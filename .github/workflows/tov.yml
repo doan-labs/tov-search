@@ -42,7 +42,7 @@ jobs:
             echo "::error::this runner has no ${{ matrix.needs }}"; exit 1
           fi
       - name: system packages
-        run: sudo apt-get update -q && sudo apt-get install -yq clang
+        run: command -v clang >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq clang; }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: rust
         run: |
