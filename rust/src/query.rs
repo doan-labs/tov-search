@@ -1145,25 +1145,101 @@ impl TopK {
     }
 }
 
-/// Top `k` over `0..n` items: a few contiguous pieces per thread, each with
-/// its own heap, then one selection over their survivors (merging heaps
-/// pairwise costs more than the scan when `k` is large).
-fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
-    // More pieces than threads so rayon can steal the leftover
-    // tail: per-piece work varies with region density, and a static
-    // ~threads*4 split strands early-finished workers (IntelCpp
-    // shared-cursor analog).
-    let pieces = (rayon::current_num_threads() * 8).min(n.max(1));
-    let step = n.div_ceil(pieces).max(1);
-    let tops: Vec<TopK> = (0..pieces)
-        .into_par_iter()
-        .map(|p| {
-            let mut top = TopK::new(k);
-            visit((p * step).min(n)..((p + 1) * step).min(n), &mut top);
-            top.cut();
-            top
-        })
-        .collect();
+/// `f(state, i)` for each `i` in `0..n`, results in order, on the pool: the
+/// calling thread starts at once, taking items in order from a shared
+/// counter; one helper is queued, and each helper once running queues the
+/// next before it takes items too. Threads asleep wake one after another off
+/// the caller's path, and a helper that runs after the items are gone
+/// returns at once: no one waits for a thread to wake, and no thread sits on
+/// a share of the work while it does. `state` is each thread's scratch.
+/// (Upstream fsearch's.)
+fn par_each<S, T: Send>(n: usize, state: impl Fn() -> S + Sync, f: impl Fn(&mut S, usize) -> T + Sync) -> Vec<T> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let out = Cells::new((0..n).map(|_| None));
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut st = state();
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n {
+                break;
+            }
+            // Safety: the counter hands each index to one thread only.
+            unsafe { out.set(i, Some(f(&mut st, i))) };
+        }
+    };
+    // Helpers still to queue (each one queues the next).
+    let left = AtomicUsize::new((rayon::current_num_threads() - 1).min(n.saturating_sub(1)));
+    fn helper<'s>(s: &rayon::Scope<'s>, left: &'s AtomicUsize, next: &'s AtomicUsize, n: usize, work: &'s (dyn Fn() + Sync)) {
+        s.spawn(move |s| {
+            if next.load(Relaxed) < n {
+                if left.fetch_sub(1, Relaxed) > 1 {
+                    helper(s, left, next, n, work);
+                }
+                work();
+            }
+        });
+    }
+    rayon::scope(|s| {
+        if left.load(Relaxed) > 0 {
+            helper(s, &left, &next, n, &work);
+        }
+        work();
+    });
+    out.0.into_iter().map(|x| x.into_inner().unwrap()).collect()
+}
+
+/// One value per index that threads read and write without locks: each
+/// index belongs to one thread at a time (in `par_each`, the one the
+/// counter handed it to).
+struct Cells<T>(Vec<std::cell::UnsafeCell<T>>);
+
+unsafe impl<T: Send> Sync for Cells<T> {}
+
+impl<T> Cells<T> {
+    fn new(v: impl Iterator<Item = T>) -> Cells<T> {
+        Cells(v.map(std::cell::UnsafeCell::new).collect())
+    }
+
+    /// Safety: no other thread uses index `i` meanwhile.
+    unsafe fn set(&self, i: usize, v: T) {
+        unsafe { *self.0[i].get() = v };
+    }
+
+    /// Safety: no other thread uses index `i` meanwhile.
+    unsafe fn take(&self, i: usize) -> T
+    where
+        T: Default,
+    {
+        unsafe { std::mem::take(&mut *self.0[i].get()) }
+    }
+}
+
+/// Up to this many entries to visit in all, `top_k` runs on the calling
+/// thread: less time than waking others.
+const INLINE_VISITS: usize = 4096;
+
+/// Top `k` over `0..n` items with keys above `floor`: a few contiguous
+/// pieces per thread, each with its own heap, then one selection over their
+/// survivors (merging heaps pairwise costs more than the scan when `k` is
+/// large). `visits` is about how many entries `visit` will look at.
+fn top_k(n: usize, k: usize, visits: usize, floor: u64, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
+    let piece = |r: std::ops::Range<usize>| {
+        let mut top = TopK::new(k);
+        top.floor = top.floor.max(floor);
+        visit(r, &mut top);
+        top.cut();
+        top
+    };
+    let tops: Vec<TopK> = if visits <= INLINE_VISITS {
+        vec![piece(0..n)]
+    } else {
+        // More pieces than threads: per-piece work varies with region
+        // density, and the shared queue hands the leftovers out.
+        let pieces = (rayon::current_num_threads() * 8).min(n.max(1));
+        let step = n.div_ceil(pieces).max(1);
+        par_each(pieces, || (), |_, p| piece((p * step).min(n)..((p + 1) * step).min(n)))
+    };
     // A full piece's k-th best already bounds the overall k-th from below.
     let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
     let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
@@ -1662,19 +1738,25 @@ impl Searcher<'_> {
             }
             out
         };
-        // The entries of `names` that beat the current floor. (`name_ents`
-        // is entry-ordered here, not prior-ordered, so every entry gets
-        // visited; the shared floor still prunes.)
-        let visit = |names: &[Cand]| {
-            top_k(names.len(), q.limit, |r, top| {
+        // The entries of `names` that beat `floor` (a `key`). A name's
+        // entries come best stat first (`Live::o_ne`): its run stops at the
+        // first that can't, and `limit` of them at most count as work.
+        let (o_ne, stat) = (&self.live.o_ne, &self.live.stat);
+        let visit = |names: &[Cand], floor: u64| {
+            let visits = names.iter().map(|c| entries(c.k).len().min(q.limit)).sum();
+            top_k(names.len(), q.limit, visits, floor, |r, top| {
                 let (mut pbuf, mut cache) = (Vec::new(), HashMap::default());
                 for c in &names[r] {
                     let nh = NameHit { score: c.score, bits: 1, flags: c.flags, best: [0; 4] };
-                    for &e in entries(c.k).iter().filter(|&&e| (lo..hi).contains(&(e as usize))) {
-                        if !neg.is_empty() && negated(parent[e as usize], &mut cache) {
+                    for &e in &o_ne[ne_off[c.k as usize] as usize..ne_off[c.k as usize + 1] as usize] {
+                        let st = stat[e as usize];
+                        if key(c.score as i32 + st, 0) <= top.floor {
+                            break;
+                        }
+                        if !(lo..hi).contains(&(e as usize)) || !neg.is_empty() && negated(parent[e as usize], &mut cache) {
                             continue;
                         }
-                        if let Some(key) = scan.score(e as usize, self.live.stat[e as usize], nh, DirMemo::default(), top.floor, &mut pbuf) {
+                        if let Some(key) = scan.score(e as usize, st, nh, DirMemo::default(), top.floor, &mut pbuf) {
                             top.push(key);
                         }
                     }
@@ -1764,7 +1846,7 @@ impl Searcher<'_> {
                 let mut batch: Vec<Cand> = if n <= INLINE_NAMES {
                     (0..parts.len()).flat_map(one).collect()
                 } else {
-                    (0..parts.len()).into_par_iter().flat_map(one).collect()
+                    par_each(parts.len(), || (), |_, p| one(p)).into_iter().flatten().collect()
                 };
                 let re = q.name_re.clone();
                 batch.extend(by_key.list[listed..lend].iter().filter_map(|&(_, k)| {
@@ -1776,7 +1858,7 @@ impl Searcher<'_> {
                     (x.0 >> i & 1 != 0).then(|| score(k, x, re.as_ref())).flatten().filter(|c| c.bound >= floor)
                 }));
                 (taken, listed) = (ends, lend);
-                hits = best(hits.into_iter().chain(visit(&batch)).collect()).0;
+                hits = best(hits.into_iter().chain(visit(&batch, fkey)).collect()).0;
                 floor = hits.get(q.limit - 1).map_or(i32::MIN, |h| h.score);
                 fkey = hits.get(q.limit - 1).map_or(0, |h| key(h.score, h.idx));
                 top = cut;
@@ -1808,30 +1890,32 @@ impl Searcher<'_> {
                 let placed = x.head == t0;
                 bin(cheap(x)) >= top && (placed || x.key as i32 >= by_key.cover)
             };
-            let rest = (0..idx.u.div_ceil(CHUNK_WORDS))
-                .into_par_iter()
-                .map_with(q.name_re.clone(), |re, c| {
-                        let mut out = Vec::new();
-                        for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.u.div_ceil(64)) {
-                            let x = tb.word(w);
-                            let mut m = x.0;
-                            while m != 0 {
-                                let k = w * 64 + m.trailing_zeros() as usize;
-                                m &= m - 1;
-                                if cheap(info[k]) >= floor
-                                    && !scored(k)
-                                    && let Some(c) = score(k as u32, x, re.as_ref()).filter(|c| c.bound >= floor)
-                                {
-                                    out.push(c);
-                                }
+            let rest = par_each(
+                idx.u.div_ceil(64 * CHUNK_WORDS),
+                || q.name_re.clone(),
+                |re, c| {
+                    let mut out = Vec::new();
+                    for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(idx.u.div_ceil(64)) {
+                        let x = tb.word(w);
+                        let mut m = x.0;
+                        while m != 0 {
+                            let k = w * 64 + m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            if cheap(info[k]) >= floor
+                                && !scored(k)
+                                && let Some(c) = score(k as u32, x, re.as_ref()).filter(|c| c.bound >= floor)
+                            {
+                                out.push(c);
                             }
                         }
-                        out
-                    },
-                )
-                .flatten()
-                .collect::<Vec<_>>();
-            Ok(Some(best(hits.into_iter().chain(visit(&rest)).collect()).0))
+                    }
+                    out
+                },
+            )
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            Ok(Some(best(hits.into_iter().chain(visit(&rest, fkey)).collect()).0))
         };
         let mut from = Run { hits: Vec::new(), floor: i32::MIN, fkey: 0, top: BINS, want: FIRST_BATCH, listed: 0 };
         // A short token first tries the names starting with it that it can
@@ -1883,7 +1967,7 @@ impl Searcher<'_> {
             }
             sorted(got, h)
         };
-        let parts = if pieces == 1 { vec![piece(0)] } else { (0..pieces).into_par_iter().map(piece).collect() };
+        let parts = if pieces == 1 { vec![piece(0)] } else { par_each(pieces, || (), |_, p| piece(p)) };
         run(parts, true, from).ok().flatten()
     }
 
@@ -1998,7 +2082,7 @@ impl Searcher<'_> {
             need_dirs: true,
             dead: self.live.dead_count != 0,
         };
-        Some(top_k(ents.len(), q.limit, |r, top| {
+        Some(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             for j in r {
                 let i = ents[j] as usize;
@@ -2387,6 +2471,16 @@ impl Searcher<'_> {
         let mut pruned = vec![0u64; bits.len()];
         let ub = &self.live.ubase;
         let nw = idx.u.div_ceil(64);
+        // Each chunk's slots and words of `bits` and `pruned`, handed out
+        // by `par_each` — or all on this thread when the scan set has few
+        // words, which takes less time than waking threads.
+        let chunks = Cells::new(slot_chunks.into_iter().zip(bits.chunks_mut(NAME_CHUNK / 64)).zip(pruned.chunks_mut(NAME_CHUNK / 64)).map(Some));
+        let few = scan.is_some_and(|s| s.iter().filter(|&&w| w != 0).count() <= INLINE_WORDS);
+        let each = |f: &(dyn Fn(usize) -> (usize, Acc) + Sync)| -> Vec<(usize, Acc)> {
+            if few { (0..chunks.0.len()).map(f).collect() } else { par_each(chunks.0.len(), || (), |_, c| f(c)) }
+        };
+        // Safety: `each` runs each chunk once.
+        let take = |c: usize| unsafe { chunks.take(c) }.unwrap();
         let mut counts: Vec<(usize, Acc)> = if fast1 {
             let c = pos[0].text[0];
             let cbit = crate::index::char_bit(c).trailing_zeros() as usize;
@@ -2394,12 +2488,8 @@ impl Searcher<'_> {
             let (fc, sp, nl) = (&self.live.first_cls, &self.live.stem_pos, &self.live.name_len8);
             let (pk, one) = (&self.live.peak, &self.live.o_ne);
             let b2 = if c.is_ascii_alphanumeric() { 16 } else { 0 };
-            slot_chunks
-                .into_par_iter()
-                .zip(bits.par_chunks_mut(NAME_CHUNK / 64))
-                .zip(pruned.par_chunks_mut(NAME_CHUNK / 64))
-                .enumerate()
-                .map(|(ci, ((slots, words), prw))| {
+            each(&|ci| {
+                    let ((slots, words), prw) = take(ci);
                     let (a, b) = (ci * NAME_CHUNK, ((ci + 1) * NAME_CHUNK).min(idx.u));
                     let (mut n, mut acc) = (0usize, Acc::default());
                     let mut bounds = TopK::new(q.limit);
@@ -2519,7 +2609,6 @@ impl Searcher<'_> {
                     }
                     (n, acc)
                 })
-                .collect()
         } else {
             // Prunable (one token, nothing else): like fast1, chunks track
             // the `limit`-th best real entry key (a name's best entry: score
@@ -2568,12 +2657,8 @@ impl Searcher<'_> {
             // Only names some token's bitsets admit can match it (with no
             // positive token every name is a candidate).
             let tbs: Vec<TokenBits> = pos.iter().chain(neg).map(|t| TokenBits::new(self.live, t)).collect();
-            slot_chunks
-                .into_par_iter()
-                .zip(bits.par_chunks_mut(NAME_CHUNK / 64))
-                .zip(pruned.par_chunks_mut(NAME_CHUNK / 64))
-                .enumerate()
-                .map(|(c, ((slots, words), prw))| {
+            each(&|c| {
+                    let ((slots, words), prw) = take(c);
                     let (a, b) = (c * NAME_CHUNK, ((c + 1) * NAME_CHUNK).min(idx.u));
                     let (mut n, mut acc) = (0usize, Acc::default());
                     let mut floor = TopK::new(q.limit);
@@ -2645,8 +2730,8 @@ impl Searcher<'_> {
                     }
                     (n, acc)
                 })
-                .collect()
         };
+        drop(chunks);
         if !prune {
             pruned = Vec::new();
         }
@@ -2989,7 +3074,7 @@ impl Scan<'_> {
     fn full(&self, lo: usize, hi: usize, memo: Option<&[DirMemo]>) -> Vec<Hit> {
         let idx = &self.live.base;
         let (ent_name, parent) = (idx.ent_name(), idx.parent());
-        top_k(hi - lo, self.q.limit, |r, top| {
+        top_k(hi - lo, self.q.limit, hi - lo, 0, |r, top| {
             let mut pbuf = Vec::new();
             for i in lo + r.start..lo + r.end {
                 let Some(nh) = self.names.get(ent_name[i]).filter(|h| h.flags & NF_OK != 0) else { continue };
@@ -3211,7 +3296,7 @@ impl Scan<'_> {
             None if self.names.lazy => self.names.iter().filter(|(_, h)| h.flags & NF_OK != 0).collect(),
             None => self.names.sparse.par_iter().copied().filter(|(_, h)| h.flags & NF_OK != 0).collect(),
         };
-        top_k(ok.len(), self.q.limit, |r, top| {
+        top_k(ok.len(), self.q.limit, self.names.ok_entries, 0, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             for &(id, nh) in &ok[r] {
                 for &e in &ne[ne_off[id as usize] as usize..ne_off[id as usize + 1] as usize] {
@@ -3251,7 +3336,7 @@ impl Scan<'_> {
             starts.push(nr);
             nr += (s.1 - s.0) as usize;
         }
-        top_k(nr + outside.len(), self.q.limit, |r, top| {
+        top_k(nr + outside.len(), self.q.limit, nr + outside.len(), 0, |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             let mut last = (u32::MAX, DirMemo::default());
             let mut visit = |i: usize, top: &mut TopK| {
