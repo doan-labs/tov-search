@@ -643,10 +643,21 @@ impl Live {
     /// relisting the few that changed is `apply_dir`'s job. This is how lost
     /// FSEvents history is recovered without crawling the whole disk.
     pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+        let mut out = self.dirs_where(|p| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since));
+        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
+            out.push(b"/".to_vec());
+        }
+        out.sort();
+        out
+    }
+
+    /// Every folder the index descends into except `/`, for which `keep`
+    /// holds. `keep` runs in parallel on the stat pool.
+    pub fn dirs_where(&self, keep: impl Fn(&[u8]) -> bool + Sync + Send) -> Vec<Vec<u8>> {
         use rayon::prelude::*;
         let idx = &self.base;
         let de = idx.dir_entry();
-        let check = |p: &[u8]| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
+        let check = &keep;
         let pool = stat_pool();
         let mut out: Vec<Vec<u8>> = pool.install(|| {
             (1..idx.d)
@@ -661,10 +672,6 @@ impl Live {
                 .collect()
         });
         out.extend(self.over.iter().filter(|(p, o)| o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0 && check(p)).map(|(p, _)| p.clone()));
-        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
-            out.push(b"/".to_vec());
-        }
-        out.sort();
         out
     }
 

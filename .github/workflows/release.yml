@@ -1,5 +1,6 @@
-# Push a tag like v0.1.0: builds tov-search for Apple Silicon and attaches it
-# to the tag's GitHub release. Run it by hand to rebuild an older tag.
+# Push a tag like v0.1.0: builds tov-search for Apple Silicon and for Linux
+# (x86_64, aarch64) and attaches them to the tag's GitHub release. Run it by
+# hand to rebuild an older tag.
 # Homebrew doesn't see it until you run rust/tools/brew.sh <tag> (see the
 # Release section of rust/README.md).
 name: release
@@ -17,10 +18,21 @@ permissions:
 
 jobs:
   release:
-    runs-on: blacksmith-6vcpu-macos-15
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every Apple Silicon Mac, not just the build machine's CPU.
+          - { target: aarch64-apple-darwin, os: blacksmith-6vcpu-macos-15, cpu: apple-m1 }
+          # Ubuntu 22.04's glibc, so the binary runs on older distros too.
+          # x86-64-v3 is AVX2 (Haswell, 2013, and later).
+          - { target: x86_64-unknown-linux-gnu, os: blacksmith-4vcpu-ubuntu-2204, cpu: x86-64-v3 }
+          - { target: aarch64-unknown-linux-gnu, os: blacksmith-4vcpu-ubuntu-2204-arm, cpu: generic }
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
-      TARBALL: tov-search-aarch64-apple-darwin.tar.gz
+      TARBALL: tov-search-${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -29,15 +41,15 @@ jobs:
         run: |
           command -v cargo >/dev/null || curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      # Every Apple Silicon Mac, not just the build machine's CPU.
       - run: cargo build --release --locked --manifest-path rust/Cargo.toml
         env:
-          RUSTFLAGS: -C target-cpu=apple-m1
+          RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tar -czf "$TARBALL" -C rust/target/release tov-search
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+          # The three jobs race to create the release; one wins.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes || gh release view "$TAG" >/dev/null
           gh release upload "$TAG" --clobber "$TARBALL" "$TARBALL.sha256"

@@ -1,11 +1,11 @@
 # tov-search
 
-Whole-disk file search for macOS. Finds any file by name in about a
+Whole-disk file search for macOS and Linux. Finds any file by name in about a
 millisecond, forgives typos, and searches inside files with an index. Use it
 as a CLI (with a small daemon) or as a Rust crate.
 
 ```
-brew install doan-labs/tap/tov-search   # Apple Silicon
+brew install doan-labs/tap/tov-search   # Apple Silicon Macs; Linux x86_64 (AVX2) and arm64
 tov-search tov-search main           # find files by name
 tov-search 'ext:rs grep:apply_dir'   # search inside files
 ```
@@ -65,10 +65,24 @@ tov-search 'sym:apply_dir'                  # where it's defined
 | as a login item (`tov-search install --login`) | give `~/.local/bin/tov-search` its own grant in System Settings > Privacy & Security, again after each rebuild |
 | without access | skips the protected folders instead of popping a prompt |
 
+## Linux
+
+| | |
+|---|---|
+| index | `~/.local/share/tov-search` (`$XDG_DATA_HOME/tov-search`) |
+| `install --login` | a systemd user service; `loginctl enable-linger` keeps it running after logout |
+| what it indexes | every local filesystem; skips /proc, /sys, /dev, /run, network, FUSE, overlay and snap mounts, and folders you can't read |
+| updates | inotify, one watch per folder, as your user |
+| a restart | relists the folders whose mtime changed while it was stopped |
+
+If the disk has more folders than `fs.inotify.max_user_watches` allows, the
+daemon log says so and gives the `sysctl` command to raise it. Until then the
+unwatched folders are caught up every 30 s.
+
 ## API
 
-JSON lines over `~/Library/Application Support/TovSearch/tov-search.sock`, or
-`tov-search stdio`:
+JSON lines over `tov-search.sock` in the index folder
+(`~/Library/Application Support/TovSearch` on macOS), or `tov-search stdio`:
 
 ```json
 {"q": "tov-search main", "limit": 20}
@@ -92,7 +106,8 @@ old version.
 
 1. Bump `version` in `Cargo.toml`, merge, then tag `main` and push the tag:
    `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds the
-   Apple Silicon binary and attaches it to the GitHub release.
+   Apple Silicon and Linux (x86_64, arm64) binaries and attaches them to the
+   GitHub release.
 2. Once that run is green: `rust/tools/brew.sh v0.2.0`. It points the formula
    in [doan-labs/homebrew-tap](https://github.com/doan-labs/homebrew-tap) at the
    new build. It runs with your own `gh` login, so the release job needs no
@@ -114,8 +129,8 @@ Design, decisions and history: [docs/rust-architecture.md](../docs/rust-architec
 ## Index
 
 ```
-crawl     getattrlistbulk, once
-updates   FSEvents; a restart replays only what changed
+crawl     getattrlistbulk (Linux: getdents64 + statx), once
+updates   FSEvents (Linux: inotify); a restart replays only what changed
 names     one mmap'd file, folder by folder, so in: is a range; each distinct name is scored once
 content   trigram index of your text files; matches are read fresh from disk, so never stale
 ```
