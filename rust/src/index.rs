@@ -278,7 +278,12 @@ impl Index {
 
     /// Lay listings out as blocks in DFS order and compute everything derived.
     /// Listing id 0 is the root ("/").
-    pub fn build(mut ls: Vec<Listing>, event_id: u64, synced_at: u32, home: &[u8]) -> Index {
+    pub fn build(ls: Vec<Listing>, event_id: u64, synced_at: u32, home: &[u8]) -> Index {
+        Self::build_ranked(ls, event_id, synced_at, home, prior_adjust)
+    }
+
+    /// `build` with another folder ranking (`linux_prior_adjust`).
+    pub fn build_ranked(mut ls: Vec<Listing>, event_id: u64, synced_at: u32, home: &[u8], prior_adjust: fn(&[u8], u8) -> i32) -> Index {
         ls.par_iter_mut().for_each(|l| {
             let names = &l.names;
             l.ents.sort_unstable_by(|a, b| {
@@ -645,6 +650,26 @@ fn prior_adjust(name: &[u8], depth: u8) -> i32 {
         b"folders" | b"Containers" | b"Group Containers" => -10,
         b"Application Support" => -5,
         _ => 0,
+    }
+}
+
+/// `prior_adjust` for a Linux disk: its top level ranked like the Mac's
+/// (/home like /Users, /usr like /System, /media and /mnt like /Volumes),
+/// and Trash, snaps and flatpaks sunk like caches. The benchmark disk is a
+/// Mac's, so the benchmark never uses this.
+pub fn linux_prior_adjust(name: &[u8], depth: u8) -> i32 {
+    if depth == 1 {
+        return match name {
+            b"home" | b"root" => 0,
+            b"media" | b"mnt" => -10,
+            b"opt" | b"var" | b"srv" | b"snap" => -25,
+            b"usr" | b"boot" => -40,
+            _ => -35,
+        };
+    }
+    match name {
+        b"Trash" | b"snap" | b"flatpak" => -20,
+        _ => prior_adjust(name, depth),
     }
 }
 

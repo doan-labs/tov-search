@@ -16,7 +16,7 @@ Noah Dunnagan.
 | folder | what it is |
 |---|---|
 | [`tov/`](tov/) | the main engine and its C kernels |
-| [`rust/`](rust/) | the Rust reference, the macOS app, the benchmark |
+| [`rust/`](rust/) | the Rust reference, the macOS and Linux app, the benchmark |
 | [`compare/`](compare/) | timing against [fsearch](https://github.com/noahdunnagan/fsearch) and [fff](https://github.com/dmtrKovalenko/fff) in CI |
 | [`docs/`](docs/) | how it all works, in detail |
 

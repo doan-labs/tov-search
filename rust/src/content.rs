@@ -30,14 +30,10 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-/// Current on-disk format (BF-owned): FSCSEG03's layout plus per-doc bloom
-/// filters and end-of-file pair keys.
-const MAGIC: &[u8; 8] = b"BFCSEG01";
-/// The previous format, still loaded: it has no bloom sections and no
-/// end-of-file pair keys. Segments of it answer every probe "maybe" and a
-/// pair plan as "every doc", so old segments keep their exact answers while
-/// missing only the new shortcuts.
-const MAGIC_V3: &[u8; 8] = b"FSCSEG03";
+/// Current on-disk format: trigram postings, per-doc bloom filters and
+/// end-of-file pair keys, all also over the text with ſ and K read as s and
+/// k (`odd_folds`). Older formats lack those grams and are rebuilt.
+const MAGIC: &[u8; 8] = b"BFCSEG02";
 /// tri_off high bit: this trigram's list is a bitset over the segment's docs
 /// (cheaper than varints once more than 1 in 8 docs contain it).
 const BITSET: u32 = 1 << 31;
@@ -88,11 +84,8 @@ pub struct Segment {
     ntri1: usize,
     plen: usize,
     paths_len: usize,
-    /// `MAGIC` (current) sections are present: per-doc bloom filters and
-    /// end-of-file pair keys. Off for `MAGIC_V3` segments.
-    fmt: bool,
-    /// `nb1` bloom/long offset entries (0 without `fmt`), `blooms_len` and
-    /// `longs_len` filter words.
+    /// `nb1` bloom/long offset entries, `blooms_len` and `longs_len` filter
+    /// words.
     nb1: usize,
     blooms_len: usize,
     longs_len: usize,
@@ -123,8 +116,8 @@ enum S {
 }
 const NS: usize = 13;
 
-fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, fmt: bool, blooms: usize, longs: usize) -> [usize; NS] {
-    let n1 = (ndocs + 1) * 4 * fmt as usize;
+fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, blooms: usize, longs: usize) -> [usize; NS] {
+    let n1 = (ndocs + 1) * 4;
     [ntri * 4, (ntri + 1) * 4, plen, (ndocs + 1) * 4, paths_len, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, n1, blooms * 8, n1, longs * 8]
 }
 
@@ -143,33 +136,23 @@ impl Segment {
     sec!(long_off, S::LongOff, u32, nb1);
     sec!(long, S::Long, u64, longs_len);
 
-    /// Doc `d`'s short-gram bloom filter (empty for the old format).
+    /// Doc `d`'s short-gram bloom filter.
     fn bloom_of(&self, d: u32) -> &[u64] {
         let o = self.bloom_off();
-        if o.is_empty() {
-            return &[];
-        }
         &self.bloom()[o[d as usize] as usize..o[d as usize + 1] as usize]
     }
 
-    /// Doc `d`'s long-gram bloom filter (empty for the old format).
+    /// Doc `d`'s long-gram bloom filter.
     fn long_of(&self, d: u32) -> &[u64] {
         let o = self.long_off();
-        if o.is_empty() {
-            return &[];
-        }
         &self.long()[o[d as usize] as usize..o[d as usize + 1] as usize]
     }
 
     /// Can doc `d` hold every gram in `probes`, by its bloom filters? Never
-    /// a false negative: a "no" only means the doc provably lacks a gram,
-    /// and old-format segments (no filters) always say maybe.
+    /// a false negative: a "no" only means the doc provably lacks a gram.
     fn may_contain(&self, d: u32, probes: &Probes) -> bool {
-        if !self.fmt {
-            return true;
-        }
-        // A doc with no filter (binary, or merged in from an old segment)
-        // can never veto: empty words mean "maybe".
+        // A doc with no filter (binary) can never veto: empty words mean
+        // "maybe".
         let has = |words: &[u64], h: u32| words.is_empty() || bloom_bits(h, words.len()).iter().all(|&b| words[b / 64] >> (b % 64) & 1 != 0);
         let (short, long) = (self.bloom_of(d), self.long_of(d));
         probes.short.iter().all(|&h| has(short, h)) && probes.long.iter().all(|&h| has(long, h))
@@ -320,16 +303,10 @@ impl Segment {
     fn load(dir: &Path, id: u64) -> Option<Segment> {
         let f = std::fs::File::open(seg_path(dir, id)).ok()?;
         let map = unsafe { Mmap::map(&f) }.ok()?;
-        // Both formats keep the first nine sections identical; the current
-        // one appends bloom offsets and words. An old file gets empty
-        // sections and `fmt` off.
-        let (f4, [ndocs, ntri, plen, paths_len, blooms, longs]) = if let Some(f) = fields::<6>(&map, MAGIC) {
-            (true, f.map(|v| v as usize))
-        } else {
-            let [n, t, p, l] = fields(&map, MAGIC_V3)?;
-            (false, [n, t, p, l, 0, 0].map(|v| v as usize))
-        };
-        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, f4, blooms, longs));
+        // Another format doesn't load: `Content::open` deletes it and its
+        // files get indexed again.
+        let [ndocs, ntri, plen, paths_len, blooms, longs] = fields::<6>(&map, MAGIC)?.map(|v| v as usize);
+        let (off, total) = layout(&lens(ndocs, ntri, plen, paths_len, blooms, longs));
         if map.len() < total {
             return None;
         }
@@ -349,8 +326,7 @@ impl Segment {
             ntri1: ntri + 1,
             plen,
             paths_len,
-            fmt: f4,
-            nb1: (ndocs + 1) * f4 as usize,
+            nb1: ndocs + 1,
             blooms_len: blooms,
             longs_len: longs,
             off,
@@ -406,25 +382,46 @@ fn eof_key(a: u8, b: u8) -> u32 {
     (fold(a) as u32) << 16 | (fold(b) as u32) << 8
 }
 
-/// Append the sorted distinct case-folded trigrams of a buffer to `out`,
-/// plus the end-of-file pair key for buffers of two bytes or more (so a
-/// 2-byte literal can use the index too). `seen` is a 2 MiB scratch bitset,
-/// all zero on entry and exit.
-fn trigrams(buf: &[u8], seen: &mut [u64], out: &mut Vec<u32>) {
-    let start = out.len();
-    if buf.len() >= 2 {
-        let e = eof_key(buf[buf.len() - 2], buf[buf.len() - 1]);
-        seen[(e >> 6) as usize] |= 1 << (e & 63);
-        out.push(e);
+/// `buf` with ſ and the Kelvin sign read as s and k, if it holds either:
+/// a case-insensitive match of an ASCII pattern may stand on them (see
+/// `Literal`), so a doc's grams cover this text too.
+fn odd_folds(buf: &[u8]) -> Option<Vec<u8>> {
+    const ODD: [(&str, u8); 2] = [("\u{17F}", b's'), ("\u{212A}", b'k')];
+    if !ODD.iter().any(|(u, _)| memchr::memmem::find(buf, u.as_bytes()).is_some()) {
+        return None;
     }
-    if buf.len() >= 3 {
-        let mut t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
-        for &b in &buf[2..] {
-            t = ((t << 8) | fold(b) as u32) & 0xFF_FFFF;
-            let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
-            if seen[w] & bit == 0 {
-                seen[w] |= bit;
-                out.push(t);
+    let (mut out, mut i) = (Vec::with_capacity(buf.len()), 0);
+    while i < buf.len() {
+        match ODD.iter().find(|(u, _)| buf[i..].starts_with(u.as_bytes())) {
+            Some((u, c)) => (out.push(*c), i += u.len()),
+            None => (out.push(buf[i]), i += 1),
+        };
+    }
+    Some(out)
+}
+
+/// Append the sorted distinct case-folded trigrams of a doc's texts (it and
+/// its `odd_folds`) to `out`, plus each one's end-of-file pair key when two
+/// bytes or more (so a 2-byte literal can use the index too). `seen` is a
+/// 2 MiB scratch bitset, all zero on entry and exit.
+fn trigrams(texts: &[&[u8]], seen: &mut [u64], out: &mut Vec<u32>) {
+    let start = out.len();
+    let mut add = |t: u32| {
+        let (w, bit) = ((t >> 6) as usize, 1u64 << (t & 63));
+        if seen[w] & bit == 0 {
+            seen[w] |= bit;
+            out.push(t);
+        }
+    };
+    for buf in texts {
+        if buf.len() >= 2 {
+            add(eof_key(buf[buf.len() - 2], buf[buf.len() - 1]));
+        }
+        if buf.len() >= 3 {
+            let mut t = (fold(buf[0]) as u32) << 8 | fold(buf[1]) as u32;
+            for &b in &buf[2..] {
+                t = ((t << 8) | fold(b) as u32) & 0xFF_FFFF;
+                add(t);
             }
         }
     }
@@ -474,9 +471,11 @@ fn bloom(hashes: &[u32], bits: usize, out: &mut Vec<u64>) {
     }
 }
 
-/// The sorted distinct folded n-gram hashes of `buf`, for the bloom filters.
-fn gram_hashes(buf: &[u8], n: usize) -> Vec<u32> {
-    let mut out: Vec<u32> = buf.windows(n).map(|w| gram_hash(w.iter().fold(0u64, |g, &b| g << 8 | fold(b) as u64))).collect();
+/// The sorted distinct folded n-gram hashes of a doc's texts (see
+/// `trigrams`), for the bloom filters.
+fn gram_hashes(texts: &[&[u8]], n: usize) -> Vec<u32> {
+    let mut out: Vec<u32> =
+        texts.iter().flat_map(|buf| buf.windows(n)).map(|w| gram_hash(w.iter().fold(0u64, |g, &b| g << 8 | fold(b) as u64))).collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -681,10 +680,12 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                     let (bs, ls, ss) = (sp.blooms.len() as u32, sp.longs.len() as u32, sp.syms.len() as u32);
                     // Three bits a short gram; two a long one, three in big
                     // files (the costliest to read for nothing).
-                    bloom(&gram_hashes(&buf, SHORT), 3, &mut sp.blooms);
-                    bloom(&gram_hashes(&buf, LONG), if buf.len() >= 16 << 10 { 3 } else { 2 }, &mut sp.longs);
+                    let alt = odd_folds(&buf);
+                    let texts: Vec<&[u8]> = std::iter::once(&buf[..]).chain(alt.as_deref()).collect();
+                    bloom(&gram_hashes(&texts, SHORT), 3, &mut sp.blooms);
+                    bloom(&gram_hashes(&texts, LONG), if buf.len() >= 16 << 10 { 3 } else { 2 }, &mut sp.longs);
                     let mut tri = Vec::new();
-                    trigrams(&buf, &mut seen, &mut tri);
+                    trigrams(&texts, &mut seen, &mut tri);
                     for &t in &tri {
                         sp.pairs[(t >> 16) as usize].push((t as u64) << 32 | (i - range.start) as u64);
                     }
@@ -836,7 +837,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], parts: Vec<Postings>
         long_off.push(longs.len() as u32);
     }
 
-    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), true, blooms.len(), longs.len()));
+    let (off, _) = layout(&lens(ndocs, keys.len(), post.len(), paths.len(), blooms.len(), longs.len()));
     let fields = [ndocs, keys.len(), post.len(), paths.len(), blooms.len(), longs.len()].map(|v| v as u64);
     let hdr = header(MAGIC, &fields);
     let sections: [&[u8]; NS] = [
@@ -1545,14 +1546,12 @@ impl Grep {
 
     /// Gram hashes every matching doc must hold (see `SHORT`), or none when
     /// the match needn't carry the pattern's folded bytes: regexes match
-    /// arbitrary things, and a case-insensitive pattern holding 'k', 's' or
-    /// non-ASCII can match on Unicode folds (K, ſ) whose folded grams are
-    /// not the pattern's — probing those would drop real hits.
+    /// arbitrary things, and a case-insensitive non-ASCII pattern can match
+    /// on Unicode folds whose grams differ. The folds of ASCII letters (K, ſ) are
+    /// indexed as s and k (`odd_folds`), so ASCII patterns are probed.
     fn probes(&self) -> Probes {
         let grams = |n: usize| {
-            let mut out: Vec<u32> = if self.mode == GrepMode::Regex
-                || (self.case_insensitive && self.pattern.bytes().any(|b| !b.is_ascii() || matches!(b, b'k' | b'K' | b's' | b'S')))
-            {
+            let mut out: Vec<u32> = if self.mode == GrepMode::Regex || (self.case_insensitive && !self.pattern.is_ascii()) {
                 Vec::new()
             } else {
                 self.pattern.as_bytes().windows(n).map(|w| gram_hash(w.iter().fold(0, |g, &b| g << 8 | fold(b) as u64))).collect()
@@ -2025,11 +2024,6 @@ fn eval(s: &Segment, q: &TQ, docs: Range<u32>) -> Option<Vec<u32>> {
             Some(out)
         }
         TQ::Pair(p) => {
-            if !s.fmt {
-                // Old segments index no end-of-file pairs: a two-byte file
-                // would be missed, so fall back to every doc.
-                return None;
-            }
             // Every key p..=p|0xFF: pair-completing trigrams plus the pair
             // itself (low byte 0).
             let keys = s.tri_key();
@@ -2401,12 +2395,11 @@ mod tests {
         std::fs::create_dir_all(&content).unwrap();
         let docs = mkdocs(&dir, &[("a.txt", b"the quick brown fox jumps over"), ("b.txt", b"unrelated filler")]);
         let seg = build_segment(&content, 1, &docs, 0..2).unwrap();
-        assert!(seg.fmt);
         // A gram present in a doc always survives its filter.
         let g = Grep::new("quick brown", GrepMode::Literal).unwrap();
         let probes = g.probes();
         assert!(seg.may_contain(0, &probes));
-        // A doc without grams (binary, old-format) answers "maybe".
+        // A doc without grams (binary) answers "maybe".
         let mut docs = mkdocs(&dir, &[("bin.dat", b"\x00\x01binary\x00")]);
         docs.items.push((docs.buf.len() as u32, 3, 4, 0));
         docs.buf.extend_from_slice(b"oth");
@@ -2486,7 +2479,6 @@ mod tests {
         let mut want: Vec<Vec<u8>> = files.iter().map(|(n, _)| dir.join(n).as_os_str().as_bytes().to_vec()).collect();
         want.sort();
         assert_eq!(paths, want.iter().map(|v| &v[..]).collect::<Vec<_>>());
-        assert!(seg.fmt);
         // Trigram postings identical to a rebuild.
         let seg2 = build_segment(&content, 2, &docs, 0..docs.len()).unwrap();
         assert_eq!(seg.tri_key(), seg2.tri_key());
@@ -2522,11 +2514,37 @@ mod tests {
     #[test]
     fn probes_disabled_for_regex_and_ambiguous_case() {
         assert!(Grep::new("ab.*", GrepMode::Regex).unwrap().probes().short.is_empty());
-        // ASCII-foldable bytes (K/S fold to two codepoints) and non-ASCII
-        // bytes can't be probed on the folded index.
-        assert!(Grep::new("kontakt", GrepMode::Literal).unwrap().probes().short.is_empty());
+        // Non-ASCII bytes can't be probed on the folded index.
         assert!(Grep::new("m\u{00fc}nchen", GrepMode::Literal).unwrap().probes().short.is_empty());
         assert!(!Grep::new("plain literal", GrepMode::Literal).unwrap().probes().short.is_empty());
+        assert!(!Grep::new("kontakt", GrepMode::Literal).unwrap().probes().short.is_empty());
+    }
+
+    /// ſ and the Kelvin sign match s and k case-insensitively: a doc holding
+    /// them instead must survive the trigram plan and the bloom filters.
+    #[test]
+    fn odd_folds_still_match() {
+        let dir = tmpdir("odd-folds");
+        let content = dir.join("content");
+        std::fs::create_dir_all(&content).unwrap();
+        let docs = mkdocs(
+            &dir,
+            &[
+                ("long-s.txt", "a \u{17F}truct here\n".as_bytes()),
+                ("kelvin.txt", "the \u{212A}ontakt list\n".as_bytes()),
+                ("plain.txt", b"nothing to see\n"),
+            ],
+        );
+        let seg = build_segment(&content, 1, &docs, 0..docs.len()).unwrap();
+        let mut c = Content::open_shared(content.clone());
+        c.push(seg);
+        for (pat, file) in [("struct", "long-s.txt"), ("kontakt", "kelvin.txt"), ("Kontakt", "")] {
+            let r = c.search(&Grep::new(pat, GrepMode::Literal).unwrap(), &Query::parse("", "/").unwrap());
+            let got: Vec<&[u8]> = r.files.iter().map(|f| f.path.as_slice()).collect();
+            let want: Vec<Vec<u8>> = [file].iter().filter(|f| !f.is_empty()).map(|f| dir.join(f).as_os_str().as_bytes().to_vec()).collect();
+            assert_eq!(got, want.iter().map(|v| &v[..]).collect::<Vec<_>>(), "{pat}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

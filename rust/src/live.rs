@@ -117,6 +117,16 @@ pub struct Live {
     /// `start_fit[h]` is the bitset of names with a word starting with a
     /// byte hashing to `h`. `ranked` skips every name without one.
     pub start_fit: Vec<u64>,
+    /// Like `char_fit`, over each name's first half (`first_half[b]`) and
+    /// second half (split at `len / 2`). A token's chars appear in order,
+    /// so a name can only match if some prefix of the token fits its first
+    /// half and the rest its second (`query::TokenBits`).
+    pub first_half: Vec<u64>,
+    pub second_half: Vec<u64>,
+    /// `double_fit[b]`: names with char class `b` at least twice (a token
+    /// with it twice needs it twice); `double_counts` their popcounts.
+    pub double_fit: Vec<u64>,
+    pub double_counts: Vec<u32>,
     /// First char of each name (past a leading dot): low 6 bits = its
     /// char-class bit index, bit 6 = the name starts with '.' (the `off`
     /// `single_score` uses). With `first_fit`, `stem_pos` and `name_len8`
@@ -175,6 +185,27 @@ fn stat_table(idx: &Index) -> Vec<i32> {
         .with_min_len(1 << 15)
         .for_each(|(i, s)| *s = dp[parent[i] as usize] as i32 + crate::query::rank_tweaks(flags[en[i] as usize], kind[i], mtime[i], now));
     stat
+}
+
+/// `rows` bitsets over the names, `nw` words each, row-major: row `r` holds
+/// the names `k` whose `bits(k)` has bit `r`. Built a word of names at a
+/// time, then laid out by row.
+fn transpose(u: usize, rows: usize, bits: impl Fn(usize) -> u128 + Sync) -> Vec<u64> {
+    use rayon::prelude::*;
+    let nw = u.div_ceil(64);
+    let mut tmp = vec![0u64; nw * rows];
+    tmp.par_chunks_mut(rows).enumerate().with_min_len(64).for_each(|(w, t)| {
+        for k in w * 64..(w * 64 + 64).min(u) {
+            let mut x = bits(k);
+            while x != 0 {
+                t[x.trailing_zeros() as usize] |= 1 << (k % 64);
+                x &= x - 1;
+            }
+        }
+    });
+    let mut out = vec![0u64; nw * rows];
+    out.par_chunks_mut(nw).enumerate().for_each(|(r, row)| row.iter_mut().enumerate().for_each(|(w, v)| *v = tmp[w * rows + r]));
+    out
 }
 
 /// `Live::order`/`ostat`: counting sort — stat has a few hundred distinct
@@ -258,31 +289,21 @@ impl Live {
             }
         }
         let nw = base.u.div_ceil(64);
-        let mut char_fit = vec![0u64; 41 * nw];
-        {
-            use rayon::prelude::*;
-            let mask = base.name_mask();
-            char_fit.par_chunks_mut(nw).enumerate().for_each(|(b, set)| {
-                for (k, &m) in mask.iter().enumerate() {
-                    if m >> b & 1 != 0 {
-                        set[k / 64] |= 1 << (k % 64);
-                    }
-                }
-            });
-        }
-        let class_counts: Vec<u32> = char_fit.chunks(nw).map(|set| set.iter().map(|w| w.count_ones()).sum()).collect();
-        let mut start_fit = vec![0u64; 23 * nw];
-        {
-            use rayon::prelude::*;
-            let mask = base.name_mask();
-            start_fit.par_chunks_mut(nw).enumerate().for_each(|(h, set)| {
-                for (k, &m) in mask.iter().enumerate() {
-                    if m >> (41 + h) & 1 != 0 {
-                        set[k / 64] |= 1 << (k % 64);
-                    }
-                }
-            });
-        }
+        let mask = base.name_mask();
+        let char_fit = transpose(base.u, 41, |k| (mask[k] & ((1 << 41) - 1)) as u128);
+        let counts = |fit: &[u64]| -> Vec<u32> { fit.chunks(nw).map(|set| set.iter().map(|w| w.count_ones()).sum()).collect() };
+        let class_counts = counts(&char_fit);
+        let start_fit = transpose(base.u, 23, |k| (mask[k] >> 41) as u128);
+        let mut first_half = transpose(base.u, 3 * 41, |k| {
+            let name = base.uname(k as u32);
+            let (a, b) = name.split_at(name.len() / 2);
+            let m = |s: &[u8]| crate::index::char_mask(s) as u128;
+            m(a) | m(b) << 41 | (crate::query::doubled(name) as u128) << 82
+        });
+        let double_fit = first_half.split_off(82 * nw);
+        let second_half = first_half.split_off(41 * nw);
+        first_half.shrink_to_fit();
+        let double_counts = counts(&double_fit);
         let (mut first_cls, mut stem_pos, mut name_len8) =
             (vec![0u8; base.u], vec![0u16; base.u], vec![0u8; base.u]);
         {
@@ -382,6 +403,10 @@ impl Live {
             char_fit,
             class_counts,
             start_fit,
+            first_half,
+            second_half,
+            double_fit,
+            double_counts,
             first_cls,
             first_fit,
             stem_pos,
@@ -643,10 +668,21 @@ impl Live {
     /// relisting the few that changed is `apply_dir`'s job. This is how lost
     /// FSEvents history is recovered without crawling the whole disk.
     pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+        let mut out = self.dirs_where(|p| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since));
+        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
+            out.push(b"/".to_vec());
+        }
+        out.sort();
+        out
+    }
+
+    /// Every folder the index descends into except `/`, for which `keep`
+    /// holds. `keep` runs in parallel on the stat pool.
+    pub fn dirs_where(&self, keep: impl Fn(&[u8]) -> bool + Sync + Send) -> Vec<Vec<u8>> {
         use rayon::prelude::*;
         let idx = &self.base;
         let de = idx.dir_entry();
-        let check = |p: &[u8]| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
+        let check = &keep;
         let pool = stat_pool();
         let mut out: Vec<Vec<u8>> = pool.install(|| {
             (1..idx.d)
@@ -661,10 +697,6 @@ impl Live {
                 .collect()
         });
         out.extend(self.over.iter().filter(|(p, o)| o.kind & 3 == KIND_DIR && o.kind & FLAG_MOUNT == 0 && check(p)).map(|(p, _)| p.clone()));
-        if lstat(b"/").is_some_and(|o| o.mtime >= since) {
-            out.push(b"/".to_vec());
-        }
-        out.sort();
         out
     }
 
