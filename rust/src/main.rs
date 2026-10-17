@@ -51,6 +51,7 @@ unsafe impl GlobalAlloc for Alloc {
 #[global_allocator]
 static GLOBAL: Alloc = Alloc;
 
+#[cfg(target_os = "macos")]
 const USAGE: &str = "usage:
   tov-search <query...> [--json]   search (starts the daemon if needed)
   tov-search stdio                 JSON lines on stdin/stdout
@@ -61,6 +62,18 @@ const USAGE: &str = "usage:
   tov-search uninstall             remove the login agent (keeps the index)
   tov-search bench <query...>      time a query in-process against the saved index";
 
+#[cfg(target_os = "linux")]
+const USAGE: &str = "usage:
+  tov-search <query...> [--json]   search (starts the daemon if needed)
+  tov-search stdio                 JSON lines on stdin/stdout
+  tov-search serve                 run the daemon in the foreground
+  tov-search status
+  tov-search install [--login]     copy to ~/.local/bin; --login also starts the daemon at login
+                                   (a systemd user service)
+  tov-search uninstall             remove the service (keeps the index)
+  tov-search bench <query...>      time a query in-process against the saved index";
+
+#[cfg(target_os = "macos")]
 const LABEL: &str = "mt.nd.tov-search";
 
 fn home() -> String {
@@ -68,11 +81,12 @@ fn home() -> String {
 }
 
 fn data_dir() -> PathBuf {
-    let d = PathBuf::from(home()).join("Library/Application Support/TovSearch");
+    let d = tov_search::default_dir(&home());
     std::fs::create_dir_all(&d).ok();
     d
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
 }
@@ -81,7 +95,10 @@ fn main() {
     // Never let a search download iCloud placeholders: opening or listing a
     // dataless file/dir fails fast instead of materializing it.
     // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
-    unsafe { setiopolicy_np(3, 0, 1) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        setiopolicy_np(3, 0, 1)
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
@@ -165,25 +182,94 @@ fn bench(qs: &str) {
     eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
 }
 
+/// Copy this binary to ~/.local/bin; the installed path.
+fn copy_to_bin() -> PathBuf {
+    let bin = PathBuf::from(home()).join(".local/bin/tov-search");
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    // Replace, never overwrite in place: a rewritten signed binary at the same
+    // path can be SIGKILLed by the code-signing cache (and a running one is
+    // busy on Linux).
+    let _ = std::fs::remove_file(&bin);
+    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    bin
+}
+
+#[cfg(target_os = "linux")]
+const UNIT: &str = "tov-search.service";
+
+#[cfg(target_os = "linux")]
+fn unit_path() -> PathBuf {
+    let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|d| d.is_absolute());
+    config.unwrap_or_else(|| PathBuf::from(home()).join(".config")).join("systemd/user").join(UNIT)
+}
+
+#[cfg(target_os = "linux")]
+fn systemctl(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl").arg("--user").args(args).status().is_ok_and(|s| s.success())
+}
+
+#[cfg(target_os = "linux")]
+fn install(login: bool) {
+    let bin = copy_to_bin();
+    if !login {
+        println!("installed {}; the daemon starts on first use", bin.display());
+        return;
+    }
+    let unit = format!(
+        "[Unit]
+Description=tov-search daemon (whole-disk file search)
+
+[Service]
+ExecStart={} serve
+Restart=always
+# Like launchd's throttle: a daemon started on first use may hold the
+# socket; this one takes over once it is gone.
+RestartSec=10
+StandardOutput=append:{log}
+StandardError=append:{log}
+
+[Install]
+WantedBy=default.target
+",
+        bin.display(),
+        log = data_dir().join("daemon.log").display()
+    );
+    let path = unit_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, unit).unwrap();
+    if !(systemctl(&["daemon-reload"]) && systemctl(&["enable", UNIT]) && systemctl(&["restart", UNIT])) {
+        die("systemctl --user failed (is there a user session? see `loginctl enable-linger`)");
+    }
+    println!("installed {} (systemd user service {UNIT})", bin.display());
+    println!("it runs while you are logged in; to keep it running after logout: loginctl enable-linger");
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall() {
+    systemctl(&["disable", "--now", UNIT]);
+    let _ = std::fs::remove_file(unit_path());
+    systemctl(&["daemon-reload"]);
+    println!("removed systemd user service {UNIT}; index kept in {}", data_dir().display());
+}
+
+#[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
     PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> bool {
     std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
+#[cfg(target_os = "macos")]
 fn domain() -> String {
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
+#[cfg(target_os = "macos")]
 fn install(login: bool) {
-    let bin = PathBuf::from(home()).join(".local/bin/tov-search");
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-    // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache.
-    let _ = std::fs::remove_file(&bin);
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
+    let bin = copy_to_bin();
     if !login {
         println!("installed {}; the daemon starts on first use", bin.display());
         return;
@@ -223,6 +309,7 @@ fn install(login: bool) {
     println!("installed {} (LaunchAgent {LABEL})", bin.display());
 }
 
+#[cfg(target_os = "macos")]
 fn uninstall() {
     launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
     let _ = std::fs::remove_file(plist_path());

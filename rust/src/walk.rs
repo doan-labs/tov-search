@@ -1,4 +1,5 @@
-//! Parallel whole-disk enumeration with getattrlistbulk(2).
+//! Parallel whole-disk enumeration with getattrlistbulk(2) on macOS,
+//! getdents64 + statx on Linux.
 //!
 //! One syscall returns hundreds of entries with name, type, size, mtime and
 //! flags already attached, so there is no per-file stat. Directories fan out
@@ -6,7 +7,6 @@
 //! how /Users etc. on the data volume appear under / exactly once).
 
 use rayon::Scope;
-#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -167,39 +167,104 @@ fn list_into(path: &[u8], l: &mut Listing) -> bool {
     true
 }
 
-/// Portable listing (one stat per entry), so the crate runs off macOS.
-// ponytail: readdir + stat is ~10x slower than getattrlistbulk; fine while only benchmarks run here.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+thread_local! {
+    static BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 64 * 1024]);
+}
+
+/// Mounts never crossed: kernel pseudo filesystems, other mounts' views
+/// (overlay, squashfs snaps) and network or FUSE drives, like the Mac skips
+/// /Volumes. `statfs` f_type values.
+#[cfg(target_os = "linux")]
+#[rustfmt::skip]
+const SKIP_FS: &[u32] = &[
+    0x9fa0 /* proc */, 0x6265_6572 /* sysfs */, 0x1cd1 /* devpts */, 0x0027_e0eb /* cgroup */, 0x6367_7270 /* cgroup2 */,
+    0x7363_6673 /* securityfs */, 0x6462_6720 /* debugfs */, 0x7472_6163 /* tracefs */, 0x6165_676c /* pstore */,
+    0xcafe_4a11 /* bpf */, 0x6265_6570 /* configfs */, 0x1980_0202 /* mqueue */, 0x9584_58f6 /* hugetlbfs */,
+    0xde5e_81e4 /* efivarfs */, 0x6e73_6673 /* nsfs */, 0x4249_4e4d /* binfmt_misc */, 0x6573_5543 /* fusectl */,
+    0x0187 /* autofs */, 0xf97c_ff8c /* selinuxfs */, 0x794c_7630 /* overlay */, 0x7371_7368 /* squashfs */,
+    0x6969 /* nfs */, 0x517b /* smb */, 0xff53_4d42 /* cifs */, 0xfe53_4d42 /* smb2 */, 0x6573_5546 /* fuse */,
+];
+
+/// getdents64 plus one statx per entry. Mount points of real filesystems
+/// are crossed (a Linux disk is often /, /home, /boot...); the rest get
+/// FLAG_MOUNT and are not descended.
+#[cfg(target_os = "linux")]
 fn list_fd(fd: i32, l: &mut Listing) {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    let dir = format!("/proc/self/fd/{fd}");
-    let (Ok(rd), Ok(me)) = (std::fs::read_dir(&dir), std::fs::metadata(&dir)) else { return };
-    for e in rd.flatten() {
-        let Ok(md) = e.metadata() else { continue };
-        let ft = md.file_type();
-        let mut kind = if ft.is_file() {
-            KIND_FILE
-        } else if ft.is_dir() {
-            KIND_DIR
-        } else if ft.is_symlink() {
-            KIND_LINK
-        } else {
-            KIND_OTHER
+    let mut me: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut me) } != 0 {
+        return;
+    }
+    BUF.with_borrow_mut(|buf| {
+        loop {
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut p = 0usize;
+            while p < n as usize {
+                // struct linux_dirent64: ino u64, off i64, reclen u16, type u8, name (NUL-terminated)
+                let reclen = u16::from_ne_bytes([buf[p + 16], buf[p + 17]]) as usize;
+                let rec = &buf[p..p + reclen];
+                p += reclen;
+                let name = &rec[19..];
+                let name = &name[..memchr::memchr(0, name).unwrap_or(name.len())];
+                if name == b"." || name == b".." || name.is_empty() || name.len() > u16::MAX as usize {
+                    continue;
+                }
+                stat_into(fd, rec[19..].as_ptr().cast(), name, rec[18], &me, l);
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn stat_into(fd: i32, cname: *const libc::c_char, name: &[u8], d_type: u8, me: &libc::stat, l: &mut Listing) {
+    let mut st: libc::statx = unsafe { std::mem::zeroed() };
+    let flags = libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT | libc::AT_STATX_DONT_SYNC;
+    let mask = libc::STATX_TYPE | libc::STATX_SIZE | libc::STATX_MTIME;
+    let (mut kind, size, mtime);
+    if unsafe { libc::statx(fd, cname, flags, mask, &mut st) } == 0 {
+        kind = match st.stx_mode as u32 & libc::S_IFMT {
+            libc::S_IFREG => KIND_FILE,
+            libc::S_IFDIR => KIND_DIR,
+            libc::S_IFLNK => KIND_LINK,
+            _ => KIND_OTHER,
         };
-        if ft.is_dir() && md.dev() != me.dev() {
+        // Like getattrlistbulk: a link's size is its target's length.
+        size = if kind == KIND_FILE || kind == KIND_LINK { st.stx_size } else { 0 };
+        mtime = st.stx_mtime.tv_sec.clamp(0, u32::MAX as i64) as u32;
+        let root = st.stx_attributes_mask & st.stx_attributes & libc::STATX_ATTR_MOUNT_ROOT as u64 != 0;
+        if kind == KIND_DIR && (root || libc::makedev(st.stx_dev_major, st.stx_dev_minor) != me.st_dev) && !crossable(fd, cname) {
             kind |= FLAG_MOUNT;
         }
-        let name = e.file_name();
-        let name = name.as_bytes();
-        if name.is_empty() || name.len() > u16::MAX as usize {
-            continue;
-        }
-        let size = if ft.is_file() { md.len() } else { 0 };
-        let mtime = md.mtime().clamp(0, u32::MAX as i64) as u32;
-        l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
-        l.names.extend_from_slice(name);
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        return;
+    } else {
+        // Listable but not searchable (no x on the folder): name only.
+        kind = match d_type {
+            libc::DT_REG => KIND_FILE,
+            libc::DT_LNK => KIND_LINK,
+            libc::DT_DIR => KIND_DIR,
+            _ => KIND_OTHER,
+        };
+        (size, mtime) = (0, 0);
     }
+    l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
+    l.names.extend_from_slice(name);
+}
+
+/// A mount point worth indexing: a local filesystem.
+#[cfg(target_os = "linux")]
+fn crossable(fd: i32, cname: *const libc::c_char) -> bool {
+    let m = unsafe { libc::openat(fd, cname, libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if m < 0 {
+        return false;
+    }
+    let mut sf: libc::statfs = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::fstatfs(m, &mut sf) } == 0 && !SKIP_FS.contains(&(sf.f_type as u32));
+    unsafe { libc::close(m) };
+    ok
 }
 
 #[cfg(target_os = "macos")]
@@ -279,4 +344,31 @@ fn parse_entry(b: &[u8], l: &mut Listing) {
     }
     l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
     l.names.extend_from_slice(name);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn scan_reports_kinds_sizes_and_no_symlink_targets() {
+        let root = std::env::temp_dir().join(format!("tov-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("d/e")).unwrap();
+        std::fs::write(root.join("d/f.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let ls = scan(root.as_os_str().as_bytes(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut seen: Vec<(String, u8, u64)> = ls
+            .iter()
+            .flat_map(|l| l.ents.iter().map(move |e| (l, e)))
+            .map(|(l, e)| (String::from_utf8_lossy(&l.names[e.name_off as usize..][..e.name_len as usize]).into_owned(), e.kind & 3, e.size))
+            .collect();
+        seen.sort();
+        let link = root.as_os_str().len() as u64;
+        let want = [("d", KIND_DIR, 0), ("e", KIND_DIR, 0), ("f.txt", KIND_FILE, 5), ("loop", KIND_LINK, link)];
+        assert_eq!(seen, want.map(|(n, k, s)| (n.to_string(), k, s)));
+        assert!(ls.iter().flat_map(|l| &l.ents).all(|e| e.mtime > 0));
+    }
 }

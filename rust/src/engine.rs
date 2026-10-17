@@ -1,10 +1,13 @@
-//! The engine: owns the live name index, follows FSEvents, keeps the content
-//! index current, and answers searches. The daemon runs one; so can any app
-//! that links this crate.
+//! The engine: owns the live name index, follows FSEvents (inotify on
+//! Linux), keeps the content index current, and answers searches. The
+//! daemon runs one; so can any app that links this crate.
 
 use crate::content::{self, Content, Grep, GrepResult};
-use crate::fsevents::{self, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
+#[cfg(target_os = "macos")]
+use crate::fsevents::{self as watcher, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
 use crate::index::Index;
+#[cfg(target_os = "linux")]
+use crate::inotify::{self as watcher, HISTORY_DONE, KERNEL_DROPPED, MUST_SCAN_SUBDIRS, USER_DROPPED};
 use crate::live::{Applied, Live};
 use crate::query::{Query, Searcher};
 use crate::walk;
@@ -80,7 +83,7 @@ struct Shared {
     home: String,
     dir: PathBuf,
     /// Wakes the apply loop; an empty batch is a no-op wake-up.
-    wake: Sender<Vec<fsevents::Event>>,
+    wake: Sender<Vec<watcher::Event>>,
     save_requested: AtomicBool,
     /// (dirs, trees) for the content worker to re-sync.
     content_tx: Sender<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
@@ -92,7 +95,10 @@ struct Shared {
     /// owner goes away.
     owner: AtomicBool,
     lock: std::fs::File,
-    stream: Mutex<Option<fsevents::Stream>>,
+    #[cfg(target_os = "macos")]
+    stream: Mutex<Option<watcher::Stream>>,
+    #[cfg(target_os = "linux")]
+    stream: Mutex<Option<Arc<watcher::Stream>>>,
     /// The stream is still replaying history (until HISTORY_DONE).
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
@@ -107,8 +113,12 @@ fn log(msg: impl AsRef<str>) {
     eprintln!("{} {}", crate::query::now_secs(), msg.as_ref());
 }
 
+#[cfg(not(target_os = "macos"))]
+use crate::no_materialize;
+
 /// Never let indexing download iCloud placeholders: on the calling thread,
 /// opening or listing a dataless file fails fast instead of materializing it.
+#[cfg(target_os = "macos")]
 pub fn no_materialize() {
     unsafe extern "C" {
         fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
@@ -124,8 +134,11 @@ fn search_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .thread_name(|i| format!("tov-search-search-{i}"))
-            .start_handler(|_| unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+            .start_handler(|_| {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+                }
             })
             .build()
             .unwrap()
@@ -195,7 +208,11 @@ impl Engine {
         let owner = try_lock(&lock);
         let skip: Vec<Vec<u8>> = match opts.skip {
             Some(v) => v.into_iter().map(|p| p.as_os_str().as_bytes().to_vec()).collect(),
+            #[cfg(target_os = "linux")]
+            None => gated(&opts.home),
+            #[cfg(target_os = "macos")]
             None if has_full_disk_access() && std::env::var_os("TOV_SEARCH_RESTRICT").is_none() => Vec::new(),
+            #[cfg(target_os = "macos")]
             None => {
                 log("no Full Disk Access: skipping consent-gated folders (grant it to tov-search to index everything)");
                 gated(&opts.home)
@@ -225,10 +242,14 @@ impl Engine {
             content_seen: Mutex::new(None),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
+        #[cfg(target_os = "macos")]
         let since = match &base {
             Some(b) if b.event_id != 0 => b.event_id,
-            _ => unsafe { fsevents::FSEventsGetCurrentEventId() },
+            _ => unsafe { watcher::FSEventsGetCurrentEventId() },
         };
+        #[cfg(target_os = "linux")]
+        let since = watcher::now_id();
+        #[cfg(target_os = "macos")]
         if owner {
             // Watch before scanning so nothing that changes mid-scan is
             // missed; replaying it afterwards is harmless (diffs are idempotent).
@@ -239,6 +260,7 @@ impl Engine {
             let base = match base {
                 Some(b) => {
                     log(format!("loaded {} entries, replaying events since {}", b.n, b.event_id));
+                    #[cfg(target_os = "macos")]
                     if !owner {
                         s.watch(b.event_id);
                     }
@@ -248,11 +270,16 @@ impl Engine {
                 None => {
                     // The owner is building it; follow once it exists.
                     let b = wait_for_index(&s.dir);
+                    #[cfg(target_os = "macos")]
                     s.watch(b.event_id);
                     b
                 }
             };
             *s.live.write().unwrap() = Some(Live::new(base));
+            // inotify watches what the index holds, then catches up on what
+            // changed since it was saved (or scanned).
+            #[cfg(target_os = "linux")]
+            s.watch(0);
             if owner {
                 start_content(&s);
             }
@@ -343,7 +370,7 @@ impl Engine {
             content_segments: c.segs.len(),
             content_bytes: c.bytes(),
             content_pending: self.s.content_pending.load(Ordering::Relaxed),
-            full_disk_access: walk::SKIP.get().is_none(),
+            full_disk_access: cfg!(target_os = "linux") || walk::SKIP.get().is_none(),
             owner: self.s.owner(),
         }
     }
@@ -363,10 +390,29 @@ impl Shared {
     }
 
     /// (Re)start the FSEvents stream from `since`, replacing any old one.
+    #[cfg(target_os = "macos")]
     fn watch(&self, since: u64) {
         self.replaying.store(true, Ordering::Relaxed);
-        let new = fsevents::watch(since, 0.1, self.wake.clone());
+        let new = watcher::watch(since, 0.1, self.wake.clone());
         *self.stream.lock().unwrap() = Some(new);
+    }
+
+    /// Watch every folder of the live index (once, or again when the watch
+    /// limit was raised), then catch up: relist folders changed since the
+    /// index was last in sync. inotify keeps no history to replay.
+    #[cfg(target_os = "linux")]
+    fn watch(&self, _since: u64) {
+        self.replaying.store(true, Ordering::Relaxed);
+        let w = self.stream.lock().unwrap().get_or_insert_with(|| watcher::Stream::start(self.wake.clone())).clone();
+        if w.wants_rewatch() {
+            let t = Instant::now();
+            let g = self.live.read().unwrap();
+            w.watch_all(|keep| g.as_ref().unwrap().dirs_where(keep));
+            log(format!("inotify: watching folders took {:.2?}", t.elapsed()));
+        }
+        let flags = MUST_SCAN_SUBDIRS | if w.degraded() { USER_DROPPED } else { 0 };
+        let (root, id) = (b"/".to_vec(), watcher::now_id());
+        let _ = self.wake.send(vec![watcher::Event { path: root.clone(), flags, id }, watcher::Event { path: root, flags: HISTORY_DONE, id }]);
     }
 
     /// A follower picks up what the owner wrote: a newer name-index save
@@ -379,8 +425,9 @@ impl Shared {
             && let Some(base) = Index::load(&path)
         {
             log(format!("following the owner's save: {} entries, replaying since {}", base.n, base.event_id));
-            self.watch(base.event_id);
+            let since = base.event_id;
             *self.live.write().unwrap() = Some(Live::new(base));
+            self.watch(since);
         }
         let cdir = self.dir.join("content");
         let changed = std::fs::metadata(&cdir).and_then(|m| m.modified()).ok();
@@ -425,6 +472,7 @@ fn wait_for_index(dir: &Path) -> Index {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[rustfmt::skip]
 const GATED_IN_HOME: &[&str] = &[
     "Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
@@ -432,24 +480,52 @@ const GATED_IN_HOME: &[&str] = &[
 ];
 
 /// Folders macOS guards with a consent prompt (or that hold other volumes).
+#[cfg(target_os = "macos")]
 pub fn gated(home: &str) -> Vec<Vec<u8>> {
     GATED_IN_HOME.iter().map(|d| format!("{home}/{d}").into_bytes()).chain([b"/Volumes".to_vec()]).collect()
 }
 
+/// Linux: the kernel's and the runtime's pseudo filesystems. Other mounts
+/// of their types are skipped by type (`walk::SKIP_FS`).
+#[cfg(target_os = "linux")]
+pub fn gated(_home: &str) -> Vec<Vec<u8>> {
+    [&b"/proc"[..], b"/sys", b"/dev", b"/run"].map(<[u8]>::to_vec).to_vec()
+}
+
 /// The system TCC database is readable only with Full Disk Access, and
 /// trying without it fails immediately (no prompt).
+#[cfg(target_os = "macos")]
 pub fn has_full_disk_access() -> bool {
     std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+}
+
+/// No such gate on Linux: unreadable folders are just skipped.
+#[cfg(target_os = "linux")]
+pub fn has_full_disk_access() -> bool {
+    true
+}
+
+/// The calling thread does background work.
+fn background() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
+    };
+    // Linux: nice applies per thread.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10)
+    };
 }
 
 fn content_loop(shared: &Shared, rx: Receiver<(Vec<Vec<u8>>, Vec<Vec<u8>>)>) {
     // Indexing file contents is background work: utility QoS keeps it off
     // the user's way (lower CPU priority and IO tier).
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+    background();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        .start_handler(|_| {
+            background();
             no_materialize();
         })
         .build()
@@ -542,7 +618,7 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     let t = Instant::now();
     let started = crate::query::now_secs();
     let ls = walk::scan(b"/", SCAN_THREADS);
-    let idx = Index::build(ls, event_id, started, shared.home.as_bytes());
+    let idx = build_index(ls, event_id, started, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
@@ -554,6 +630,15 @@ fn full_build(shared: &Shared, event_id: u64) -> Index {
     Index::load(&path).unwrap_or(idx)
 }
 
+/// `Index::build`, ranking folders the way this OS lays out a disk.
+fn build_index(ls: Vec<walk::Listing>, event_id: u64, synced_at: u32, home: &[u8]) -> Index {
+    #[cfg(target_os = "linux")]
+    return Index::build_ranked(ls, event_id, synced_at, home, crate::index::linux_prior_adjust);
+    #[cfg(target_os = "macos")]
+    Index::build(ls, event_id, synced_at, home)
+}
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
@@ -561,7 +646,14 @@ unsafe extern "C" {
 /// Hand freed allocator memory back to the OS after big transient work
 /// (index builds, content batches) instead of letting malloc cache it.
 fn release_memory() {
-    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0)
+    };
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0)
+    };
 }
 
 fn compact(shared: &Shared) {
@@ -571,7 +663,7 @@ fn compact(shared: &Shared) {
         let live = g.as_ref().unwrap();
         (live.to_listings(), live.event_id, live.synced_at)
     };
-    let idx = Index::build(ls, eid, synced, shared.home.as_bytes());
+    let idx = build_index(ls, eid, synced, shared.home.as_bytes());
     let path = shared.dir.join("index.bin");
     if let Err(e) = idx.save(&path) {
         log(format!("save failed: {e}"));
@@ -613,20 +705,40 @@ fn relist_changed(shared: &Shared, why: &str, flags: u32) {
         live.synced_at = started;
         std::mem::take(&mut live.trees)
     };
+    // Folders this found (made while nobody watched) need watches; what
+    // changed in them before the watch existed is caught by one more pass.
+    #[cfg(target_os = "linux")]
+    if let Some(w) = shared.stream.lock().unwrap().clone()
+        && trees.iter().fold(false, |any, t| w.add_tree(t.clone()) | any)
+    {
+        let _ = shared.wake.send(vec![watcher::Event { path: b"/".to_vec(), flags: MUST_SCAN_SUBDIRS, id: watcher::now_id() }]);
+    }
     let n = dirs.len();
     let _ = shared.content_tx.send((dirs, trees));
+    #[cfg(target_os = "linux")]
+    if n > 0 || flags & USER_DROPPED == 0 {
+        log(format!("caught up ({why}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)", t.elapsed()));
+    }
+    #[cfg(target_os = "macos")]
     log(format!(
         "FSEvents lost track of / ({why}, flags {flags:#x}): relisted {n} folders changed since {from} in {:.2?} ({stat_time:.2?} checking)",
         t.elapsed()
     ));
 }
 
-fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
+fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<watcher::Event>>) {
     let mut last_save = Instant::now();
     let mut last_follow = Instant::now();
+    #[cfg(target_os = "linux")]
+    let mut last_catch_up = Instant::now();
     let ours = shared.dir.as_os_str().as_bytes();
     loop {
-        let mut events = match rx.recv_timeout(Duration::from_secs(60)) {
+        #[cfg(target_os = "macos")]
+        let idle = Duration::from_secs(60);
+        // Wake for the next catch-up.
+        #[cfg(target_os = "linux")]
+        let idle = watcher::CATCH_UP_EVERY.saturating_sub(last_catch_up.elapsed()).max(Duration::from_millis(100));
+        let mut events = match rx.recv_timeout(idle) {
             Ok(b) => b,
             Err(RecvTimeoutError::Timeout) => Vec::new(),
             Err(RecvTimeoutError::Disconnected) => return,
@@ -644,8 +756,9 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
                     root_flags |= e.flags;
                 }
                 if e.flags & HISTORY_DONE != 0 {
-                    log("replay done");
-                    shared.replaying.store(false, Ordering::Relaxed);
+                    if shared.replaying.swap(false, Ordering::Relaxed) {
+                        log("replay done");
+                    }
                     continue;
                 }
                 *dirs.entry(crate::live::normalize(&e.path)).or_default() |= e.flags & MUST_SCAN_SUBDIRS != 0;
@@ -674,10 +787,17 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
             trees.extend(rec.into_iter().map(|(p, _)| p));
             let _ = shared.content_tx.send((flat.into_iter().map(|(p, _)| p).collect(), trees));
             if rebuild {
+                #[cfg(target_os = "macos")]
                 let why = match root_flags {
                     f if f & KERNEL_DROPPED != 0 => "kernel dropped events",
                     f if f & USER_DROPPED != 0 => "events dropped before we read them",
                     _ => "history unavailable",
+                };
+                #[cfg(target_os = "linux")]
+                let why = match root_flags {
+                    f if f & KERNEL_DROPPED != 0 => "inotify queue overflowed",
+                    f if f & USER_DROPPED != 0 => "some folders are unwatched",
+                    _ => "start",
                 };
                 relist_changed(shared, why, root_flags);
             } else if !shared.replaying.load(Ordering::Relaxed) {
@@ -688,6 +808,15 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
         }
         if let Some(l) = shared.live.read().unwrap().as_ref() {
             l.names_cache.trim_if_idle(Duration::from_secs(60));
+        }
+        // Folders inotify could not watch are caught up by mtime instead.
+        #[cfg(target_os = "linux")]
+        if last_catch_up.elapsed() >= watcher::CATCH_UP_EVERY {
+            last_catch_up = Instant::now();
+            let w = shared.stream.lock().unwrap().clone();
+            if w.is_some_and(|w| w.degraded() || w.wants_rewatch()) {
+                shared.watch(0);
+            }
         }
         if !shared.owner() && (owner_wrote || last_follow.elapsed() > FOLLOW_EVERY) {
             last_follow = Instant::now();
@@ -712,6 +841,17 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<fsevents::Event>>) {
 }
 
 /// Default data dir: `~/Library/Application Support/TovSearch`.
+#[cfg(target_os = "macos")]
 pub fn default_dir(home: &str) -> PathBuf {
     Path::new(home).join("Library/Application Support/TovSearch")
+}
+
+/// Default data dir on Linux: `$XDG_DATA_HOME/tov-search`, else
+/// `~/.local/share/tov-search`.
+#[cfg(target_os = "linux")]
+pub fn default_dir(home: &str) -> PathBuf {
+    match std::env::var_os("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute()) {
+        Some(d) => PathBuf::from(d).join("tov-search"),
+        None => Path::new(home).join(".local/share/tov-search"),
+    }
 }
