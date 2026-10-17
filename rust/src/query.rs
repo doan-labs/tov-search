@@ -2174,20 +2174,21 @@ impl Searcher<'_> {
             } else {
                 Some(&prevb_hold[..])
             }
+        } else if carry.is_none() {
+            // Nothing carries over from the last table (a first keystroke,
+            // or a query that doesn't narrow it): the full pass's own mask
+            // early-out beats a fit-set prepass, and it runs on every thread.
+            None
         } else {
             cand = prev.as_ref().map(|p| p.names.maybe().into_owned()).unwrap_or_else(|| vec![0; self.live.base.u.div_ceil(64)]);
-            let mut any = false;
             for (i, t) in q.tokens.iter().enumerate() {
                 let same =
                     prev.as_ref().and_then(|p| p.key.tokens.get(i)).is_some_and(|(pt, pm, pn)| pt == &t.text && pm == &t.mode && pn == &t.negate);
                 if !same {
                     self.union_fits(t, &mut cand);
-                    any = true;
                 }
             }
-            // A first keystroke's single positive token gains nothing over
-            // the full pass's own mask early-out.
-            if any || prev.is_some() { Some(&cand) } else { None }
+            Some(&cand)
         };
         // Multi-token: a hit lies in every positive token's cover, so a name
         // outside the smallest cover of an earlier (already typed) token

@@ -165,12 +165,26 @@ fn bench(qs: &str) {
     let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run tov-search serve"));
     let live = live::Live::new(idx);
     let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
+    // Like the daemon: searches on user-interactive threads.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+            }
+        })
+        .build()
+        .unwrap();
     let s = query::Searcher { live: &live };
+    // Between runs, another name search: a repeat would be answered from
+    // the names cache, which only a repeat of the last query hits.
+    let other = query::Query::parse("zzzzzz", &home()).unwrap();
     let mut times = Vec::new();
     let mut hits = Vec::new();
     for _ in 0..20 {
+        pool.install(|| s.search(&other));
         let t = Instant::now();
-        hits = s.search(&q);
+        hits = pool.install(|| s.search(&q));
         times.push(t.elapsed());
     }
     let mut p = Vec::new();
@@ -178,8 +192,9 @@ fn bench(qs: &str) {
         live.base.path(h.idx as usize, &mut p);
         println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
     }
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    eprintln!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0]);
 }
 
 /// Copy this binary to ~/.local/bin; the installed path.
