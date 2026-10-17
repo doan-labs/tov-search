@@ -2008,32 +2008,38 @@ impl Searcher<'_> {
         self.union_fits(pos[t], &mut fits);
         // The names' entries, and the subtrees of those that are folders.
         let (mut ents, mut trees, mut n) = (Vec::new(), Vec::new(), 0usize);
-        'names: for (w, &word) in fits.iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                let i = word.trailing_zeros();
-                word &= word - 1;
-                let k = w * 64 + i as usize;
-                if token_score(idx.uname(k as u32), mask[k], pos[t]).is_none() {
-                    continue;
+        // The names that match, scored on every thread, in id order.
+        let matched = par_each(nw.div_ceil(CHUNK_WORDS), || (), |_, c| {
+            let mut out = Vec::new();
+            for w in c * CHUNK_WORDS..((c + 1) * CHUNK_WORDS).min(nw) {
+                let mut word = fits[w];
+                while word != 0 {
+                    let k = w * 64 + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    if token_score(idx.uname(k as u32), mask[k], pos[t]).is_some() {
+                        out.push(k);
+                    }
                 }
-                for &e in &ne[ne_off[k] as usize..ne_off[k + 1] as usize] {
-                    if n > SELECTIVE {
-                        break 'names;
-                    }
-                    let e = e as usize;
-                    if (lo..hi).contains(&e) {
-                        ents.push(e as u32);
-                        n += 1;
-                    }
-                    if kind[e] & 3 == KIND_DIR
-                        && let Some(d) = idx.dir_of(e as u32)
-                    {
-                        let (a, b) = (idx.dir_start()[d as usize].max(lo as u32), idx.dir_end()[d as usize].min(hi as u32));
-                        if a < b {
-                            trees.push((a, b));
-                            n += (b - a) as usize;
-                        }
+            }
+            out
+        });
+        'names: for k in matched.into_iter().flatten() {
+            for &e in &ne[ne_off[k] as usize..ne_off[k + 1] as usize] {
+                if n > SELECTIVE {
+                    break 'names;
+                }
+                let e = e as usize;
+                if (lo..hi).contains(&e) {
+                    ents.push(e as u32);
+                    n += 1;
+                }
+                if kind[e] & 3 == KIND_DIR
+                    && let Some(d) = idx.dir_of(e as u32)
+                {
+                    let (a, b) = (idx.dir_start()[d as usize].max(lo as u32), idx.dir_end()[d as usize].min(hi as u32));
+                    if a < b {
+                        trees.push((a, b));
+                        n += (b - a) as usize;
                     }
                 }
             }
