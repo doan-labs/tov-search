@@ -1,0 +1,232 @@
+// Entry filters and the per-entry passes that fill the top-k lists.
+
+import { NO, MAXV, NF_OK } from "./consts"
+import { zerosU32 } from "./bytes"
+import { entName, entKind, entSize, entMtime, entParent, dirPrior,
+  neOff, ne, neStat, peak, statOrder, statOrdered } from "./index"
+import { rankTweaks } from "./prior"
+import { qNpos, qNneg } from "./score"
+import { okBuf, okCount, cand, candSet, hScore, hFlags, hBits, present } from "./names"
+import { mBits, mBest0, mBest1, mBest2, mBest3, memoOf } from "./memos"
+import { topScore, topIdx, topK, push, resetTop } from "./topk"
+import { Query } from "./query"
+import { dirNeg, nameNeg } from "./negs"
+
+// The current query's entry filters.
+export let qKind = -1
+export let qSizeLo = 0
+export let qSizeHi = MAXV
+export let qMtimeLo = 0
+export let qMtimeHi = 4294967295
+export let qNeedDirs = false
+
+// Does entry i pass the kind, size and mtime filters?
+export function passes(i: int): bool {
+  if (qKind >= 0 && (int(entKind[i]!) & 3) !== qKind) {
+    return false
+  }
+  const sz = entSize[i]!
+  if (sz < qSizeLo || sz > qSizeHi) {
+    return false
+  }
+  const mt = int(entMtime[i]!)
+  return mt >= qMtimeLo && mt <= qMtimeHi
+}
+
+// Score of entry i (its name id is live and OK), or NO if it fails a filter.
+export function scoreEntry(i: int, id: int): int {
+  if (!passes(i)) {
+    return NO
+  }
+  const k = int(entKind[i]!)
+  const mt = int(entMtime[i]!)
+  let score = int(hScore[id]!)
+  const p = int(entParent[i]!)
+  if (qNeedDirs) {
+    const all = (1 << qNpos) - 1
+    const mb = mBits[p]!
+    const nbits = int(hBits[id]!)
+    if (mb === -1 || ((nbits | mb) & all) !== all) {
+      return NO
+    }
+    for (let t = 0; t < qNpos; t++) {
+      if ((nbits & (1 << t)) === 0) {
+        // Matched by a folder on the path instead.
+        let b = 6
+        if (t === 0) {
+          b = Math.trunc(int(mBest0[p]!) * 3 / 4)
+        } else if (t === 1) {
+          b = Math.trunc(int(mBest1[p]!) * 3 / 4)
+        } else if (t === 2) {
+          b = Math.trunc(int(mBest2[p]!) * 3 / 4)
+        } else if (t === 3) {
+          b = Math.trunc(int(mBest3[p]!) * 3 / 4)
+        }
+        score += b
+      }
+    }
+  }
+  return score + int(dirPrior[p]!) + rankTweaks(int(hFlags[id]!), k, mt)
+}
+
+export let kScore: int[] = []
+export let kIdx: int[] = []
+
+// hook: the best topK entries in [lo, hi) whose name is live and OK (by score,
+// then lower index), into kScore/kIdx best first; returns how many.
+// reads: topK u gen now okBuf okCount entName entKind entSize entMtime entParent
+// reads: hScore hFlags hBits dirPrior mBits mBest0 mBest1 mBest2 mBest3
+// reads: qKind qSizeLo qSizeHi qMtimeLo qMtimeHi qNpos qNeedDirs
+// writes: kScore[:return] kIdx[:return]
+export function fullPass(lo: int, hi: int): int {
+  // topScore/topIdx are this body's scratch: empty on the way in and out, so
+  // the kernel (which never touches them) leaves the same state behind.
+  resetTop()
+  for (let i = lo; i < hi; i++) {
+    const id = int(entName[i]!)
+    if (present(id) && (int(hFlags[id]!) & NF_OK) !== 0) {
+      const s = scoreEntry(i, id)
+      if (s !== NO) {
+        push(s, i)
+      }
+    }
+  }
+  const got = topScore.length
+  for (let j = 0; j < got; j++) {
+    kScore[j] = topScore[j]!
+    kIdx[j] = topIdx[j]!
+  }
+  resetTop()
+  return got
+}
+
+export function byNamePass(lo: int, hi: int): void {
+  if (topK === 0 || okCount === 0) {
+    return
+  }
+  let minBound = 2147483647
+  let maxBound = -2147483648
+  for (let c = 0; c < okCount; c++) {
+    const id = int(okBuf[c]!)
+    const bound = int(hScore[id]!) + int(peak[id]!)
+    minBound = bound < minBound ? bound : minBound
+    maxBound = bound > maxBound ? bound : maxBound
+  }
+  const buckets = zerosU32(maxBound - minBound + 1)
+  for (let c = 0; c < okCount; c++) {
+    const id = int(okBuf[c]!)
+    const b = int(hScore[id]!) + int(peak[id]!) - minBound
+    buckets[b] = u32(int(buckets[b]!) + 1)
+  }
+  let start = 0
+  for (let b = buckets.length - 1; b >= 0; b--) {
+    const count = int(buckets[b]!)
+    buckets[b] = u32(start)
+    start += count
+  }
+  for (let c = 0; c < okCount; c++) {
+    const id = int(okBuf[c]!)
+    const b = int(hScore[id]!) + int(peak[id]!) - minBound
+    const at = int(buckets[b]!)
+    candSet(at, id)
+    buckets[b] = u32(at + 1)
+  }
+
+  for (let c = 0; c < okCount; c++) {
+    const id = int(cand[c]!)
+    const nameScore = int(hScore[id]!)
+    const nameBound = nameScore + int(peak[id]!)
+    if (topScore.length === topK) {
+      const last = topScore.length - 1
+      if (nameBound < topScore[last]!) {
+        break
+      }
+    }
+    const a = int(neOff[id]!)
+    const b = int(neOff[id + 1]!)
+    for (let j = a; j < b; j++) {
+      const e = int(ne[j]!)
+      const entryBound = nameScore + int(neStat[j]!)
+      if (topScore.length === topK) {
+        const last = topScore.length - 1
+        const floorScore = topScore[last]!
+        const floorIdx = topIdx[last]!
+        if (entryBound < floorScore || (entryBound === floorScore && e > floorIdx)) {
+          break
+        }
+      }
+      if (e < lo || e >= hi) {
+        continue
+      }
+      // With one positive token and no directory needs, scoreEntry is
+      // hScore + dirPrior + rankTweaks (or NO for an entry filter).
+      const score = scoreEntry(e, id)
+      if (score !== NO) {
+        push(score, e)
+      }
+    }
+  }
+}
+
+// The walk over statOrder for a query with no positive name tokens. With no
+// positives scoreNamesLoop leaves hScore at zero and there is no folder-token
+// bonus, so every accepted score is its static score. With `names` false and
+// `negOnly` false the query has no name terms at all and every name is OK.
+// With `negOnly` the only name terms are negations, marked by loadNegs().
+export function statOrderPass(lo: int, hi: int, names: bool, negOnly: bool): void {
+  const filtered = qKind >= 0 || qSizeLo > 0 || qSizeHi < MAXV || qMtimeLo > 0 || qMtimeHi < 4294967295
+  for (let p = 0; p < statOrder.length; p++) {
+    const e = int(statOrder[p]!)
+    const stat = int(statOrdered[p]!)
+    if (topScore.length === topK) {
+      const last = topScore.length - 1
+      const floorScore = topScore[last]!
+      const floorIdx = topIdx[last]!
+      if (stat < floorScore || (stat === floorScore && e > floorIdx)) {
+        break
+      }
+    }
+    if (e < lo || e >= hi) {
+      continue
+    }
+    if (negOnly) {
+      // A negated folder drops most entries, so test it first.
+      if (dirNeg(int(entParent[e]!)) || nameNeg(int(entName[e]!))) {
+        continue
+      }
+    } else if (qNeedDirs) {
+      const pd = int(entParent[e]!)
+      memoOf(pd)
+      if (mBits[pd]! === -1) {
+        continue
+      }
+    }
+    if (names) {
+      const id = int(entName[e]!)
+      if (!present(id) || (int(hFlags[id]!) & NF_OK) === 0) {
+        continue
+      }
+    }
+    if (filtered && !passes(e)) {
+      continue
+    }
+    push(stat, e)
+  }
+}
+
+// Update the entry filters shared by the scoring passes.
+export function setFilters(q: Query): void {
+  qKind = q.kind
+  qSizeLo = q.sizeLo
+  qSizeHi = q.sizeHi
+  qMtimeLo = q.mtimeLo
+  qMtimeHi = q.mtimeHi
+  qNeedDirs = qNpos > 1 || qNneg > 0
+}
+
+export function kbufPad(): void {
+  while (kScore.length < topK) {
+    kScore.push(0)
+    kIdx.push(0)
+  }
+}

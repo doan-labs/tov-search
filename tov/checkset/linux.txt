@@ -1,0 +1,30 @@
+# Check set, Linux kernel tree at a5ebb76233b79db01e82e061173cb73c6d2b5c6b.
+# Written before any timing was looked at; never tuned on. Every prefix is typed.
+sched fair
+shced fair
+vmscan
+vmsacn
+nvme core.c
+bpf verifier
+bpf verifer
+tcp_input
+ext:c tcp_input
+ext:h list.h
+in:~/linux/fs inode.c
+kind:dir drivers net
+'Kconfig
+^dt-bindings
+.rst$
+size:>1mb
+btrfs extent tree
+ethtool !mellanox
+amdgpu dm
+!arch irq
+!test !tools Kconfig
+usb gadget
+syscall tbl
+Documentation sound
+page_alloc.c
+x
+k
+mm

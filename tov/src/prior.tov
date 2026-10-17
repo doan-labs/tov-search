@@ -1,0 +1,78 @@
+// Bundle/extension and location prior tables, and the static rank tweaks.
+
+import { KIND_DIR, KIND_LINK, FLAG_HIDDEN, NF_DOT, NF_APP } from "./consts"
+import { enc, bytesEq, endsWithCI, endsWithBytes, satSub } from "./bytes"
+import { nb } from "./index"
+import { now } from "./disk"
+
+export const BUNDLE_EXTS = [".framework", ".bundle", ".plugin", ".appex", ".kext", ".xpc", ".lproj", ".xcassets", ".photoslibrary",
+  ".musiclibrary", ".tvlibrary", ".imovielibrary", ".dSYM", ".xcarchive", ".sdk", ".platform"].map(enc)
+export const DEPTH1 = ["Users", "Applications", "Volumes", "Library", "System", "opt"].map(enc)
+export const DEPTH1_ADJ = [0, 10, -10, -25, -40, -25]
+export const ADJ_NAMES = ["Library", "Caches", "caches", "cache", "Cache", "Logs", "DerivedData", "CoreSimulator",
+  "node_modules", "__pycache__", "site-packages", "Pods", "venv", "bower_components",
+  "target", "build", "dist", "out", "vendor", "deps", "tmp", "temp",
+  "folders", "Containers", "Group Containers", "Application Support"].map(enc)
+export const ADJ_VALS = [-20, -20, -20, -20, -20, -20, -20, -20,
+  -30, -30, -30, -30, -30, -30,
+  -12, -12, -12, -12, -12, -12, -12, -12,
+  -10, -10, -10, -5]
+export const APPLICATIONS = enc("Applications")
+export const DOT_APP = enc(".app")
+
+// How much a directory's name moves everything under it in ranking.
+export function priorAdjust(o: int, l: int, depth: int): int {
+  if (depth === 1) {
+    for (let j = 0; j < DEPTH1.length; j++) {
+      if (bytesEq(o, l, DEPTH1[j]!)) {
+        return DEPTH1_ADJ[j]!
+      }
+    }
+    return -35
+  }
+  if (bytesEq(o, l, APPLICATIONS)) {
+    return 30
+  }
+  if (endsWithBytes(o, l, DOT_APP)) {
+    return -25
+  }
+  for (let j = 0; j < BUNDLE_EXTS.length; j++) {
+    if (endsWithCI(o, l, BUNDLE_EXTS[j]!)) {
+      return -20
+    }
+  }
+  if (l > 0 && nb(o) === 46) {
+    return -25
+  }
+  for (let j = 0; j < ADJ_NAMES.length; j++) {
+    if (bytesEq(o, l, ADJ_NAMES[j]!)) {
+      return ADJ_VALS[j]!
+    }
+  }
+  return 0
+}
+
+export function rankTweaks(flags: int, kind: int, mtime: int): int {
+  let s = 0
+  if ((flags & NF_DOT) !== 0) {
+    s -= 8
+  }
+  if ((kind & FLAG_HIDDEN) !== 0) {
+    s -= 8
+  }
+  const k = kind & 3
+  if ((k === KIND_DIR || k === KIND_LINK) && (flags & NF_APP) !== 0) {
+    s += 25
+  }
+  const age = satSub(now, mtime)
+  if (age <= 86400) {
+    s += 10
+  } else if (age <= 604800) {
+    s += 7
+  } else if (age <= 2592000) {
+    s += 4
+  } else if (age <= 31536000) {
+    s += 1
+  }
+  return s
+}

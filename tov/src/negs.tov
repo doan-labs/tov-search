@@ -1,0 +1,76 @@
+// Queries whose only name terms are negated words: every name is usable
+// except those a negation matches. Those few are marked in a bitset, so no
+// name table is built and the statOrder walk asks only "is this name, or a
+// folder above it, negated?".
+
+import { Z, ONE } from "./consts"
+import { zerosU32, zerosU8, zerosU64 } from "./bytes"
+import { u, umask, uoff, d, entName, dirEntry, dirParent } from "./index"
+import { fitsT, tokenMatches } from "./score"
+
+export let negBits: u64[] = []
+let negKey = ""
+let dnGen = 0
+let dnStamp: u32[] = []
+let dnNeg: u8[] = []
+let dnChain: int[] = []
+
+// hook: set bit k of negBits for each name k one of the first nt tokens (all
+// negated) matches, and clear every other bit.
+// reads: umask uoff unames tText tOff tMode tMask tLoose tStart u
+// writes: negBits
+export function markNegs(nt: int): void {
+  for (let w = 0; w < negBits.length; w++) {
+    negBits[w] = Z
+  }
+  for (let k = 0; k < u; k++) {
+    const m = umask[k]!
+    const o = int(uoff[k]!)
+    const l = int(uoff[k + 1]!) - o
+    for (let t = 0; t < nt; t++) {
+      if (fitsT(t, m) && tokenMatches(o, l, t)) {
+        negBits[k >> 6] = negBits[k >> 6]! | (ONE << u64(k & 63))
+        break
+      }
+    }
+  }
+}
+
+// Mark the names the query's nt negated tokens match, unless the last call
+// had the same tokens (key). Starts fresh folder answers when they change.
+export function loadNegs(key: string, nt: int): void {
+  if (dnStamp.length === 0) {
+    negBits = zerosU64((u + 63) >> 6)
+    dnStamp = zerosU32(d)
+    dnNeg = zerosU8(d)
+  }
+  if (key === negKey) {
+    return
+  }
+  markNegs(nt)
+  negKey = key
+  dnGen += 1
+}
+
+export function nameNeg(id: int): bool {
+  return ((negBits[id >> 6]! >> u64(id & 63)) & ONE) !== Z
+}
+
+// Is dir k, or a folder above it, negated? Folds only uncached ancestors.
+export function dirNeg(k: int): bool {
+  dnChain = []
+  let c = k
+  while (c !== 0 && int(dnStamp[c]!) !== dnGen) {
+    dnChain.push(c)
+    c = int(dirParent[c]!)
+  }
+  // The root has the empty name, which no word matches.
+  let neg = c !== 0 && int(dnNeg[c]!) === 1
+  for (let j = dnChain.length - 1; j >= 0; j--) {
+    const x = dnChain[j]!
+    neg = neg || nameNeg(int(entName[int(dirEntry[x]!)]!))
+    dnStamp[x] = u32(dnGen)
+    dnNeg[x] = u8(neg ? 1 : 0)
+  }
+  return neg
+}

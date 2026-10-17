@@ -1,0 +1,174 @@
+// The ranked fast path's index-side tables: eager per-name info, the top-key
+// list, head/short buckets, class counts and the start-fit transpose.
+
+import { Z, ONE } from "./consts"
+import { zerosU32, zerosU64, zerosI8, lowerAscii, endsWithBytes } from "./bytes"
+import { u, neOff, ne, entParent, dirPrior, uoff, umask, nb } from "./index"
+import { DOT_APP } from "./prior"
+
+export const RANKED_BINS = 1024
+export const RANKED_BIN0 = 256
+export const RANKED_FIRST_BATCH = 64
+export const RANKED_LAST_BATCH = 4096
+
+export const RANKED_WANT = 16384
+
+export let rankedNamePrior: i8[] = []
+export let rankedNameInfo: u32[] = []
+export let rankedByList: u32[] = []
+export let rankedByListCount = 0
+export let rankedHeadOff: u32[] = []
+export let rankedHeadIds: u32[] = []
+export let rankedShortOff: u32[] = []
+export let rankedShortIds: u32[] = []
+export let rankedKeyCounts: u32[] = []
+export let rankedCover = 0
+export let rankedStartFit: u64[] = []
+export let rankedClassCounts: u32[] = []
+
+export function rankedKey(info: u32): int {
+  const b = int(info & u32(255))
+  return b >= 128 ? b - 256 : b
+}
+
+export function rankedLen(info: u32): int {
+  return int((info >> u32(8)) & u32(255))
+}
+
+export function rankedStem(info: u32): int {
+  return int((info >> u32(16)) & u32(255))
+}
+
+export function rankedHead(info: u32): int {
+  return int(info >> u32(24))
+}
+
+// Allocate the ranked-name lookup tables.
+export function rankedIndexAlloc(): void {
+  const listCap = u < RANKED_WANT ? u : RANKED_WANT
+  const nw = Math.trunc((u + 63) / 64)
+  rankedNamePrior = zerosI8(u)
+  rankedNameInfo = zerosU32(u)
+  rankedByList = zerosU32(listCap)
+  rankedByListCount = 0
+  rankedHeadOff = zerosU32(257)
+  rankedHeadIds = zerosU32(listCap)
+  rankedShortOff = zerosU32(257)
+  rankedShortIds = zerosU32(u)
+  rankedKeyCounts = zerosU32(256)
+  rankedCover = 0
+  rankedStartFit = zerosU64(23 * nw)
+  rankedClassCounts = zerosU32(41)
+}
+
+// hook: eager NameInfo, ByKey, class counts and start-fit transpose
+// reads: neOff ne entParent dirPrior uoff unames umask u
+// writes: rankedNamePrior rankedNameInfo rankedByList rankedByListCount rankedHeadOff rankedHeadIds rankedShortOff rankedShortIds rankedKeyCounts rankedCover rankedStartFit rankedClassCounts
+export function rankedIndexBuild(): void {
+  const keyCounts = zerosU32(256)
+  const headCounts = zerosU32(256)
+  const shortCounts = zerosU32(256)
+  for (let id = 0; id < u; id++) {
+    const a = int(neOff[id]!)
+    const b = int(neOff[id + 1]!)
+    let prior = 0
+    if (a < b) {
+      prior = int(dirPrior[int(entParent[int(ne[a]!)!]!)!]!)
+      for (let j = a + 1; j < b; j++) {
+        const p = int(dirPrior[int(entParent[int(ne[j]!)!]!)!]!)
+        prior = p > prior ? p : prior
+      }
+    }
+    rankedNamePrior[id] = i8(prior)
+    const o = int(uoff[id]!)
+    const rawLen = int(uoff[id + 1]!) - o
+    const off = rawLen > 1 && nb(o) === 46 ? 1 : 0
+    let stem = rawLen
+    for (let j = rawLen - 1; j >= 0; j--) {
+      if (nb(o + j) === 46) {
+        stem = j > off ? j : rawLen
+        break
+      }
+    }
+    const len8 = rawLen - off < 255 ? rawLen - off : 255
+    const stem8 = stem - off < 255 ? stem - off : 255
+    const head = off < rawLen ? lowerAscii(nb(o + off)) : 0
+    const tweak = 10 + (endsWithBytes(o, rawLen, DOT_APP) ? 25 : 0) - (rawLen > 0 && nb(o) === 46 ? 8 : 0)
+    let key = prior + tweak - Math.trunc((rawLen < 80 ? rawLen : 80) / 3)
+    key = key < -128 ? -128 : key
+    const info = u32((key & 255) | (len8 << 8) | (stem8 << 16) | (head << 24))
+    rankedNameInfo[id] = info
+    const keyIndex = rankedKey(info) + 128
+    keyCounts[keyIndex] = u32(int(keyCounts[keyIndex]!) + 1)
+    if (len8 <= 3 || stem8 <= 3) {
+      shortCounts[head] = u32(int(shortCounts[head]!) + 1)
+    }
+  }
+  let cover = 128
+  let selected = 0
+  while (cover > -128 && selected + int(keyCounts[cover + 127]!) <= RANKED_WANT) {
+    cover -= 1
+    selected += int(keyCounts[cover + 128]!)
+  }
+  rankedCover = cover
+  rankedByListCount = selected
+  for (let k = 0; k < 256; k++) {
+    rankedKeyCounts[k] = keyCounts[k]!
+  }
+  const keyNext = zerosU32(256)
+  let listAt = 0
+  for (let k = 255; k >= cover + 128; k--) {
+    keyNext[k] = u32(listAt)
+    listAt += int(keyCounts[k]!)
+  }
+  for (let id = 0; id < u; id++) {
+    const key = rankedKey(rankedNameInfo[id]!) + 128
+    if (key >= cover + 128) {
+      const at = int(keyNext[key]!)
+      rankedByList[at] = u32(id)
+      keyNext[key] = u32(at + 1)
+    }
+  }
+  for (let p = 0; p < rankedByListCount; p++) {
+    const head = rankedHead(rankedNameInfo[int(rankedByList[p]!)]!)
+    headCounts[head] = u32(int(headCounts[head]!) + 1)
+  }
+  for (let h = 0; h < 256; h++) {
+    rankedHeadOff[h + 1] = u32(int(rankedHeadOff[h]!) + int(headCounts[h]!))
+    rankedShortOff[h + 1] = u32(int(rankedShortOff[h]!) + int(shortCounts[h]!))
+  }
+  const headNext = zerosU32(256)
+  const shortNext = zerosU32(256)
+  for (let h = 0; h < 256; h++) {
+    headNext[h] = rankedHeadOff[h]!
+    shortNext[h] = rankedShortOff[h]!
+  }
+  for (let p = 0; p < rankedByListCount; p++) {
+    const id = int(rankedByList[p]!)
+    const head = rankedHead(rankedNameInfo[id]!)
+    const at = int(headNext[head]!)
+    rankedHeadIds[at] = u32(id)
+    headNext[head] = u32(at + 1)
+  }
+  for (let id = 0; id < u; id++) {
+    const info = rankedNameInfo[id]!
+    if (rankedLen(info) <= 3 || rankedStem(info) <= 3) {
+      const head = rankedHead(info)
+      const at = int(shortNext[head]!)
+      rankedShortIds[at] = u32(id)
+      shortNext[head] = u32(at + 1)
+    }
+    const m = umask[id]!
+    for (let c = 0; c < 41; c++) {
+      if ((m & (ONE << u64(c))) !== Z) {
+        rankedClassCounts[c] = u32(int(rankedClassCounts[c]!) + 1)
+      }
+    }
+    for (let h = 0; h < 23; h++) {
+      if ((m & (ONE << u64(41 + h))) !== Z) {
+        const w = h * Math.trunc((u + 63) / 64) + Math.trunc(id / 64)
+        rankedStartFit[w] = rankedStartFit[w]! | (ONE << u64(id % 64))
+      }
+    }
+  }
+}

@@ -1,0 +1,299 @@
+// The ranked fast path for a bare single fuzzy token: bin candidates by a
+// cheap bound, score the best first, stop early when the floor passes cover.
+
+import { NO, Z, ONE, FUZZY, DELIM, NF_APP, NF_DOT } from "./consts"
+import { zerosU32, lowerAscii } from "./bytes"
+import { u, umask, uoff, neOff, ne, neStat, entParent, dirPrior, entKind, entMtime } from "./index"
+import { RANKED_BINS, RANKED_BIN0, RANKED_FIRST_BATCH, RANKED_LAST_BATCH, RANKED_WANT,
+  rankedNamePrior, rankedNameInfo, rankedByList, rankedByListCount, rankedHeadOff, rankedHeadIds,
+  rankedShortOff, rankedShortIds, rankedKeyCounts, rankedCover, rankedStartFit, rankedClassCounts,
+  rankedKey, rankedLen, rankedStem, rankedHead } from "./rankedindex"
+import { qNpos, qNneg, tText, tOff, tMode, tMask, fitsT, tokenScore, nameFlags, cls } from "./score"
+import { rankTweaks } from "./prior"
+import { trailingZeros64 } from "./masks"
+import { prefilter, cand, clamp16 } from "./names"
+import { topScore, topIdx, topK, push, resetTop } from "./topk"
+import { Query } from "./query"
+import { narrows, setPartial } from "./search"
+import { passes } from "./entries"
+
+// The ranked run's scratch state: bin histogram/cursors and the candidate pool.
+export let rankedWorkIds: u32[] = []
+export let rankedSortedIds: u32[] = []
+export let rankedBinHist: u32[] = []
+export let rankedBinStart: u32[] = []
+export let rankedBinEnd: u32[] = []
+export let rankedBinCursor: u32[] = []
+export let rankedRunHist: u32[] = []
+
+// Allocate the ranked-search scratch state.
+export function rankedRunAlloc(): void {
+  const listCap = u < RANKED_WANT ? u : RANKED_WANT
+  rankedWorkIds = zerosU32(u + listCap)
+  rankedSortedIds = zerosU32(u + listCap)
+  rankedBinHist = zerosU32(RANKED_BINS)
+  rankedBinStart = zerosU32(RANKED_BINS + 1)
+  rankedBinEnd = zerosU32(RANKED_BINS + 1)
+  rankedBinCursor = zerosU32(RANKED_BINS)
+  rankedRunHist = zerosU32(RANKED_BINS)
+}
+
+export function rankedBin(bound: int): int {
+  const b = bound + RANKED_BIN0
+  return b < 0 ? 0 : b >= RANKED_BINS ? RANKED_BINS - 1 : b
+}
+
+export function rankedCheap(id: int, m: int, t0: int, base: int): int {
+  const info = rankedNameInfo[id]!
+  const key = rankedKey(info)
+  let placement = 0
+  if (rankedHead(info) === t0) {
+    placement = rankedLen(info) === m ? 100 : rankedStem(info) === m ? 80 : 30
+  }
+  return base + key + placement
+}
+
+export function rankedCollect(t0: int, m: int, base: int, starts: bool): int {
+  for (let b = 0; b < RANKED_BINS; b++) {
+    rankedBinHist[b] = u32(0)
+  }
+  let count = 0
+  if (starts) {
+    const nw = Math.trunc((u + 63) / 64)
+    const row = (t0 % 23) * nw
+    for (let w = 0; w < nw; w++) {
+      let bits = rankedStartFit[row + w]!
+      while (bits !== Z) {
+        const bit = trailingZeros64(bits)
+        const id = w * 64 + bit
+        bits = bits & (bits - ONE)
+        if (id < u && rankedHead(rankedNameInfo[id]!) === t0 && fitsT(0, umask[id]!)) {
+          const b = rankedBin(rankedCheap(id, m, t0, base))
+          rankedWorkIds[count] = u32(id)
+          rankedBinHist[b] = u32(int(rankedBinHist[b]!) + 1)
+          count += 1
+        }
+      }
+    }
+  } else {
+    const ha = int(rankedHeadOff[t0]!)
+    const hb = int(rankedHeadOff[t0 + 1]!)
+    for (let p = ha; p < hb; p++) {
+      const id = int(rankedHeadIds[p]!)
+      if (fitsT(0, umask[id]!)) {
+        const b = rankedBin(rankedCheap(id, m, t0, base))
+        rankedWorkIds[count] = u32(id)
+        rankedBinHist[b] = u32(int(rankedBinHist[b]!) + 1)
+        count += 1
+      }
+    }
+    const sa = int(rankedShortOff[t0]!)
+    const sb = int(rankedShortOff[t0 + 1]!)
+    for (let p = sa; p < sb; p++) {
+      const id = int(rankedShortIds[p]!)
+      const info = rankedNameInfo[id]!
+      const whole = rankedLen(info) === m || rankedStem(info) === m
+      if (whole && rankedKey(info) < rankedCover && fitsT(0, umask[id]!)) {
+        const b = rankedBin(rankedCheap(id, m, t0, base))
+        rankedWorkIds[count] = u32(id)
+        rankedBinHist[b] = u32(int(rankedBinHist[b]!) + 1)
+        count += 1
+      }
+    }
+  }
+  let at = 0
+  for (let b = RANKED_BINS - 1; b >= 0; b--) {
+    rankedBinStart[b] = u32(at)
+    at += int(rankedBinHist[b]!)
+    rankedBinEnd[b] = u32(at)
+    rankedBinCursor[b] = rankedBinStart[b]!
+  }
+  rankedBinEnd[RANKED_BINS] = u32(0)
+  for (let p = 0; p < count; p++) {
+    const id = int(rankedWorkIds[p]!)
+    const b = rankedBin(rankedCheap(id, m, t0, base))
+    const pos = int(rankedBinCursor[b]!)
+    rankedSortedIds[pos] = u32(id)
+    rankedBinCursor[b] = u32(pos + 1)
+  }
+  return count
+}
+
+export function rankedEntryVisit(id: int, nameScore: int, lo: int, hi: int): void {
+  const a = int(neOff[id]!)
+  const b = int(neOff[id + 1]!)
+  for (let j = a; j < b; j++) {
+    const e = int(ne[j]!)
+    const bound = nameScore + int(neStat[j]!)
+    if (topScore.length === topK) {
+      const last = topScore.length - 1
+      const floorScore = topScore[last]!
+      const floorIdx = topIdx[last]!
+      if (bound < floorScore || (bound === floorScore && e > floorIdx)) {
+        break
+      }
+    }
+    // A filtered-out entry is skipped; its bound stays valid for the rest.
+    if (e < lo || e >= hi || !passes(e)) {
+      continue
+    }
+    const p = int(entParent[e]!)
+    const flags = nameFlags(int(uoff[id]!), int(uoff[id + 1]!) - int(uoff[id]!))
+    const score = nameScore + int(dirPrior[p]!) + rankTweaks(flags, int(entKind[e]!), int(entMtime[e]!))
+    push(score, e)
+  }
+}
+
+export function rankedScoreCandidate(id: int, floor: int, lo: int, hi: int): void {
+  const o = int(uoff[id]!)
+  const l = int(uoff[id + 1]!) - o
+  const raw = tokenScore(o, l, umask[id]!, 0)
+  if (raw === NO) {
+    return
+  }
+  const score = clamp16(raw)
+  const flags = nameFlags(o, l)
+  const tweak = 10 + ((flags & NF_APP) !== 0 ? 25 : 0) - ((flags & NF_DOT) !== 0 ? 8 : 0)
+  const prior = int(rankedNamePrior[id]!)
+  const bound = score + prior + tweak
+  if (bound >= floor) {
+    rankedEntryVisit(id, score, lo, hi)
+  }
+}
+
+export let rankedFloor = -2147483648
+export let rankedTop = RANKED_BINS
+export let rankedWant = RANKED_FIRST_BATCH
+export let rankedListed = 0
+
+export function rankedRun(complete: bool, tentative: bool, t0: int, m: int, base: int, lo: int, hi: int): int {
+  for (let b = 0; b < RANKED_BINS; b++) {
+    rankedRunHist[b] = rankedBinHist[b]!
+  }
+  for (let k = rankedCover; k <= 127; k++) {
+    const b = rankedBin(base + k)
+    rankedRunHist[b] = u32(int(rankedRunHist[b]!) + int(rankedKeyCounts[k + 128]!))
+  }
+  const least = complete ? 0 : rankedBin(base + rankedCover + 30)
+  while (rankedWant <= RANKED_LAST_BATCH &&
+      !(rankedFloor !== -2147483648 && (rankedTop === 0 || rankedFloor > rankedTop - 1 - RANKED_BIN0)) &&
+      rankedTop > least) {
+    const low = Math.max(rankedFloor === -2147483648 ? 0 : rankedBin(rankedFloor), least)
+    let cut = rankedTop
+    let nTaken = 0
+    while (cut > low && nTaken < rankedWant) {
+      cut -= 1
+      nTaken += int(rankedRunHist[cut]!)
+    }
+    const candidateEnd = int(rankedBinEnd[cut]!)
+    const candidateStart = int(rankedBinEnd[rankedTop]!)
+    for (let p = candidateStart; p < candidateEnd; p++) {
+      rankedScoreCandidate(int(rankedSortedIds[p]!), rankedFloor, lo, hi)
+    }
+    let listEnd = rankedListed
+    while (listEnd < rankedByListCount &&
+        rankedBin(base + rankedKey(rankedNameInfo[int(rankedByList[listEnd]!)]!)) >= cut) {
+      listEnd += 1
+    }
+    for (let p = rankedListed; p < listEnd; p++) {
+      const id = int(rankedByList[p]!)
+      const info = rankedNameInfo[id]!
+      if (rankedHead(info) !== t0 && fitsT(0, umask[id]!)) {
+        rankedScoreCandidate(id, rankedFloor, lo, hi)
+      }
+    }
+    rankedListed = listEnd
+    rankedTop = cut
+    if (topScore.length >= topK) {
+      rankedFloor = topScore[topK - 1]!
+    } else {
+      rankedFloor = -2147483648
+    }
+    rankedWant *= 4
+    const done = rankedFloor !== -2147483648 &&
+      (rankedTop === 0 || rankedFloor > rankedTop - 1 - RANKED_BIN0)
+    if ((tentative && !(done && rankedFloor >= base + rankedCover)) ||
+        (topScore.length < Math.trunc(topK / 4) && rankedWant > RANKED_FIRST_BATCH * 4)) {
+      if (!complete) {
+        break
+      }
+      return -1
+    }
+  }
+  const done = rankedFloor !== -2147483648 &&
+    (rankedTop === 0 || rankedFloor > rankedTop - 1 - RANKED_BIN0)
+  if (done && rankedFloor >= base + rankedCover &&
+      (complete || rankedFloor > base + rankedCover + 29)) {
+    return 1
+  }
+  if (!complete) {
+    return 0
+  }
+  if (rankedFloor === -2147483648) {
+    return -1
+  }
+  const count = prefilter(1)
+  for (let p = 0; p < count; p++) {
+    const id = int(cand[p]!)
+    const info = rankedNameInfo[id]!
+    const cheap = rankedCheap(id, m, t0, base)
+    const placed = rankedHead(info) === t0
+    const scored = rankedBin(cheap) >= rankedTop && (placed || rankedKey(info) >= rankedCover)
+    if (cheap >= rankedFloor && !scored && fitsT(0, umask[id]!)) {
+      rankedScoreCandidate(id, rankedFloor, lo, hi)
+    }
+  }
+  return 1
+}
+
+export function rankedTry(q: Query, lo: int, hi: int): bool {
+  if (topK <= 0 || qNpos !== 1 || qNneg !== 0 || tMode.length !== 1 ||
+      int(tMode[0]!) !== FUZZY || q.exts.length !== 0 || q.hasScope || narrows(q)) {
+    return false
+  }
+  const ql = int(tOff[1]!) - int(tOff[0]!)
+  const den = f64(u)
+  let estimate = den
+  for (let c = 0; c < 41; c++) {
+    if ((tMask[0]! & (ONE << u64(c))) !== Z) {
+      estimate = estimate * f64(int(rankedClassCounts[c]!)) / den
+    }
+  }
+  let tentative = false
+  if (estimate < 20000) {
+    let asciiLetters = true
+    for (let j = 0; j < ql; j++) {
+      const b = int(tText[int(tOff[0]!) + j]!)
+      if (b < 65 || (b > 90 && b < 97) || b > 122) {
+        asciiLetters = false
+        break
+      }
+    }
+    if (estimate < 1000 || !asciiLetters) {
+      return false
+    }
+    tentative = true
+  }
+  const t0 = lowerAscii(int(tText[int(tOff[0]!) ]!))
+  const base = 24 * ql + 8 - (cls(t0) === DELIM ? 16 : 0)
+  rankedFloor = -2147483648
+  rankedTop = RANKED_BINS
+  rankedWant = RANKED_FIRST_BATCH
+  rankedListed = 0
+  let status = 0
+  if (ql <= 3) {
+    rankedCollect(t0, ql, base, false)
+    status = rankedRun(false, tentative, t0, ql, base, lo, hi)
+  }
+  if (status === 0) {
+    rankedCollect(t0, ql, base, true)
+    status = rankedRun(true, tentative, t0, ql, base, lo, hi)
+  }
+  if (status === 1) {
+    // Ranked Some skips scoreNamesLoop, so current-generation h* state is incomplete.
+    setPartial(true)
+    return true
+  }
+  resetTop()
+  return false
+}

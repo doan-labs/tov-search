@@ -1,0 +1,252 @@
+// Covers for multi-word queries. A word's cover is every name that could fit
+// it, plus every name under a folder whose name matches it. Every hit of a
+// multi-word query lies in each positive word's cover, so a rebuilt name table
+// scores only names in the smallest earlier word's cover (plus every folder
+// name, for the folder memos), and the entry pass visits only that cover's
+// folder subtrees plus the outside entries whose own name matches the word.
+// Covers are built once per word and cached for the last COVER_CACHE words:
+// while the last word is typed, the earlier ones don't change. A word whose
+// folder subtrees hold more than COVER_MAX entries gets no cover.
+
+import { NO, Z, ONE, NF_OK } from "./consts"
+import { zerosU64 } from "./bytes"
+import { d, u, umask, uoff, entName, entParent, dirEntry, dirStart, dirEnd, dirParent,
+  neOff, ne } from "./index"
+import { qNpos, tText, tOff, tMode, fitsT, tokenScore } from "./score"
+import { cand, okBuf, okCount, hBits, hFlags, present } from "./names"
+import { memoOf } from "./memos"
+import { scoreEntry } from "./entries"
+import { topK, push } from "./topk"
+
+const COVER_CACHE = 8
+const COVER_MAX = 1 << 21
+
+let dirNames: u64[] = [] // names some folder carries, built on first use
+
+// The cache: one slot per word (text and mode).
+let cText: u8[][] = []
+let cMode: int[] = []
+let cOk: bool[] = [] // false: too broad, no cover
+let cNames: u64[][] = [] // names in the cover
+let cCount: int[] = []
+let cIn: u64[][] = [] // folders that match the word or lie under one that does
+let cTops: u32[][] = [] // matching folders with no matching folder above
+let cNext = 0
+
+// The cover the current name table was restricted to (tableTok < 0: none).
+export let tableTok = -1
+let tableIn: u64[] = []
+let tableTops: u32[] = []
+
+function hasBit(bits: u64[], i: int): bool {
+  return (bits[i >> 6]! & (ONE << u64(i & 63))) !== Z
+}
+
+function setBit(inout bits: u64[], i: int): void {
+  bits[i >> 6] = bits[i >> 6]! | (ONE << u64(i & 63))
+}
+
+// Cache slot of token t's cover, building it on a miss.
+function coverFor(t: int): int {
+  const ta = int(tOff[t]!)
+  const tb = int(tOff[t + 1]!)
+  for (let c = 0; c < cText.length; c++) {
+    const key = cText[c]!
+    if (cMode[c]! !== tMode[t]! || key.length !== tb - ta) {
+      continue
+    }
+    let same = true
+    for (let j = 0; j < key.length; j++) {
+      if (key[j]! !== tText[ta + j]!) {
+        same = false
+        break
+      }
+    }
+    if (same) {
+      return c
+    }
+  }
+
+  if (dirNames.length === 0) {
+    let all = zerosU64((u + 63) >> 6)
+    for (let k = 1; k < d; k++) {
+      setBit(&all, int(entName[int(dirEntry[k]!)]!))
+    }
+    dirNames = all
+  }
+  // Names that could fit t, and folder names that match it.
+  let names = zerosU64(dirNames.length)
+  let hit = zerosU64(dirNames.length)
+  let count = 0
+  for (let id = 0; id < u; id++) {
+    const m = umask[id]!
+    if (fitsT(t, m)) {
+      setBit(&names, id)
+      count += 1
+      const o = int(uoff[id]!)
+      if (hasBit(dirNames, id) && tokenScore(o, int(uoff[id + 1]!) - o, m, t) !== NO) {
+        setBit(&hit, id)
+      }
+    }
+  }
+  // Parents come before children, so one pass marks every folder under a hit.
+  let inside = zerosU64((d + 63) >> 6)
+  const tops: u32[] = []
+  let total = 0
+  for (let k = 1; k < d && total <= COVER_MAX; k++) {
+    const p = int(dirParent[k]!)
+    if (hasBit(inside, p)) {
+      setBit(&inside, k)
+    } else if (hasBit(hit, int(entName[int(dirEntry[k]!)]!))) {
+      setBit(&inside, k)
+      tops.push(u32(k))
+      total += int(dirEnd[k]!) - int(dirStart[k]!)
+    }
+  }
+  const ok = total <= COVER_MAX
+  if (ok) {
+    for (const k of tops) {
+      for (let e = int(dirStart[int(k)]!); e < int(dirEnd[int(k)]!); e++) {
+        const id = int(entName[e]!)
+        if (!hasBit(names, id)) {
+          setBit(&names, id)
+          count += 1
+        }
+      }
+    }
+    // Folder names stay in every table, for the folder memos.
+    for (let w = 0; w < names.length; w++) {
+      names[w] = names[w]! | dirNames[w]!
+    }
+  } else {
+    names = []
+    inside = []
+  }
+
+  const key: u8[] = []
+  for (let j = ta; j < tb; j++) {
+    key.push(tText[j]!)
+  }
+  let slot = cText.length
+  if (slot < COVER_CACHE) {
+    cText.push(key)
+    cMode.push(tMode[t]!)
+    cOk.push(ok)
+    cNames.push(names)
+    cCount.push(count)
+    cIn.push(inside)
+    cTops.push(tops)
+  } else {
+    slot = cNext
+    cNext = (cNext + 1) % COVER_CACHE
+    cText[slot] = key
+    cMode[slot] = tMode[t]!
+    cOk[slot] = ok
+    cNames[slot] = names
+    cCount[slot] = count
+    cIn[slot] = inside
+    cTops[slot] = tops
+  }
+  return slot
+}
+
+// A rebuilt table for a query with 2+ positive words: keep only the first
+// count candidates in the smallest earlier word's cover, or a folder's name.
+// Returns how many are kept. The last word isn't used: it changes on every
+// keystroke.
+export function restrictCand(count: int): int {
+  tableTok = -1
+  tableIn = []
+  tableTops = []
+  if (qNpos < 2) {
+    return count
+  }
+  let best = -1
+  for (let t = 0; t < qNpos - 1; t++) {
+    const c = coverFor(t)
+    if (cOk[c]! && (best < 0 || cCount[c]! < cCount[best]!)) {
+      best = c
+      tableTok = t
+    }
+  }
+  if (best < 0) {
+    return count
+  }
+  tableIn = cIn[best]!
+  tableTops = cTops[best]!
+  const names = cNames[best]!
+  let kept = 0
+  for (let c = 0; c < count; c++) {
+    const id = int(cand[c]!)
+    if (hasBit(names, id)) {
+      cand[kept] = u32(id)
+      kept += 1
+    }
+  }
+  return kept
+}
+
+let lastDir = -1 // the folder whose memo visit() last made current
+
+function visit(e: int): void {
+  const id = int(entName[e]!)
+  if (!present(id) || (int(hFlags[id]!) & NF_OK) === 0) {
+    return
+  }
+  const p = int(entParent[e]!)
+  if (p !== lastDir) {
+    memoOf(p)
+    lastDir = p
+  }
+  const s = scoreEntry(e, id)
+  if (s !== NO) {
+    push(s, e)
+  }
+}
+
+// The entry pass for a table restricted to a cover. Every hit lies under one
+// of the cover's folders or carries the word in its own name, so walk those
+// folder subtrees, then the entries outside them whose own name has the word.
+// Like search()'s few-candidates walk it makes folder memos one at a time, so
+// past the same 60000 entries it returns false and the parallel memos and
+// full pass run instead.
+export function coveredPass(lo: int, hi: int): bool {
+  const bit = 1 << tableTok
+  let work = 0
+  for (const k of tableTops) {
+    work += int(dirEnd[int(k)]!) - int(dirStart[int(k)]!)
+  }
+  for (let c = 0; c < okCount && work <= 60000; c++) {
+    const id = int(okBuf[c]!)
+    if ((int(hBits[id]!) & bit) !== 0) {
+      work += int(neOff[id + 1]!) - int(neOff[id]!)
+    }
+  }
+  if (work > 60000) {
+    return false
+  }
+  if (topK === 0) {
+    return true
+  }
+  lastDir = -1
+  for (const k of tableTops) {
+    const a = int(dirStart[int(k)]!)
+    const b = int(dirEnd[int(k)]!)
+    for (let e = a > lo ? a : lo; e < (b < hi ? b : hi); e++) {
+      visit(e)
+    }
+  }
+  for (let c = 0; c < okCount; c++) {
+    const id = int(okBuf[c]!)
+    if ((int(hBits[id]!) & bit) === 0) {
+      continue
+    }
+    for (let j = int(neOff[id]!); j < int(neOff[id + 1]!); j++) {
+      const e = int(ne[j]!)
+      if (e >= lo && e < hi && !hasBit(tableIn, int(entParent[e]!))) {
+        visit(e)
+      }
+    }
+  }
+  return true
+}

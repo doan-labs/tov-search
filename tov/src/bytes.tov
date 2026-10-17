@@ -1,0 +1,153 @@
+// Byte and array helpers shared by the engine's modules. The unames-indexed
+// ones read the index module's name bytes through nb; nothing here owns state.
+
+import { MAXV } from "./consts"
+import { nb } from "./index"
+
+export function zerosU32(n: int): u32[] {
+  const a: u32[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(u32(0))
+  }
+  return a
+}
+export function zerosU64(n: int): u64[] {
+  const a: u64[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(u64(0))
+  }
+  return a
+}
+export function zerosI32(n: int): i32[] {
+  const a: i32[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(i32(0))
+  }
+  return a
+}
+export function zerosI16(n: int): i16[] {
+  const a: i16[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(i16(0))
+  }
+  return a
+}
+export function zerosU8(n: int): u8[] {
+  const a: u8[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(u8(0))
+  }
+  return a
+}
+export function zerosI8(n: int): i8[] {
+  const a: i8[] = []
+  for (let i = 0; i < n; i++) {
+    a.push(i8(0))
+  }
+  return a
+}
+
+export function bytesEq(o: int, l: int, s: u8[]): bool {
+  if (l !== s.length) {
+    return false
+  }
+  for (let j = 0; j < l; j++) {
+    if (nb(o + j) !== int(s[j]!)) {
+      return false
+    }
+  }
+  return true
+}
+
+export function lowerAscii(b: int): int {
+  return b >= 65 && b <= 90 ? b + 32 : b
+}
+
+export function endsWithCI(o: int, l: int, s: u8[]): bool {
+  if (l <= s.length) {
+    return false
+  }
+  const at = o + l - s.length
+  for (let j = 0; j < s.length; j++) {
+    if (lowerAscii(nb(at + j)) !== lowerAscii(int(s[j]!))) {
+      return false
+    }
+  }
+  return true
+}
+
+export function enc(s: string): u8[] {
+  return new TextEncoder().encode(s)
+}
+
+export function endsWithBytes(o: int, l: int, s: u8[]): bool {
+  if (l < s.length) {
+    return false
+  }
+  const at = o + l - s.length
+  for (let j = 0; j < s.length; j++) {
+    if (nb(at + j) !== int(s[j]!)) {
+      return false
+    }
+  }
+  return true
+}
+
+export function encDec(s: int): int {
+  if (s < 2147483648) {
+    return s
+  }
+  let v = s >> 21
+  if (v > 2147483647) {
+    v = 2147483647
+  }
+  return v << 21
+}
+
+export function satU64(x: f64): int {
+  if (x >= 9223372036854775807.0) {
+    return MAXV
+  }
+  return Math.trunc(x)
+}
+
+export function satSub(a: int, b: int): int {
+  return a > b ? a - b : 0
+}
+
+export function isDigit(b: int): bool {
+  return b >= 48 && b <= 57
+}
+
+export function bytesKey(x: u8[]): string {
+  let k = ""
+  for (const b of x) {
+    k = k + `${b}.`
+  }
+  return k
+}
+
+export function bytesStart(a: u8[], b: u8[]): bool {
+  if (a.length < b.length) {
+    return false
+  }
+  for (let j = 0; j < b.length; j++) {
+    if (a[j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+export function bytesEnd(a: u8[], b: u8[]): bool {
+  if (a.length < b.length) {
+    return false
+  }
+  const off = a.length - b.length
+  for (let j = 0; j < b.length; j++) {
+    if (a[off + j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}

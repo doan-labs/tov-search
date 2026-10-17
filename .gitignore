@@ -1,0 +1,9 @@
+target/
+rust/bench/data/
+rust/bench/out/
+rust/bin/
+.DS_Store
+.probe/
+.diff-check/
+.firecrawl/
+__pycache__/

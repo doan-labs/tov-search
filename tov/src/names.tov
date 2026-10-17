@@ -1,0 +1,169 @@
+// The name table: one slot per distinct name for the current query, plus the
+// candidate and result buffers filled by the prefilter and scoring hooks.
+
+import { NO, Z, ONE, NF_OK, NF_NEG } from "./consts"
+import { zerosU32, zerosI32, zerosU8 } from "./bytes"
+import { u, umask, uoff, neOff } from "./index"
+import { qNpos, qNneg, tMask, tLoose, tStart, xOff,
+  fitsT, tokenScore, tokenMatches, extOk, nameFlags } from "./score"
+
+export let cand: u32[] = []
+
+// hook: ids of the names any of the nt tokens could match (fitsT), ascending,
+// into cand; returns how many.
+// reads: umask tMask tLoose tStart u
+// writes: cand[:return]
+export function prefilter(nt: int): int {
+  let c = 0
+  for (let k = 0; k < u; k++) {
+    const m = umask[k]!
+    for (let t = 0; t < nt; t++) {
+      const miss = tMask[t]! & ~m
+      if (miss === Z || (((miss & ~tLoose[t]!) | (miss & (miss - ONE))) === Z && (m & tStart[t]!) !== Z)) {
+        cand[c] = u32(k)
+        c += 1
+        break
+      }
+    }
+  }
+  return c
+}
+
+// One query's scored names. A slot is live when its stamp is the query's gen.
+export let gen = 0
+export let hStamp: u32[] = []
+export let hScore: i32[] = []
+export let hBits: u8[] = []
+export let hFlags: u8[] = []
+export let hBest0: i32[] = []
+export let hBest1: i32[] = []
+export let hBest2: i32[] = []
+export let hBest3: i32[] = []
+export let okBuf: u32[] = [] // names that pass as a match, ascending
+export let okCount = 0
+export let presBuf: u32[] = [] // every name given a slot this query, ascending
+export let presCount = 0
+export let okEntries = 0
+
+export function clamp16(x: int): int {
+  return x < -32768 ? -32768 : x > 32767 ? 32767 : x
+}
+
+// Score the ids in cand rather than 0..count? Set by scoreNames().
+export let fromCand = false
+
+// hook: score names against the query: the first `count` ids in cand, or
+// (fromCand false) ids 0..count. Fills the h* slots of every name a token
+// touches (their ids into presBuf, presCount), the ids that pass as a match
+// into okBuf (returns how many), and the entries carrying them into okEntries.
+// reads: cand umask uoff unames neOff tText tOff tMode tMask tLoose tStart xText xOff qNpos qNneg gen fromCand
+// writes: okEntries presCount okBuf[:return] presBuf[:presCount]
+// writes: hStamp hScore hBits hFlags hBest0 hBest1 hBest2 hBest3
+export function scoreNamesLoop(count: int): int {
+  const np = qNpos
+  const nt = qNpos + qNneg
+  let nok = 0
+  let npres = 0
+  okEntries = 0
+  for (let c = 0; c < count; c++) {
+    const k = fromCand ? int(cand[c]!) : c
+    const m = umask[k]!
+    const o = int(uoff[k]!)
+    const l = int(uoff[k + 1]!) - o
+    let score = 0
+    let bits = 0
+    let flags = nameFlags(o, l)
+    let b0 = 0
+    let b1 = 0
+    let b2 = 0
+    let b3 = 0
+    for (let t = 0; t < np; t++) {
+      if (fitsT(t, m)) {
+        const s = tokenScore(o, l, m, t)
+        if (s !== NO) {
+          bits = bits | (1 << t)
+          const s16 = clamp16(s)
+          score = clamp16(score + s16)
+          const bb = s16 > 0 ? s16 : 0
+          if (t === 0) {
+            b0 = bb
+          } else if (t === 1) {
+            b1 = bb
+          } else if (t === 2) {
+            b2 = bb
+          } else if (t === 3) {
+            b3 = bb
+          }
+        }
+      }
+    }
+    for (let t = np; t < nt; t++) {
+      if (tokenMatches(o, l, t)) {
+        flags = flags | NF_NEG
+        break
+      }
+    }
+    const ok = (np === 0 || bits !== 0) && (flags & NF_NEG) === 0 && (xOff.length === 1 || extOk(o, l))
+    if (ok) {
+      flags = flags | NF_OK
+      okEntries += int(neOff[k + 1]!) - int(neOff[k]!)
+      okBuf[nok] = u32(k)
+      nok += 1
+    }
+    if (ok || bits !== 0 || (flags & NF_NEG) !== 0) {
+      hStamp[k] = u32(gen)
+      hScore[k] = i32(score)
+      hBits[k] = u8(bits)
+      hFlags[k] = u8(flags)
+      hBest0[k] = i32(b0)
+      hBest1[k] = i32(b1)
+      hBest2[k] = i32(b2)
+      hBest3[k] = i32(b3)
+      presBuf[npres] = u32(k)
+      npres += 1
+    }
+  }
+  presCount = npres
+  return nok
+}
+
+export function present(id: int): bool {
+  return int(hStamp[id]!) === gen
+}
+
+// Provide the name-search pipeline with controlled updates to shared state.
+export function nextGen(): void {
+  gen += 1
+}
+
+export function narrowCand(): int {
+  const t = cand
+  cand = presBuf
+  presBuf = t
+  return presCount
+}
+
+export function scoreNames(count: int, useCand: bool): int {
+  fromCand = useCand
+  okCount = scoreNamesLoop(count)
+  return okCount
+}
+
+export function candSet(i: int, v: int): void {
+  cand[i] = u32(v)
+}
+
+// Allocate per-name candidate and scoring state.
+export function namesAlloc(): void {
+  cand = zerosU32(u)
+  okBuf = zerosU32(u)
+  presBuf = zerosU32(u)
+  hStamp = zerosU32(u)
+  hScore = zerosI32(u)
+  hBits = zerosU8(u)
+  hFlags = zerosU8(u)
+  hBest0 = zerosI32(u)
+  hBest1 = zerosI32(u)
+  hBest2 = zerosI32(u)
+  hBest3 = zerosI32(u)
+}

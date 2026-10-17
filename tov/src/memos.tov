@@ -1,0 +1,107 @@
+// Dir memos: for a dir, which tokens its name or an ancestor's matches (-1: a
+// negated one does), with the best score of the first 4 tokens.
+
+import { NF_NEG } from "./consts"
+import { zerosU32, zerosI32 } from "./bytes"
+import { d, entName, dirEntry, dirParent } from "./index"
+import { gen, present, hFlags, hBits, hBest0, hBest1, hBest2, hBest3 } from "./names"
+
+export let mStamp: u32[] = []
+export let mBits: int[] = []
+export let mBest0: i32[] = []
+export let mBest1: i32[] = []
+export let mBest2: i32[] = []
+export let mBest3: i32[] = []
+export let chain: int[] = []
+
+// Memo of dir k from its own name and its parent's memo (dir 0's is empty).
+export function setMemo(k: int, p: int): void {
+  const id = int(entName[int(dirEntry[k]!)]!)
+  let bits = 0
+  let b0 = 0
+  let b1 = 0
+  let b2 = 0
+  let b3 = 0
+  if (present(id)) {
+    if ((int(hFlags[id]!) & NF_NEG) !== 0) {
+      bits = -1
+    } else {
+      bits = int(hBits[id]!)
+      b0 = int(hBest0[id]!)
+      b1 = int(hBest1[id]!)
+      b2 = int(hBest2[id]!)
+      b3 = int(hBest3[id]!)
+    }
+  }
+  if (p >= 0) {
+    const pb = mBits[p]!
+    if (pb === -1 || bits === -1) {
+      bits = -1
+    } else {
+      bits = bits | pb
+      b0 = b0 > int(mBest0[p]!) ? b0 : int(mBest0[p]!)
+      b1 = b1 > int(mBest1[p]!) ? b1 : int(mBest1[p]!)
+      b2 = b2 > int(mBest2[p]!) ? b2 : int(mBest2[p]!)
+      b3 = b3 > int(mBest3[p]!) ? b3 : int(mBest3[p]!)
+    }
+  }
+  mStamp[k] = u32(gen)
+  mBits[k] = bits
+  mBest0[k] = i32(b0)
+  mBest1[k] = i32(b1)
+  mBest2[k] = i32(b2)
+  mBest3[k] = i32(b3)
+}
+
+export function clearRoot(): void {
+  mStamp[0] = u32(gen)
+  mBits[0] = 0
+  mBest0[0] = i32(0)
+  mBest1[0] = i32(0)
+  mBest2[0] = i32(0)
+  mBest3[0] = i32(0)
+}
+
+// hook: every dir's memo, parents first (a parent's id is below its children's).
+// reads: d dirEntry dirStart dirLen dirEnd dirParent entName gen
+// reads: hStamp hFlags hBits hBest0 hBest1 hBest2 hBest3
+// writes: mStamp mBits mBest0 mBest1 mBest2 mBest3
+export function allMemos(): void {
+  clearRoot()
+  for (let k = 1; k < d; k++) {
+    setMemo(k, int(dirParent[k]!))
+  }
+}
+
+// Dir k's memo, folding only its uncached ancestors.
+export function memoOf(k: int): void {
+  if (int(mStamp[k]!) === gen) {
+    return
+  }
+  chain = []
+  let c = k
+  while (c !== 0 && int(mStamp[c]!) !== gen) {
+    chain.push(c)
+    c = int(dirParent[c]!)
+  }
+  if (c === 0 && int(mStamp[0]!) !== gen) {
+    clearRoot()
+  }
+  for (let j = chain.length - 1; j >= 0; j--) {
+    const x = chain[j]!
+    setMemo(x, int(dirParent[x]!))
+  }
+}
+
+// Allocate the memo tables for each directory.
+export function memosAlloc(): void {
+  mStamp = zerosU32(d)
+  mBest0 = zerosI32(d)
+  mBest1 = zerosI32(d)
+  mBest2 = zerosI32(d)
+  mBest3 = zerosI32(d)
+  mBits = []
+  for (let k = 0; k < d; k++) {
+    mBits.push(0)
+  }
+}

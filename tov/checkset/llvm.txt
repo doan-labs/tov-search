@@ -1,0 +1,28 @@
+# Check set, llvm-project at llvmorg-19.1.0. Written before any timing was
+# looked at; never tuned on. Every prefix is typed.
+SelectionDAG
+SelectoinDAG
+X86ISelLowering
+clang Sema
+SemaDecl.cpp
+lld ELF
+mlir dialect
+!test Passes
+!unittests !test cmake
+ext:td X86
+ext:cpp InstCombine
+in:~/llvm-project/llvm/lib Transforms
+kind:dir Target AArch64
+'CMakeLists
+^Clang
+.ll$
+size:>500kb
+libcxx string
+compiler-rt asan
+llvm-objdump
+lldb Process
+Attributor
+Atributor
+a
+i
+td

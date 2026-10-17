@@ -1,0 +1,15 @@
+[package]
+name = "fff-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "4b17d9b278c3818fb380855b7d77424b239b3b91" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

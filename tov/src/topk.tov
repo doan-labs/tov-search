@@ -1,0 +1,42 @@
+// The top-k heap as two parallel sorted lists, best first.
+
+export let topScore: int[] = []
+export let topIdx: int[] = []
+export let topK = 50
+
+export function better(s: int, i: int, s2: int, i2: int): bool {
+  return s > s2 || (s === s2 && i < i2)
+}
+
+export function push(s: int, i: int): void {
+  const len = topScore.length
+  if (len === topK) {
+    if (topK === 0 || !better(s, i, topScore[len - 1]!, topIdx[len - 1]!)) {
+      return
+    }
+    topScore.pop()
+    topIdx.pop()
+  }
+  topScore.push(s)
+  topIdx.push(i)
+  let j = topScore.length - 1
+  while (j > 0 && better(topScore[j]!, topIdx[j]!, topScore[j - 1]!, topIdx[j - 1]!)) {
+    const ts = topScore[j]!
+    topScore[j] = topScore[j - 1]!
+    topScore[j - 1] = ts
+    const ti = topIdx[j]!
+    topIdx[j] = topIdx[j - 1]!
+    topIdx[j - 1] = ti
+    j -= 1
+  }
+}
+
+// Keep top-k storage updates within this module.
+export function resetTop(): void {
+  topScore = []
+  topIdx = []
+}
+
+export function setTopK(k: int): void {
+  topK = k
+}

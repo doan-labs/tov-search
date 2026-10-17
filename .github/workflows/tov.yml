@@ -1,0 +1,67 @@
+# tov/check.sh on Linux: every build answers like the oracle, every kernel
+# matches its Tov body, then the timing run. On Blacksmith runners, one job
+# per SIMD width: AVX-512, AVX2, NEON.
+# macOS is checked locally (tov/check.sh).
+name: tov
+# PRs only: main gets the code already checked on its PR.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # Docs-only changes don't touch the engine.
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    # Drafts skip CI; marking the PR ready runs it. PRs from public org
+    # members and the logins in the CI_TRUSTED repo variable run on every
+    # push. Anyone else's run only when a maintainer adds the ci-approved
+    # label, once per approval: after new pushes, remove and re-add it.
+    if: >-
+      github.event_name != 'pull_request' || (!github.event.pull_request.draft
+      && ((github.event.action == 'labeled' && github.event.label.name == 'ci-approved')
+      || (github.event.action != 'labeled'
+      && (contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association)
+      || contains(fromJSON(vars.CI_TRUSTED || '[]'), github.event.pull_request.user.login)))))
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: x86_64 clang (AVX-512), os: blacksmith-2vcpu-ubuntu-2404, cc: clang, cflags: -mavx512bw, needs: avx512bw }
+          - { name: x86_64 gcc (AVX2), os: blacksmith-2vcpu-ubuntu-2404, cc: gcc, cflags: -mavx2 -mno-avx512f }
+          - { name: arm64 clang (NEON), os: blacksmith-2vcpu-ubuntu-2404-arm, cc: clang }
+    env:
+      CC: ${{ matrix.cc }}
+      CFLAGS: ${{ matrix.cflags }}
+      TOV_PIN: ba81eb0d9cffe745411cafdd112c59d86cd7deb8
+    steps:
+      - name: cpu
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          if [ -n "${{ matrix.needs }}" ] && ! grep -qw "${{ matrix.needs }}" /proc/cpuinfo; then
+            echo "::error::this runner has no ${{ matrix.needs }}"; exit 1
+          fi
+      - name: system packages
+        run: sudo apt-get update -q && sudo apt-get install -yq clang
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: rust
+        run: |
+          command -v cargo >/dev/null || curl -fsSL https://sh.rustup.rs | sh -s -- -y -q --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/bin/tov
+            ~/.tov/src
+          key: tov-${{ env.TOV_PIN }}-${{ matrix.os }}
+      - name: tov at the pinned commit
+        run: |
+          [ -x "$HOME/.cargo/bin/tov" ] && exit 0
+          git init -q ~/.tov/src
+          git -C ~/.tov/src fetch -q --depth 1 https://github.com/richiemcilroy/Tov "$TOV_PIN"
+          git -C ~/.tov/src checkout -q FETCH_HEAD
+          cargo install -q --locked --path ~/.tov/src/crates/tov
+      - name: benchmark disk
+        run: cd rust/bench && cargo build --release -q && target/release/bench gen
+      - run: tov/check.sh

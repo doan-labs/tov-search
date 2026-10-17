@@ -1,0 +1,41 @@
+# Holdout trace: never tune against this. Checked now and then to catch
+# changes that only help the dev queries.
+Cargo.toml
+app.js
+setup.py
+dockerfile
+tsconfig
+reamde
+pakcage
+index.html
+src main
+components button
+notes
+resume
+go.mod
+styles.css
+server
+main.go
+database
+avatar png
+IMG 2023
+b
+q
+helpers
+logo.svg
+favicon
+Desktop
+Downloads zip
+ext:py test
+ext:json config
+type:video
+type:doc report
+kind:dir src
+in:~/Documents report
+in:~/Library prefs
+!dist index.js
+^README
+.md$
+'Makefile
+size:<1kb .env
+mtime:<30d screenshot

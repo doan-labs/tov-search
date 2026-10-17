@@ -1,0 +1,291 @@
+// The query: its parsed form and the word/filter parser.
+
+import { HOME, KIND_FILE, KIND_DIR, KIND_LINK, FUZZY, EXACT, PREFIX, SUFFIX, Z, MAXV } from "./consts"
+import { enc, lowerAscii, satU64, satSub } from "./bytes"
+import { charBit, startBit } from "./masks"
+import { now } from "./disk"
+
+export type Token = { text: u8[], mask: u64, mode: int, negate: bool, loose: u64, start: u64 }
+
+export type Query = {
+  tokens: Token[],
+  kind: int,
+  exts: u8[][],
+  hasScope: bool,
+  scope: u8[],
+  sizeLo: int,
+  sizeHi: int,
+  mtimeLo: int,
+  mtimeHi: int,
+  limit: int,
+}
+
+const TYPE_NAMES = ["image", "video", "audio", "doc", "code", "archive", "font"]
+const TYPE_EXTS: string[][] = [
+  ["png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "icns", "avif", "jxl"],
+  ["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "hevc"],
+  ["mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "ogg", "opus", "alac", "caf", "mid", "midi", "m4r"],
+  ["pdf", "doc", "docx", "pages", "txt", "md", "rtf", "odt", "key", "ppt", "pptx", "numbers", "xls", "xlsx", "csv", "epub", "tex"],
+  ["rs", "c", "h", "cc", "cpp", "hpp", "m", "mm", "swift", "go", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "java", "kt", "rb", "php", "cs", "sh", "zsh", "bash", "fish", "lua", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "vue", "svelte", "zig", "nim", "hs", "ml", "ex", "exs", "erl", "clj", "dart", "r", "jl", "metal", "glsl", "wgsl", "proto", "graphql", "nix"],
+  ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso", "zst", "lz4", "xip"],
+  ["ttf", "otf", "woff", "woff2", "ttc", "dfont"],
+]
+
+export function takesTypos(len: int, mode: int): bool {
+  return mode === FUZZY && len >= 5
+}
+
+export function pushToken(q: Query, w: string): Query {
+  let t = w
+  let negate = false
+  let mode = FUZZY
+  if (t.startsWith("!")) {
+    t = t.slice(1)
+    negate = true
+    mode = EXACT
+  }
+  if (t.startsWith("'")) {
+    t = t.slice(1)
+    mode = EXACT
+  } else if (t.startsWith("^")) {
+    t = t.slice(1)
+    mode = PREFIX
+  } else if (t.endsWith("$")) {
+    t = t.slice(0, t.byteLength - 1)
+    mode = SUFFIX
+  }
+  let npos = 0
+  for (const x of q.tokens) {
+    if (!x.negate) {
+      npos += 1
+    }
+  }
+  if (t === "" || (!negate && npos >= 8)) {
+    return q
+  }
+  const raw = enc(t)
+  const text: u8[] = []
+  let mask = Z
+  for (let j = 0; j < raw.length; j++) {
+    const b = lowerAscii(int(raw[j]!))
+    text.push(u8(b))
+    mask = mask | charBit(b)
+  }
+  let loose = Z
+  let start = Z
+  if (takesTypos(text.length, mode)) {
+    loose = mask & ~charBit(int(text[0]!))
+    start = startBit(int(text[0]!))
+  }
+  const out = q
+  out.tokens.push({ text: text, mask: mask, mode: mode, negate: negate, loose: loose, start: start })
+  return out
+}
+
+// Rust's f64 parse of a digits-and-dots string: one dot at most, a digit somewhere.
+function parseNum(s: string): f64 | undefined {
+  let digits = 0
+  let dots = 0
+  for (const c of s.chars()) {
+    if (c === ".") {
+      dots += 1
+    } else {
+      digits += 1
+    }
+  }
+  if (digits === 0 || dots > 1) {
+    return undefined
+  }
+  return parseFloat(s)
+}
+
+function splitUnit(s: string): { num: f64 | undefined, unit: string } {
+  let i = 0
+  const b = enc(s)
+  while (i < b.length && ((int(b[i]!) >= 48 && int(b[i]!) <= 57) || int(b[i]!) === 46)) {
+    i += 1
+  }
+  return { num: parseNum(s.slice(0, i)), unit: s.slice(i).toLowerCase() }
+}
+
+// Units, and what they multiply by. (Tov 0.0.1 over-releases a string a
+// `switch` is on, bugs/switch-string-overrelease.tov, so lookups go by index.)
+const SIZE_UNITS = ["", "b", "k", "kb", "m", "mb", "g", "gb", "t", "tb"]
+const SIZE_MULS = [1.0, 1.0, 1e3, 1e3, 1e6, 1e6, 1e9, 1e9, 1e12, 1e12]
+const AGE_UNITS = ["s", "m", "min", "h", "", "d", "w", "mo", "y"]
+const AGE_MULS = [1.0, 60.0, 60.0, 3600.0, 86400.0, 86400.0, 604800.0, 2592000.0, 31536000.0]
+
+function parseVal(s: string, age: bool): int throws Error {
+  const p = splitUnit(s)
+  const at = age ? AGE_UNITS.indexOf(p.unit) : SIZE_UNITS.indexOf(p.unit)
+  const x = p.num
+  if (at < 0 || x === undefined) {
+    throw new Error(`bad range ${s}`)
+  }
+  return satU64(x * (age ? AGE_MULS[at]! : SIZE_MULS[at]!))
+}
+
+function range(v: string, age: bool): int[] throws Error {
+  if (v.startsWith(">=")) {
+    return [try parseVal(v.slice(2), age), MAXV]
+  }
+  if (v.startsWith(">")) {
+    return [try parseVal(v.slice(1), age), MAXV]
+  }
+  if (v.startsWith("<=")) {
+    return [0, try parseVal(v.slice(2), age)]
+  }
+  if (v.startsWith("<")) {
+    return [0, try parseVal(v.slice(1), age)]
+  }
+  const dd = v.indexOf("..")
+  if (dd >= 0) {
+    return [try parseVal(v.slice(0, dd), age), try parseVal(v.slice(dd + 2), age)]
+  }
+  const x = try parseVal(v, age)
+  return [x, x]
+}
+
+const FILTERS = ["ext", "type", "kind", "in", "size", "mtime", "modified", "re", "path", "limit", "grep", "content", "regex", "sym", "symbol"]
+
+// Apply filter k:v; false if k is not a filter name.
+function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
+  const out = q
+  switch (FILTERS.indexOf(k)) {
+    case 0: // ext
+      for (const e of v.split(",")) {
+        let x = e
+        while (x.startsWith(".")) {
+          x = x.slice(1)
+        }
+        out.exts.push(enc(x.toLowerCase()))
+      }
+      break
+    case 1: // type
+      for (const t of v.split(",")) {
+        if (t === "app") {
+          out.kind = KIND_DIR
+          out.exts.push(enc("app"))
+          continue
+        }
+        const at = TYPE_NAMES.indexOf(t)
+        if (at < 0) {
+          throw new Error(`unknown type ${t}`)
+        }
+        for (const e of TYPE_EXTS[at]!) {
+          out.exts.push(enc(e))
+        }
+      }
+      break
+    case 2: // kind
+      if (v === "file" || v === "f") {
+        out.kind = KIND_FILE
+      } else if (v === "dir" || v === "folder" || v === "d") {
+        out.kind = KIND_DIR
+      } else if (v === "link" || v === "symlink" || v === "l") {
+        out.kind = KIND_LINK
+      } else {
+        throw new Error(`unknown kind ${v}`)
+      }
+      break
+    case 3: { // in
+      let p = v.startsWith("~") ? HOME + v.slice(1) : v
+      while (p.endsWith("/")) {
+        p = p.slice(0, p.byteLength - 1)
+      }
+      out.hasScope = true
+      out.scope = enc(p)
+      break
+    }
+    case 4: { // size
+      const r = try range(v, false)
+      out.sizeLo = r[0]!
+      out.sizeHi = r[1]!
+      break
+    }
+    case 5: // mtime
+    case 6: { // modified
+      const r = try range(v, true)
+      const lo = r[0]!
+      const hi = r[1]!
+      out.mtimeLo = satSub(now, hi < now ? hi : now)
+      out.mtimeHi = satSub(now, lo & 4294967295)
+      if (hi === MAXV) {
+        out.mtimeLo = 0
+      }
+      break
+    }
+    case 7: // re
+    case 8: // path
+      throw new Error("regex filters are not ported")
+    case 9: { // limit
+      let s = v.startsWith("+") ? v.slice(1) : v
+      if (s === "" || s.byteLength > 18) {
+        throw new Error("bad limit")
+      }
+      for (const c of s.chars()) {
+        if (c < "0" || c > "9") {
+          throw new Error("bad limit")
+        }
+      }
+      const x = parseInt(s)
+      if (x === undefined) {
+        throw new Error("bad limit")
+      }
+      out.limit = x
+      break
+    }
+    case 10: // grep
+    case 11: // content
+    case 12: // regex
+    case 13: // sym
+    case 14: // symbol
+      break
+    default:
+      return { known: false, q: out }
+  }
+  return { known: true, q: out }
+}
+
+// Split on spaces, keeping "double quoted" runs together.
+function splitWords(s: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let quoted = false
+  for (const c of s.chars()) {
+    if (c === "\"") {
+      quoted = !quoted
+    } else if (c === " " && !quoted) {
+      if (cur !== "") {
+        out.push(cur)
+        cur = ""
+      }
+    } else {
+      cur = cur + c
+    }
+  }
+  if (cur !== "") {
+    out.push(cur)
+  }
+  return out
+}
+
+export function parse(s: string): Query throws Error {
+  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  for (const word of splitWords(s)) {
+    const colon = word.indexOf(":")
+    if (colon >= 0) {
+      const f = try filter(q, word.slice(0, colon), word.slice(colon + 1))
+      q = f.q
+      if (f.known) {
+        continue
+      }
+    }
+    for (const piece of word.split("/")) {
+      if (piece !== "") {
+        q = pushToken(q, piece)
+      }
+    }
+  }
+  return q
+}

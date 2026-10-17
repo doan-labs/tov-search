@@ -1,0 +1,141 @@
+// The disk file and its decoded record arrays.
+
+import { readFileSync } from "node:fs"
+import { KIND_DIR } from "./consts"
+import { zerosU32, zerosU8 } from "./bytes"
+
+export let buf: u8[] = []
+
+export function b8(p: int): int {
+  return int(buf[p]!)
+}
+function rd16(p: int): int {
+  return b8(p) | (b8(p + 1) << 8)
+}
+function rd32(p: int): int {
+  return rd16(p) | (rd16(p + 2) << 16)
+}
+function rd64(p: int): int {
+  return rd32(p) | (rd32(p + 4) << 32)
+}
+
+// Records, by their index in the disk file.
+export let nrec = 0
+export let now = 0
+export let rParent: u32[] = []
+export let rKind: u8[] = []
+export let rSize: int[] = []
+export let rMtime: u32[] = []
+export let rOff: u32[] = []
+export let rLen: u32[] = []
+
+export function readDisk(path: string): void throws Error {
+  const s = try readFileSync(path)
+  buf = new TextEncoder().encode(s)
+  if (buf.length < 20 || b8(0) !== 70 || b8(7) !== 49) {
+    throw new Error("not a disk file")
+  }
+  nrec = rd64(8)
+  now = rd32(16)
+  rParent = zerosU32(nrec)
+  rKind = zerosU8(nrec)
+  rMtime = zerosU32(nrec)
+  rOff = zerosU32(nrec)
+  rLen = zerosU32(nrec)
+  rSize = []
+  rSize.push(0)
+  rKind[0] = u8(KIND_DIR)
+  let p = 20 + 19
+  for (let i = 1; i < nrec; i++) {
+    rParent[i] = u32(rd32(p))
+    rKind[i] = buf[p + 4]!
+    rSize.push(rd64(p + 5))
+    rMtime[i] = u32(rd32(p + 13))
+    const len = rd16(p + 17)
+    rOff[i] = u32(p + 19)
+    rLen[i] = u32(len)
+    p += 19 + len
+  }
+}
+
+// Record names compare as bytes, shorter first on a common prefix.
+function recLess(a: int, b: int): bool {
+  const ao = int(rOff[a]!)
+  const bo = int(rOff[b]!)
+  const al = int(rLen[a]!)
+  const bl = int(rLen[b]!)
+  const n = al < bl ? al : bl
+  for (let j = 0; j < n; j++) {
+    const x = b8(ao + j)
+    const y = b8(bo + j)
+    if (x !== y) {
+      return x < y
+    }
+  }
+  return al < bl
+}
+
+export let kids: u32[] = []
+
+export function sortKids(lo: int, hi: int): void {
+  if (hi - lo <= 16) {
+    for (let i = lo + 1; i < hi; i++) {
+      const v = int(kids[i]!)
+      let j = i - 1
+      while (j >= lo && recLess(v, int(kids[j]!))) {
+        kids[j + 1] = kids[j]!
+        j -= 1
+      }
+      kids[j + 1] = u32(v)
+    }
+    return
+  }
+  const mid = lo + Math.trunc((hi - lo) / 2)
+  const pv = int(kids[mid]!)
+  let i = lo
+  let j = hi - 1
+  while (i <= j) {
+    while (recLess(int(kids[i]!), pv)) {
+      i += 1
+    }
+    while (recLess(pv, int(kids[j]!))) {
+      j -= 1
+    }
+    if (i <= j) {
+      const t = kids[i]!
+      kids[i] = kids[j]!
+      kids[j] = t
+      i += 1
+      j -= 1
+    }
+  }
+  if (lo < j + 1) {
+    sortKids(lo, j + 1)
+  }
+  if (i < hi) {
+    sortKids(i, hi)
+  }
+}
+
+// Provide index construction with controlled updates to the child table.
+export function kidsNew(n: int): void {
+  kids = zerosU32(n)
+}
+
+export function kidsSet(i: int, v: int): void {
+  kids[i] = u32(v)
+}
+
+export function kidsClear(): void {
+  kids = []
+}
+
+export function diskRelease(): void {
+  buf = []
+  rParent = []
+  rKind = []
+  rSize = []
+  rMtime = []
+  rOff = []
+  rLen = []
+}

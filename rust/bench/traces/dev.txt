@@ -1,0 +1,42 @@
+# Dev trace: what the loop tunes against. One query per line; every prefix
+# of it is timed, as if typed. Lines starting with # are ignored.
+main
+readme
+package.json
+mian.rs
+index.ts
+config.yaml
+src index
+docker compose
+screenshot
+invoice
+Info.plist
+zshrc
+tsconfig.json
+webpack config
+App.tsx
+utils
+license
+.gitignore
+Makefile
+requirements.txt
+settings
+photo 2024
+a
+x
+lib
+budget xlsx
+Downloads pdf
+ext:rs index
+ext:md readme
+type:image screenshot
+kind:dir node_modules
+in:~/Developer main
+in:~ package.json
+!test main
+!node_modules index.js
+'test
+^Cargo
+.json$
+size:>10mb mov
+mtime:<7d log

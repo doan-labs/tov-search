@@ -1,0 +1,16 @@
+[package]
+name = "fsearch-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Upstream fsearch (macOS only), the project tov-search's Rust engine was imported from.
+fsearch = { git = "https://github.com/noahdunnagan/fsearch", rev = "88e63fdf850cf7749deae8198b187accd21f8ba5" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

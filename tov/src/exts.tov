@@ -1,0 +1,139 @@
+// Per-extension name lists, built once at startup, so an ext:/type: query
+// scores only the names whose extension can match instead of every name.
+
+import { Z, ONE } from "./consts"
+import { zerosU32, zerosU64 } from "./bytes"
+import { u, uoff, unames, nb } from "./index"
+import { fold, xText, xOff } from "./score"
+import { trailingZeros64 } from "./masks"
+import { candSet } from "./names"
+
+// An extension (the bytes after a name's last dot) of up to 7 bytes packs
+// into one key: (length + 1) << 56, then its folded bytes. Longer ones all
+// share LONG_EXT; extOk() still checks every listed name exactly.
+const LONG_EXT: u64 = u64(9) << u64(56)
+
+export let extIds: u32[] = [] // name ids grouped by extension key, ascending in each group
+export let extOff: u32[] = [] // group g is extIds[extOff[g]..extOff[g+1]]
+let extKeys: u64[] = [] // group -> key
+let extSlotKey: u64[] = [] // open-addressing key -> group table; Z = empty slot
+let extSlotGroup: u32[] = []
+let extSlotMask = 0
+let extBits: u64[] = [] // scratch: one bit per name id
+
+// The key of the extension s[o..o+el]. Query extensions are already lower
+// case, so folding them changes nothing.
+function extKey(s: u8[], o: int, el: int): u64 {
+  if (el > 7) {
+    return LONG_EXT
+  }
+  let key = u64(el + 1) << u64(56)
+  for (let j = 0; j < el; j++) {
+    key = key | (u64(fold(int(s[o + j]!))) << u64(8 * j))
+  }
+  return key
+}
+
+function slot(key: u64): int {
+  let i = int((key ^ (key >> u64(21)) ^ (key >> u64(43))) & u64(extSlotMask))
+  while (extSlotKey[i]! !== Z && extSlotKey[i]! !== key) {
+    i = (i + 1) & extSlotMask
+  }
+  return i
+}
+
+function rehash(cap: int): void {
+  extSlotKey = zerosU64(cap)
+  extSlotGroup = zerosU32(cap)
+  extSlotMask = cap - 1
+  for (let g = 0; g < extKeys.length; g++) {
+    const i = slot(extKeys[g]!)
+    extSlotKey[i] = extKeys[g]!
+    extSlotGroup[i] = u32(g)
+  }
+}
+
+function group(key: u64): int {
+  const i = slot(key)
+  return extSlotKey[i]! === Z ? -1 : int(extSlotGroup[i]!)
+}
+
+export function extIndexBuild(): void {
+  rehash(1024)
+  const of = zerosU32(u) // name -> group + 1, 0 when it has no dot
+  const counts: u32[] = []
+  for (let k = 0; k < u; k++) {
+    const o = int(uoff[k]!)
+    const l = int(uoff[k + 1]!) - o
+    let dot = l - 1
+    while (dot >= 0 && nb(o + dot) !== 46) {
+      dot -= 1
+    }
+    if (dot < 0) {
+      continue
+    }
+    const key = extKey(unames, o + dot + 1, l - dot - 1)
+    let g = group(key)
+    if (g < 0) {
+      g = extKeys.length
+      extKeys.push(key)
+      counts.push(u32(0))
+      if (2 * extKeys.length > extSlotMask) {
+        rehash(2 * (extSlotMask + 1))
+      } else {
+        const i = slot(key)
+        extSlotKey[i] = key
+        extSlotGroup[i] = u32(g)
+      }
+    }
+    of[k] = u32(g + 1)
+    counts[g] = u32(int(counts[g]!) + 1)
+  }
+  extOff = zerosU32(extKeys.length + 1)
+  for (let g = 0; g < extKeys.length; g++) {
+    extOff[g + 1] = u32(int(extOff[g]!) + int(counts[g]!))
+  }
+  const next = zerosU32(extKeys.length)
+  for (let g = 0; g < extKeys.length; g++) {
+    next[g] = extOff[g]!
+  }
+  extIds = zerosU32(int(extOff[extKeys.length]!))
+  for (let k = 0; k < u; k++) {
+    const g = int(of[k]!) - 1
+    if (g >= 0) {
+      const at = int(next[g]!)
+      extIds[at] = u32(k)
+      next[g] = u32(at + 1)
+    }
+  }
+  extBits = zerosU64(Math.trunc((u + 63) / 64))
+}
+
+// Fill cand with the ascending ids of every name whose extension key matches
+// one of the query's extensions; returns how many. A superset of the names
+// extOk() accepts (long extensions share a list), never missing one.
+export function extCand(): int {
+  for (let x = 0; x + 1 < xOff.length; x++) {
+    const xo = int(xOff[x]!)
+    const g = group(extKey(xText, xo, int(xOff[x + 1]!) - xo))
+    if (g >= 0) {
+      for (let p = int(extOff[g]!); p < int(extOff[g + 1]!); p++) {
+        const id = int(extIds[p]!)
+        extBits[id >> 6] = extBits[id >> 6]! | (ONE << u64(id & 63))
+      }
+    }
+  }
+  let c = 0
+  for (let w = 0; w < extBits.length; w++) {
+    let bits = extBits[w]!
+    if (bits !== Z) {
+      extBits[w] = Z
+      while (bits !== Z) {
+        candSet(c, w * 64 + trailingZeros64(bits))
+        c += 1
+        bits = bits & (bits - ONE)
+      }
+    }
+  }
+  return c
+}

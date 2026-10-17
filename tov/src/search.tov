@@ -1,0 +1,289 @@
+// Search: scope lookup, the narrowing check for incremental name tables, and
+// the top-level per-keystroke search() that orchestrates the passes.
+
+import { NO, SUFFIX, NF_OK } from "./consts"
+import { lowerAscii, bytesKey, bytesStart, bytesEnd } from "./bytes"
+import { d, n, entName, entParent, dirEntry, dirStart, dirLen, dirEnd,
+  uoff, u, neOff, ne, nb } from "./index"
+import { Token, Query, takesTypos } from "./query"
+import { qNpos, qNneg, loadQueryTables } from "./score"
+import { gen, nextGen, narrowCand, scoreNames, prefilter, okBuf, okCount, okEntries,
+  present, hFlags } from "./names"
+import { memoOf, allMemos } from "./memos"
+import { qNeedDirs, scoreEntry, byNamePass, statOrderPass, fullPass,
+  kScore, kIdx, setFilters, kbufPad } from "./entries"
+import { topScore, topIdx, topK, setTopK, resetTop, push } from "./topk"
+import { rankedTry } from "./ranked"
+import { tableTok, restrictCand, coveredPass } from "./covers"
+import { extCand } from "./exts"
+import { loadNegs } from "./negs"
+
+export function dirOf(e: int): int {
+  let lo = 0
+  let hi = d
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (int(dirEntry[mid]!) < e) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return lo < d && int(dirEntry[lo]!) === e ? lo : -1
+}
+
+function nameCmp(e: int, c: u8[], co: int, cl: int): int {
+  const id = int(entName[e]!)
+  const o = int(uoff[id]!)
+  const l = int(uoff[id + 1]!) - o
+  const m = l < cl ? l : cl
+  for (let j = 0; j < m; j++) {
+    const x = nb(o + j)
+    const y = int(c[co + j]!)
+    if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return l < cl ? -1 : l > cl ? 1 : 0
+}
+
+function nameEqCI(e: int, c: u8[], co: int, cl: int): bool {
+  const id = int(entName[e]!)
+  const o = int(uoff[id]!)
+  if (int(uoff[id + 1]!) - o !== cl) {
+    return false
+  }
+  for (let j = 0; j < cl; j++) {
+    if (lowerAscii(nb(o + j)) !== lowerAscii(int(c[co + j]!))) {
+      return false
+    }
+  }
+  return true
+}
+
+// Resolve an absolute path to its entry, or -1.
+function lookup(path: u8[]): int {
+  let e = 0
+  let i = 0
+  while (i < path.length) {
+    if (int(path[i]!) === 47) {
+      i += 1
+      continue
+    }
+    let j = i
+    while (j < path.length && int(path[j]!) !== 47) {
+      j += 1
+    }
+    const k = dirOf(e)
+    if (k < 0) {
+      return -1
+    }
+    const s = int(dirStart[k]!)
+    const end = s + int(dirLen[k]!)
+    let lo = s
+    let hi = end
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (nameCmp(mid, path, i, j - i) < 0) {
+        lo = mid + 1
+      } else {
+        hi = mid
+      }
+    }
+    if (lo < end && nameCmp(lo, path, i, j - i) === 0) {
+      e = lo
+    } else {
+      let found = -1
+      for (let c = s; c < end; c++) {
+        if (nameEqCI(c, path, i, j - i)) {
+          found = c
+          break
+        }
+      }
+      if (found < 0) {
+        return -1
+      }
+      e = found
+    }
+    i = j
+  }
+  return e
+}
+
+// What the name table depends on: tokens (text, mode, negation) and exts.
+function nameKey(q: Query): string {
+  let k = ""
+  for (const x of q.exts) {
+    k = k + bytesKey(x) + ","
+  }
+  k = k + "|"
+  for (const t of q.tokens) {
+    k = k + `${t.mode}${t.negate ? "!" : "+"}` + bytesKey(t.text) + "/"
+  }
+  return k
+}
+
+export let prevKey = ""
+export let prevTokens: Token[] = []
+export let partialTable = false
+
+// Owner for the write rankedTry() does when it leaves an incomplete table.
+export function setPartial(p: bool): void {
+  partialTable = p
+}
+
+// Can q only match names the last table matched? Same exts, same tokens, each
+// positive one the same or longer in a way that only narrows it.
+export function narrows(q: Query): bool {
+  if (partialTable) {
+    return false
+  }
+  if (nameKey(q).split("|")[0] !== prevKey.split("|")[0] || q.tokens.length !== prevTokens.length) {
+    return false
+  }
+  let anyPos = false
+  for (let j = 0; j < q.tokens.length; j++) {
+    const a = q.tokens[j]!
+    const b = prevTokens[j]!
+    if (a.mode !== b.mode || a.negate !== b.negate) {
+      return false
+    }
+    if (a.negate) {
+      if (a.text.length !== b.text.length || !bytesStart(a.text, b.text)) {
+        return false
+      }
+    } else {
+      anyPos = true
+      if (a.mode === SUFFIX) {
+        if (!bytesEnd(a.text, b.text)) {
+          return false
+        }
+      } else if (!bytesStart(a.text, b.text) || takesTypos(a.text.length, a.mode) !== takesTypos(b.text.length, b.mode)) {
+        return false
+      }
+    }
+  }
+  return anyPos
+}
+
+export function search(q: Query): void {
+  resetTop()
+  setTopK(q.limit)
+  let lo = 1
+  let hi = n
+  if (q.hasScope) {
+    const e = lookup(q.scope)
+    const k = e < 0 ? -1 : dirOf(e)
+    if (k < 0) {
+      return
+    }
+    lo = int(dirStart[k]!)
+    hi = int(dirEnd[k]!)
+  }
+  // Flatten the query for the hooks: positive tokens first, then negated.
+  loadQueryTables(q)
+  setFilters(q)
+
+  // No name terms (only filters, scope or limit): every entry's score is its
+  // static score, so walk statOrder without building a name table. The cached
+  // table stays as it was.
+  if (qNpos === 0 && qNneg === 0 && q.exts.length === 0) {
+    if (topK > 0) {
+      statOrderPass(lo, hi, false, false)
+    }
+    return
+  }
+
+  // Only negated words: every name is usable except those a negation matches.
+  // Mark just those in a bitset and walk statOrder; the name table is left
+  // as it was.
+  if (qNpos === 0 && q.exts.length === 0) {
+    loadNegs(nameKey(q), qNneg)
+    if (topK > 0) {
+      statOrderPass(lo, hi, false, true)
+    }
+    return
+  }
+
+  if (rankedTry(q, lo, hi)) {
+    return
+  }
+  resetTop()
+
+  // Step 1: every name-only predicate, once per distinct name. A repeat of
+  // the last name query reuses its table (and dir memos); one that only
+  // narrows it (typing) rescans just the names it kept. A rebuilt multi-word
+  // table keeps only names in an earlier word's cover (see covers.tov); a
+  // narrowed one stays inside it.
+  const key = nameKey(q)
+  if (key !== prevKey || gen === 0 || partialTable) {
+    const narrow = gen > 0 && narrows(q)
+    nextGen()
+    let count = u
+    // With an ext filter and at most one positive token, no negation, only
+    // names with a matching extension are used (no folder scores), so
+    // scoring just those leaves every result the same.
+    const byExt = q.exts.length > 0 && qNpos <= 1 && qNneg === 0
+    if (narrow) {
+      count = narrowCand()
+    } else if (byExt) {
+      // At most one word: restrictCand only clears the last cover table.
+      count = restrictCand(extCand())
+    } else {
+      count = restrictCand(qNpos > 0 ? prefilter(qNpos + qNneg) : u)
+    }
+    scoreNames(count, byExt || qNpos > 0)
+    prevKey = key
+    prevTokens = q.tokens
+    partialTable = false
+  }
+  const nok = okCount
+
+  // Step 2: score entries. Few candidates: just the entries carrying a
+  // matching name. A table restricted to a small cover: just that cover's
+  // entries. Many: one pass over every entry in scope.
+  if (okEntries <= 60000) {
+    for (let c = 0; c < nok; c++) {
+      const id = int(okBuf[c]!)
+      const a = int(neOff[id]!)
+      const b = int(neOff[id + 1]!)
+      for (let j = a; j < b; j++) {
+        const i = int(ne[j]!)
+        if (i < lo || i >= hi) {
+          continue
+        }
+        if (qNeedDirs) {
+          memoOf(int(entParent[i]!))
+        }
+        const s = scoreEntry(i, id)
+        if (s !== NO) {
+          push(s, i)
+        }
+      }
+    }
+    return
+  }
+  if (tableTok >= 0 && coveredPass(lo, hi)) {
+    return
+  }
+  if (qNpos === 0) {
+    if (topK === 0) {
+      return
+    }
+    statOrderPass(lo, hi, true, false)
+    return
+  }
+  if (qNpos === 1 && qNneg === 0 && okEntries > 60000) {
+    byNamePass(lo, hi)
+    return
+  }
+  if (qNeedDirs) {
+    allMemos()
+  }
+  kbufPad()
+  const got = fullPass(lo, hi)
+  resetTop()
+  for (let j = 0; j < got; j++) {
+    push(kScore[j]!, kIdx[j]!)
+  }
+}

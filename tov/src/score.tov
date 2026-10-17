@@ -1,0 +1,390 @@
+// Name scoring: fold/class/bonus primitives, the fuzzy matcher, per-token
+// scoring and the flattened query tables the hot loops read.
+
+import { NO, NF_DOT, NF_APP, LOWER, UPPER, DIGIT, DELIM, OTHER, FUZZY, EXACT, PREFIX, Z, ONE } from "./consts"
+import { isDigit, endsWithBytes } from "./bytes"
+import { charBit } from "./masks"
+import { nb } from "./index"
+import { DOT_APP } from "./prior"
+import { Query, takesTypos } from "./query"
+
+export function fold(b: int): int {
+  return b >= 65 && b <= 90 ? b | 32 : b
+}
+
+export function cls(b: int): int {
+  if (b >= 97 && b <= 122) {
+    return LOWER
+  }
+  if (b >= 65 && b <= 90) {
+    return UPPER
+  }
+  if (b >= 48 && b <= 57) {
+    return DIGIT
+  }
+  if (b === 32 || b === 95 || b === 45 || b === 46 || b === 47 || b === 40 || b === 41 || b === 91 || b === 93 || b === 44 || b === 43 || b === 64) {
+    return DELIM
+  }
+  return OTHER
+}
+
+export function bonus(prev: int, cur: int): int {
+  if (prev === DELIM && cur !== DELIM) {
+    return 8
+  }
+  if ((prev === LOWER && cur === UPPER) || ((prev === LOWER || prev === UPPER) && cur === DIGIT)) {
+    return 7
+  }
+  return 0
+}
+
+// hook: first index in unames[from, to) whose byte folds to c (a lowercased query byte), or -1.
+// reads: unames
+export function findFolded(from: int, to: int, c: int): int {
+  const up = c >= 97 && c <= 122 ? c - 32 : c
+  for (let i = from; i < to; i++) {
+    const b = nb(i)
+    if (b === c || b === up) {
+      return i
+    }
+  }
+  return -1
+}
+
+// hook: last index in unames[from, to) whose byte folds to c, or -1.
+// reads: unames
+export function rfindFolded(from: int, to: int, c: int): int {
+  const up = c >= 97 && c <= 122 ? c - 32 : c
+  for (let i = to - 1; i >= from; i--) {
+    const b = nb(i)
+    if (b === c || b === up) {
+      return i
+    }
+  }
+  return -1
+}
+
+export function lenPenalty(l: int): int {
+  return Math.trunc((l < 80 ? l : 80) / 3)
+}
+
+export function stemOf(o: int, l: int, off: int): int {
+  for (let i = l - 1; i >= 0; i--) {
+    if (nb(o + i) === 46) {
+      return i > off ? i : l
+    }
+  }
+  return l
+}
+
+export function singleScore(o: int, l: int, i: int, cap: int): int {
+  const prev = i === 0 ? DELIM : cls(nb(o + i - 1))
+  let score = 16 + bonus(prev, cls(nb(o + i))) * 2
+  const off = l > 1 && nb(o) === 46 ? 1 : 0
+  if (i === off) {
+    const stem = stemOf(o, l, off)
+    const placed = i + 1 === l ? 100 : i + 1 === stem ? 80 : 30
+    score += cap < placed ? cap : placed
+  }
+  return score - lenPenalty(l)
+}
+
+// fzf-v1 style: leftmost-ending match of q[qo, qo+ql) in the name, shrunk from
+// the right, then scored with boundary/camel/consecutive bonuses. NO if none.
+export function fuzzyScore(o: int, l: int, q: u8[], qo: int, ql: int, cap: int): int {
+  let end = 0
+  let from = 0
+  for (let k = 0; k < ql; k++) {
+    const f = findFolded(o + from, o + l, int(q[qo + k]!))
+    if (f < 0) {
+      return NO
+    }
+    end = f - o
+    from = end + 1
+  }
+  if (ql === 1) {
+    return singleScore(o, l, end, cap)
+  }
+  let start = end + 1
+  for (let k = ql - 1; k >= 0; k--) {
+    const f = rfindFolded(o, o + start, int(q[qo + k]!))
+    if (f < 0) {
+      return NO
+    }
+    start = f - o
+  }
+  let score = 0
+  let at = start
+  let firstBonus = 0
+  for (let k = 0; k < ql; k++) {
+    let run = false
+    if (k > 0) {
+      const last = at
+      const f = findFolded(o + last + 1, o + end + 1, int(q[qo + k]!))
+      if (f < 0) {
+        return NO
+      }
+      at = f - o
+      run = at === last + 1
+      if (!run) {
+        score += -3 - (at - last - 2)
+      }
+    }
+    const prev = at === 0 ? DELIM : cls(nb(o + at - 1))
+    let b = bonus(prev, cls(nb(o + at)))
+    if (run) {
+      if (b >= 8 && b > firstBonus) {
+        firstBonus = b
+      }
+      if (firstBonus > b) {
+        b = firstBonus
+      }
+      if (b < 4) {
+        b = 4
+      }
+    } else {
+      firstBonus = b
+    }
+    score += 16 + (k === 0 ? b * 2 : b)
+  }
+  const off = l > 1 && nb(o) === 46 ? 1 : 0
+  const stem = stemOf(o, l, off)
+  const contiguous = end + 1 - start === ql
+  let placed = 0
+  if (start === off && contiguous && end + 1 === l) {
+    placed = 100
+  } else if (start === off && contiguous && end + 1 === stem) {
+    placed = 80
+  } else if (start === off && contiguous) {
+    placed = 30
+  }
+  return score + (cap < placed ? cap : placed) - lenPenalty(l)
+}
+
+// Does unames[wo, wo+wl) start with q[qo+qf, qo+ql), folded?
+export function startsQ(wo: int, wl: int, q: u8[], qo: int, ql: int, qf: int): bool {
+  const need = ql - qf
+  if (wl < need) {
+    return false
+  }
+  for (let j = 0; j < need; j++) {
+    if (fold(nb(wo + j)) !== int(q[qo + qf + j]!)) {
+      return false
+    }
+  }
+  return true
+}
+
+// How long a prefix of the word the query spells with exactly one edit (a
+// wrong, extra, missing or swapped letter), or NO. Digits are never edited.
+export function oneEditPrefix(wo: int, wl: int, q: u8[], qo: int, ql: int): int {
+  let i = -1
+  for (let k = 0; k < ql; k++) {
+    if (k >= wl || fold(nb(wo + k)) !== int(q[qo + k]!)) {
+      i = k
+      break
+    }
+  }
+  if (i < 0) {
+    return NO
+  }
+  if (isDigit(int(q[qo + i]!)) || (i < wl && isDigit(nb(wo + i)))) {
+    return NO
+  }
+  if (i + 1 < ql && i + 1 < wl && fold(nb(wo + i)) === int(q[qo + i + 1]!) && fold(nb(wo + i + 1)) === int(q[qo + i]!) && startsQ(wo + i + 2, wl - i - 2, q, qo, ql, i + 2)) {
+    return ql
+  }
+  if (i < wl && startsQ(wo + i + 1, wl - i - 1, q, qo, ql, i + 1)) {
+    return ql
+  }
+  if (startsQ(wo + i, wl - i, q, qo, ql, i + 1)) {
+    return ql - 1
+  }
+  if (i < wl && startsQ(wo + i + 1, wl - i - 1, q, qo, ql, i)) {
+    return ql + 1
+  }
+  return NO
+}
+
+// The current query's tokens, flat: the qNpos positive ones, then the negated.
+export let qNpos = 0
+export let qNneg = 0
+export let tText: u8[] = []
+export let tOff: u32[] = []
+export let tMode: int[] = []
+export let tMask: u64[] = []
+export let tLoose: u64[] = []
+export let tStart: u64[] = []
+// Its extensions (ext:, type:), flat.
+export let xText: u8[] = []
+export let xOff: u32[] = []
+
+// Owner loader for the flattened query tables search() used to write directly.
+export function loadQueryTables(q: Query): void {
+  tText = []
+  tOff = [u32(0)]
+  tMode = []
+  tMask = []
+  tLoose = []
+  tStart = []
+  qNpos = 0
+  qNneg = 0
+  for (let pass = 0; pass < 2; pass++) {
+    for (const t of q.tokens) {
+      if (t.negate === (pass === 1)) {
+        for (const b of t.text) {
+          tText.push(b)
+        }
+        tOff.push(u32(tText.length))
+        tMode.push(t.mode)
+        tMask.push(t.mask)
+        tLoose.push(t.loose)
+        tStart.push(t.start)
+        if (pass === 0) {
+          qNpos += 1
+        } else {
+          qNneg += 1
+        }
+      }
+    }
+  }
+  xText = []
+  xOff = [u32(0)]
+  for (const x of q.exts) {
+    for (const b of x) {
+      xText.push(b)
+    }
+    xOff.push(u32(xText.length))
+  }
+}
+
+export function typoAt(o: int, l: int, s: int, t: int): int {
+  const qo = int(tOff[t]!)
+  const ql = int(tOff[t + 1]!) - qo
+  if (s >= l || fold(nb(o + s)) !== int(tText[qo]!)) {
+    return NO
+  }
+  const len = oneEditPrefix(o + s, l - s, tText, qo, ql)
+  if (len === NO || len > 128) {
+    return NO
+  }
+  const fixed: u8[] = []
+  for (let j = 0; j < len; j++) {
+    fixed.push(u8(fold(nb(o + s + j))))
+  }
+  const r = fuzzyScore(o, l, fixed, 0, len, 30)
+  return r === NO ? NO : r - 60
+}
+
+// Best score for token t read with one typo at the start of the name or of a
+// space-separated word in it, minus the typo's cost.
+export function typoScore(o: int, l: int, m: u64, t: int): int {
+  let best = typoAt(o, l, l > 1 && nb(o) === 46 ? 1 : 0, t)
+  if ((m & charBit(32)) !== Z) {
+    for (let j = 0; j < l; j++) {
+      if (nb(o + j) === 32) {
+        const r = typoAt(o, l, j + 1, t)
+        if (r > best) {
+          best = r
+        }
+      }
+    }
+  }
+  return best
+}
+
+// Can a name with mask m match token t? Cleanly, or with one typo.
+export function fitsT(t: int, m: u64): bool {
+  const miss = tMask[t]! & ~m
+  if (miss === Z) {
+    return true
+  }
+  return ((miss & ~tLoose[t]!) | (miss & (miss - ONE))) === Z && (m & tStart[t]!) !== Z
+}
+
+export function tokenScore(o: int, l: int, m: u64, t: int): int {
+  const qo = int(tOff[t]!)
+  const ql = int(tOff[t + 1]!) - qo
+  const mode = tMode[t]!
+  if (mode === FUZZY) {
+    if (takesTypos(ql, FUZZY)) {
+      const clean = (tMask[t]! & ~m) === Z ? fuzzyScore(o, l, tText, qo, ql, 100) : NO
+      const typo = (m & tStart[t]!) !== Z ? typoScore(o, l, m, t) : NO
+      return clean > typo ? clean : typo
+    }
+    return fuzzyScore(o, l, tText, qo, ql, 100)
+  }
+  if (mode === EXACT) {
+    for (let i = 0; i + ql <= l; i++) {
+      if (startsQ(o + i, ql, tText, qo, ql, 0)) {
+        return 40 + (i === 0 ? 30 : 0) - lenPenalty(l)
+      }
+    }
+    return NO
+  }
+  if (mode === PREFIX) {
+    return startsQ(o, l, tText, qo, ql, 0) ? 60 - lenPenalty(l) : NO
+  }
+  return l >= ql && startsQ(o + l - ql, ql, tText, qo, ql, 0) ? 50 - lenPenalty(l) : NO
+}
+
+export function tokenMatches(o: int, l: int, t: int): bool {
+  if (tMode[t]! === FUZZY) {
+    const qo = int(tOff[t]!)
+    const ql = int(tOff[t + 1]!) - qo
+    let j = 0
+    for (let i = 0; i < l; i++) {
+      if (fold(nb(o + i)) === int(tText[qo + j]!)) {
+        j += 1
+        if (j === ql) {
+          return true
+        }
+      }
+    }
+    return false
+  }
+  return tokenScore(o, l, ~Z, t) !== NO
+}
+
+// Does the name's extension (after its last dot) fold to one of the query's?
+export function extOk(o: int, l: int): bool {
+  let dot = -1
+  for (let i = l - 1; i >= 0; i--) {
+    if (nb(o + i) === 46) {
+      dot = i
+      break
+    }
+  }
+  if (dot < 0) {
+    return false
+  }
+  const eo = o + dot + 1
+  const el = l - dot - 1
+  for (let x = 0; x + 1 < xOff.length; x++) {
+    const xo = int(xOff[x]!)
+    if (int(xOff[x + 1]!) - xo === el) {
+      let same = true
+      for (let j = 0; j < el; j++) {
+        if (int(xText[xo + j]!) !== fold(nb(eo + j))) {
+          same = false
+          break
+        }
+      }
+      if (same) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+export function nameFlags(o: int, l: int): int {
+  let f = 0
+  if (l > 0 && nb(o) === 46) {
+    f = f | NF_DOT
+  }
+  if (endsWithBytes(o, l, DOT_APP)) {
+    f = f | NF_APP
+  }
+  return f
+}

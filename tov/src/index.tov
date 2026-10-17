@@ -1,0 +1,352 @@
+// The index: entries, dir blocks, interned names, per-name entry lists and
+// the static score order, all built once by build().
+
+import { HOME, NONE, KIND_DIR } from "./consts"
+import { zerosU32, zerosU8, zerosI32, zerosI16, encDec, bytesEq } from "./bytes"
+import { buf, b8, nrec, rParent, rKind, rSize, rMtime, rOff, rLen, kids, sortKids,
+  kidsNew, kidsSet, kidsClear, diskRelease } from "./disk"
+import { nameMask } from "./masks"
+import { priorAdjust, rankTweaks } from "./prior"
+import { nameFlags } from "./score"
+import { rankedIndexAlloc, rankedIndexBuild } from "./rankedindex"
+import { rankedRunAlloc } from "./ranked"
+
+export let n = 0 // entries
+export let d = 0 // dirs
+export let u = 0 // distinct names
+
+export let entName: u32[] = []
+export let entKind: u8[] = []
+export let entParent: u32[] = [] // dir id
+export let entSize: int[] = [] // dec_size(enc_size(size)): what filters see
+export let entMtime: u32[] = []
+
+export let dirEntry: u32[] = []
+export let dirStart: u32[] = []
+export let dirLen: u32[] = []
+export let dirEnd: u32[] = []
+export let dirPrior: i32[] = []
+export let dirParent: u32[] = []
+
+export let statOrder: u32[] = []
+export let statOrdered: i32[] = []
+
+export let unames: u8[] = []
+export let uoff: u32[] = []
+export let umask: u64[] = []
+export let neOff: u32[] = []
+export let ne: u32[] = []
+export let neStat: i16[] = []
+export let peak: i16[] = []
+
+export function nb(i: int): int {
+  return int(unames[i]!)
+}
+
+export function build(): void throws Error {
+  // Children of each dir record, grouped by parent (counting sort), sorted by name.
+  const cStart = zerosU32(nrec + 1)
+  for (let i = 1; i < nrec; i++) {
+    const p = int(rParent[i]!)
+    cStart[p + 1] = u32(int(cStart[p + 1]!) + 1)
+  }
+  for (let i = 0; i < nrec; i++) {
+    cStart[i + 1] = u32(int(cStart[i + 1]!) + int(cStart[i]!))
+  }
+  kidsNew(nrec)
+  const fill = zerosU32(nrec)
+  for (let i = 0; i < nrec; i++) {
+    fill[i] = cStart[i]!
+  }
+  for (let i = 1; i < nrec; i++) {
+    const p = int(rParent[i]!)
+    const at = int(fill[p]!)
+    kidsSet(at, i)
+    fill[p] = u32(at + 1)
+  }
+  for (let r = 0; r < nrec; r++) {
+    if ((int(rKind[r]!) & 3) === KIND_DIR) {
+      const a = int(cStart[r]!)
+      const b = int(cStart[r + 1]!)
+      if (b - a > 1) {
+        sortKids(a, b)
+      }
+    }
+  }
+
+  // Lay dir blocks out in depth-first order.
+  const entRec = zerosU32(nrec)
+  const par = zerosU32(nrec) // parent's entry index for now
+  const bE: u32[] = []
+  const bS: u32[] = []
+  const bL: u32[] = []
+  const stE: int[] = [0]
+  const stR: int[] = [0]
+  let kp: int[] = []
+  let kr: int[] = []
+  let pos = 1
+  while (stE.length > 0) {
+    const e = stE.pop()!
+    const r = stR.pop()!
+    const start = pos
+    kp = []
+    kr = []
+    const a = int(cStart[r]!)
+    const b = int(cStart[r + 1]!)
+    for (let j = a; j < b; j++) {
+      const c = int(kids[j]!)
+      entRec[pos] = u32(c)
+      par[pos] = u32(e)
+      if ((int(rKind[c]!) & 3) === KIND_DIR) {
+        kp.push(pos)
+        kr.push(c)
+      }
+      pos += 1
+    }
+    bE.push(u32(e))
+    bS.push(u32(start))
+    bL.push(u32(pos - start))
+    for (let j = kp.length - 1; j >= 0; j--) {
+      stE.push(kp[j]!)
+      stR.push(kr[j]!)
+    }
+  }
+  n = pos
+  kidsClear()
+
+  // Dir ids follow entry order.
+  const blk = zerosU32(n)
+  for (let i = 0; i < n; i++) {
+    blk[i] = u32(NONE)
+  }
+  for (let j = 0; j < bE.length; j++) {
+    blk[int(bE[j]!)] = u32(j)
+  }
+  d = bE.length
+  dirEntry = zerosU32(d)
+  dirStart = zerosU32(d)
+  dirLen = zerosU32(d)
+  let k = 0
+  for (let i = 0; i < n; i++) {
+    const j = int(blk[i]!)
+    if (j !== NONE) {
+      dirEntry[k] = u32(i)
+      dirStart[k] = bS[j]!
+      dirLen[k] = bL[j]!
+      blk[i] = u32(k)
+      k += 1
+    }
+  }
+  entParent = zerosU32(n)
+  for (let i = 1; i < n; i++) {
+    entParent[i] = blk[int(par[i]!)]!
+  }
+
+  // Per-entry fields, and names interned in entry order.
+  entKind = zerosU8(n)
+  entMtime = zerosU32(n)
+  entSize = []
+  entName = zerosU32(n)
+  let cap = 1
+  while (cap < n + n / 2) {
+    cap = cap * 2
+  }
+  const table = zerosU32(cap)
+  uoff = [u32(0)]
+  unames = []
+  for (let i = 0; i < n; i++) {
+    const r = int(entRec[i]!)
+    entKind[i] = rKind[r]!
+    entMtime[i] = rMtime[r]!
+    entSize.push(encDec(rSize[r]!))
+    const o = int(rOff[r]!)
+    const l = int(rLen[r]!)
+    let h = 2166136261
+    for (let j = 0; j < l; j++) {
+      h = ((h ^ b8(o + j)) * 16777619) & 4294967295
+    }
+    let slot = h & (cap - 1)
+    let id = -1
+    for (;;) {
+      const t = int(table[slot]!)
+      if (t === 0) {
+        id = int(uoff.length) - 1
+        table[slot] = u32(id + 1)
+        for (let j = 0; j < l; j++) {
+          unames.push(buf[o + j]!)
+        }
+        uoff.push(u32(unames.length))
+        break
+      }
+      const c = t - 1
+      const co = int(uoff[c]!)
+      if (int(uoff[c + 1]!) - co === l) {
+        let same = true
+        for (let j = 0; j < l; j++) {
+          if (nb(co + j) !== b8(o + j)) {
+            same = false
+            break
+          }
+        }
+        if (same) {
+          id = c
+          break
+        }
+      }
+      slot = (slot + 1) & (cap - 1)
+    }
+    entName[i] = u32(id)
+  }
+  u = uoff.length - 1
+  for (let j = 0; j < 64; j++) {
+    unames.push(u8(0)) // padding: a kernel may load 64 bytes (an AVX-512 vector) from any name
+  }
+  diskRelease()
+
+  umask = []
+  for (let id = 0; id < u; id++) {
+    umask.push(nameMask(int(uoff[id]!), int(uoff[id + 1]!) - int(uoff[id]!)))
+  }
+
+  // Entry ranges grouped by name.
+  neOff = zerosU32(u + 1)
+  for (let i = 0; i < n; i++) {
+    const id = int(entName[i]!)
+    neOff[id + 1] = u32(int(neOff[id + 1]!) + 1)
+  }
+  for (let id = 0; id < u; id++) {
+    neOff[id + 1] = u32(int(neOff[id + 1]!) + int(neOff[id]!))
+  }
+  const nf = zerosU32(u)
+
+  // Subtree ends, folded upward; location priors, folded downward.
+  dirEnd = zerosU32(d)
+  dirParent = zerosU32(d)
+  for (let k2 = 0; k2 < d; k2++) {
+    dirEnd[k2] = u32(int(dirStart[k2]!) + int(dirLen[k2]!))
+    dirParent[k2] = entParent[int(dirEntry[k2]!)]!
+  }
+  for (let k2 = d - 1; k2 >= 1; k2--) {
+    const p = int(dirParent[k2]!)
+    if (int(dirEnd[k2]!) > int(dirEnd[p]!)) {
+      dirEnd[p] = dirEnd[k2]!
+    }
+  }
+  const comps = HOME.split("/").filter((c) => c !== "").map((c) => new TextEncoder().encode(c))
+  dirPrior = zerosI32(d)
+  const depth: int[] = [0]
+  const hm: int[] = [0]
+  for (let k2 = 1; k2 < d; k2++) {
+    const e = int(dirEntry[k2]!)
+    const p = int(dirParent[k2]!)
+    const id = int(entName[e]!)
+    const o = int(uoff[id]!)
+    const l = int(uoff[id + 1]!) - o
+    const dp = depth[p]! < 255 ? depth[p]! + 1 : 255
+    depth.push(dp)
+    const hp = hm[p]!
+    let h = 255
+    if (hp === 255) {
+      h = 255
+    } else if (hp >= comps.length) {
+      h = hp
+    } else if (bytesEq(o, l, comps[hp]!)) {
+      h = hp + 1
+    }
+    hm.push(h)
+    const entered = h === comps.length && hp < comps.length
+    let pr = int(dirPrior[p]!) + priorAdjust(o, l, dp) + (entered ? 15 : 0)
+    pr = pr < -100 ? -100 : pr > 60 ? 60 : pr
+    dirPrior[k2] = i32(pr)
+  }
+
+  // Static score order for queries with no positive name tokens.
+  const flags = zerosU8(u)
+  for (let id = 0; id < u; id++) {
+    const o = int(uoff[id]!)
+    flags[id] = u8(nameFlags(o, int(uoff[id + 1]!) - o))
+  }
+  const stat = zerosI32(n)
+  const rootId = int(entName[0]!)
+  const rootStat = int(dirPrior[int(entParent[0]!)]!) + rankTweaks(int(flags[rootId]!), int(entKind[0]!), int(entMtime[0]!))
+  if (rootStat < -32768 || rootStat > 32767) {
+    throw new Error("static score outside i16 range")
+  }
+  stat[0] = i32(rootStat)
+  let minStat = rootStat
+  let maxStat = rootStat
+  if (n > 1) {
+    for (let i = 1; i < n; i++) {
+      const id = int(entName[i]!)
+      const s = int(dirPrior[int(entParent[i]!)]!) + rankTweaks(int(flags[id]!), int(entKind[i]!), int(entMtime[i]!))
+      if (s < -32768 || s > 32767) {
+        throw new Error("static score outside i16 range")
+      }
+      stat[i] = i32(s)
+      minStat = s < minStat ? s : minStat
+      maxStat = s > maxStat ? s : maxStat
+    }
+    const width = maxStat - minStat + 1
+    const count = zerosU32(width)
+    for (let i = 1; i < n; i++) {
+      const b = int(stat[i]!) - minStat
+      count[b] = u32(int(count[b]!) + 1)
+    }
+    statOrder = zerosU32(n - 1)
+    const next = zerosU32(width)
+    let total = 0
+    for (let b = width - 1; b >= 0; b--) {
+      next[b] = u32(total)
+      total += int(count[b]!)
+    }
+    for (let i = 1; i < n; i++) {
+      const b = int(stat[i]!) - minStat
+      const at = int(next[b]!)
+      statOrder[at] = u32(i)
+      next[b] = u32(at + 1)
+    }
+    statOrdered = zerosI32(n - 1)
+    for (let p = 0; p < n - 1; p++) {
+      statOrdered[p] = stat[int(statOrder[p]!)]!
+    }
+  } else {
+    statOrder = []
+    statOrdered = []
+  }
+  ne = zerosU32(n)
+  neStat = zerosI16(n)
+  peak = zerosI16(u)
+  for (let id = 0; id < u; id++) {
+    nf[id] = neOff[id]!
+  }
+  for (let p = 0; p < statOrder.length; p++) {
+    const e = int(statOrder[p]!)
+    const id = int(entName[e]!)
+    const at = int(nf[id]!)
+    ne[at] = u32(e)
+    neStat[at] = i16(statOrdered[p]!)
+    nf[id] = u32(at + 1)
+  }
+  const rootAt = int(nf[rootId]!)
+  const rootStart = int(neOff[rootId]!)
+  let rootPos = rootAt
+  ne[rootAt] = u32(0)
+  neStat[rootAt] = i16(rootStat)
+  while (rootPos > rootStart && int(neStat[rootPos - 1]!) <= rootStat) {
+    ne[rootPos] = ne[rootPos - 1]!
+    neStat[rootPos] = neStat[rootPos - 1]!
+    rootPos -= 1
+  }
+  ne[rootPos] = u32(0)
+  neStat[rootPos] = i16(rootStat)
+  for (let id = 0; id < u; id++) {
+    const a = int(neOff[id]!)
+    if (a < int(neOff[id + 1]!)) {
+      peak[id] = neStat[a]!
+    }
+  }
+
+  rankedIndexAlloc()
+  rankedRunAlloc()
+  rankedIndexBuild()
+}

@@ -1,0 +1,27 @@
+# Check set for a disk generated from a different seed (see README.md here).
+# Written before any timing was looked at; never tuned on. Every prefix is typed.
+mainn
+readme md
+package lock
+index.tsx
+servcie
+controller user
+!node_modules config
+!test !spec utils
+ext:json tsconfig
+ext:py setup
+in:~/Developer router
+kind:dir src
+type:image logo
+'Makefile
+^webpack
+.lock$
+size:>100mb
+Library Caches
+Desktop screenshot
+budget 2023
+docker-compose.yml
+helpres
+resume pdf
+s
+o

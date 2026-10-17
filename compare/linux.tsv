@@ -1,0 +1,35 @@
+# Queries on the Linux kernel tree, typed key by key. Each line: the query,
+# a tab, then the file it is looking for, relative to the tree's root. "Found"
+# means exactly that file is in the answer to the full query. Plain words
+# only: every engine understands them.
+main.c	init/main.c
+mian.c	init/main.c
+Makefile	Makefile
+readme	README
+MAINTAINERS	MAINTAINERS
+flow_dissector.c	net/core/flow_dissector.c
+flow_disector	net/core/flow_dissector.c
+elantech	drivers/input/mouse/elantech.c
+elantehc	drivers/input/mouse/elantech.c
+sched core.c	kernel/sched/core.c
+ext4 inode	fs/ext4/inode.c
+page_alloc	mm/page_alloc.c
+tcp_ipv4	net/ipv4/tcp_ipv4.c
+kvm x86.c	arch/x86/kvm/x86.c
+memcontrol	mm/memcontrol.c
+memcontorl	mm/memcontrol.c
+i915_driver	drivers/gpu/drm/i915/i915_driver.c
+filemap	mm/filemap.c
+fork.c	kernel/fork.c
+btrfs ctree	fs/btrfs/ctree.c
+nvme host core	drivers/nvme/host/core.c
+vmscan	mm/vmscan.c
+printk.c	kernel/printk/printk.c
+linux sched.h	include/linux/sched.h
+checkpatch	scripts/checkpatch.pl
+submitting-patches	Documentation/process/submitting-patches.rst
+arm64 head.S	arch/arm64/kernel/head.S
+e1000e netdev	drivers/net/ethernet/intel/e1000e/netdev.c
+namei	fs/namei.c
+lib string.c	lib/string.c
+list.h	include/linux/list.h

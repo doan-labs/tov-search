@@ -1,0 +1,30 @@
+// Shared constants used across the engine's modules.
+
+export const HOME = "/Users/bench"
+export const NONE = 4294967295
+export const NO = -1000000000 // "no match" score: below any real one, so max() works
+export const MAXV = 9223372036854775807 // stands in for u64::MAX in ranges
+
+export const KIND_FILE = 0
+export const KIND_DIR = 1
+export const KIND_LINK = 2
+export const FLAG_HIDDEN = 4
+
+export const FUZZY = 0
+export const EXACT = 1
+export const PREFIX = 2
+export const SUFFIX = 3
+
+export const NF_OK = 1
+export const NF_DOT = 2
+export const NF_APP = 4
+export const NF_NEG = 8
+
+export const LOWER = 0
+export const UPPER = 1
+export const DIGIT = 2
+export const DELIM = 3
+export const OTHER = 4
+
+export const Z: u64 = u64(0)
+export const ONE: u64 = u64(1)

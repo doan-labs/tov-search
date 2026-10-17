@@ -1,0 +1,96 @@
+// The tov-search name engine, ported to Tov from the reference engine that wrote
+// bench/oracle (src/{index,live,query}.rs at 04a402e). Speaks bench/PROTOCOL.md:
+//
+//   engine <disk-file>   build the index, print "ready", answer one query per stdin line
+//
+// The engine is split by concern into the modules in src/: this file keeps the
+// raw stdin hook, the answer/output side and main. Plain Tov can't read stdin,
+// so `readLine` is a raw hook: inject.py pastes the C body in
+// kernels/io/readLine.c over it. Every other `// hook:` function, in whatever
+// module, has a pure-Tov body that is the reference, and an optional C kernel
+// in kernels/ to race it. Its `reads:` and `writes:` lines are the globals
+// that kernel gets; see inject.py for the contract and build/hooks.h for the
+// prototypes.
+
+import { MAXV } from "./src/consts"
+import { enc } from "./src/bytes"
+import { readDisk } from "./src/disk"
+import { build, unames, uoff, entName, entParent, dirEntry } from "./src/index"
+import { Query, parse } from "./src/query"
+import { namesAlloc } from "./src/names"
+import { memosAlloc } from "./src/memos"
+import { extIndexBuild } from "./src/exts"
+import { topScore, topIdx } from "./src/topk"
+import { search } from "./src/search"
+
+// ------------------------------------------------------------------ hooks
+
+// hook(raw): one query line without its "\n", or "\n" at EOF. Flushes stdout first.
+function readLine(): string {
+  return "\n"
+}
+
+// ------------------------------------------------------------------ output
+
+let out: u8[] = []
+
+function putPath(i: int): void {
+  const ch: int[] = []
+  let e = i
+  while (e !== 0 && ch.length < 256) {
+    ch.push(e)
+    e = int(dirEntry[int(entParent[e]!)]!)
+  }
+  if (ch.length === 0) {
+    out.push(u8(47))
+  }
+  for (let j = ch.length - 1; j >= 0; j--) {
+    out.push(u8(47))
+    const id = int(entName[ch[j]!]!)
+    const a = int(uoff[id]!)
+    const b = int(uoff[id + 1]!)
+    for (let x = a; x < b; x++) {
+      out.push(unames[x]!)
+    }
+  }
+}
+
+function answer(line: string): string throws Error {
+  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  try {
+    q = parse(line)
+  } catch (e) {
+    return "error\n\n"
+  }
+  search(q)
+  out = []
+  for (let j = 0; j < topScore.length; j++) {
+    for (const c of enc(`${topScore[j]!}\t`)) {
+      out.push(c)
+    }
+    putPath(topIdx[j]!)
+    out.push(u8(10))
+  }
+  out.push(u8(10))
+  return try new TextDecoder().decode(out)
+}
+
+function main(): void throws Error {
+  const args = process.argv.slice(2)
+  if (args.length < 1) {
+    throw new Error("usage: engine <disk-file>")
+  }
+  try readDisk(args[0]!)
+  try build()
+  namesAlloc()
+  memosAlloc()
+  extIndexBuild()
+  process.stdout.write("ready\n")
+  for (;;) {
+    const line = readLine()
+    if (line === "\n") {
+      break
+    }
+    process.stdout.write(try answer(line))
+  }
+}

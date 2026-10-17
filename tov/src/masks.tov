@@ -1,0 +1,67 @@
+// Name character masks: which bytes a name has and which classes it can start.
+
+import { Z, ONE } from "./consts"
+import { lowerAscii } from "./bytes"
+import { nb } from "./index"
+
+export function charBit(b: int): u64 {
+  if (b >= 97 && b <= 122) {
+    return ONE << u64(b - 97)
+  }
+  if (b >= 65 && b <= 90) {
+    return ONE << u64(b - 65)
+  }
+  if (b >= 48 && b <= 57) {
+    return ONE << u64(26 + b - 48)
+  }
+  if (b === 46) {
+    return ONE << u64(36)
+  }
+  if (b === 45 || b === 95) {
+    return ONE << u64(37)
+  }
+  if (b === 32) {
+    return ONE << u64(38)
+  }
+  if (b >= 128) {
+    return ONE << u64(39)
+  }
+  return ONE << u64(40)
+}
+
+export function startBit(b: int): u64 {
+  return ONE << u64(41 + (lowerAscii(b) % 23))
+}
+
+export function nameMask(o: int, l: int): u64 {
+  let m = Z
+  for (let j = 0; j < l; j++) {
+    m = m | charBit(nb(o + j))
+  }
+  const off = l > 1 && nb(o) === 46 ? 1 : 0
+  if (off < l) {
+    m = m | startBit(nb(o + off))
+  }
+  for (let j = 0; j + 1 < l; j++) {
+    if (nb(o + j) === 32) {
+      m = m | startBit(nb(o + j + 1))
+    }
+  }
+  return m
+}
+
+// hook: index of the least significant set bit, or 64 when bits is zero.
+// reads:
+// writes:
+export function trailingZeros64(bits: u64): int {
+  if (bits === Z) {
+    return 64
+  }
+  let count = 0
+  let remaining = bits
+  while ((remaining & ONE) === Z) {
+    remaining = remaining >> u64(1)
+    count += 1
+  }
+  return count
+}
