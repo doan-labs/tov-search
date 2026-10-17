@@ -2876,6 +2876,9 @@ const SEED_NAMES: usize = 32;
 const SEED_ENTRIES: usize = 8;
 /// How many top-stat entries' names seed a pruned table's floor.
 const SEED_STAT: usize = 512;
+/// A scoped `walk` takes this many steps per scope entry before it visits
+/// the scope in place.
+const WALK_SCOPE: usize = 4;
 
 /// Is dir `d`'s own name or one of its ancestors' negated? `is_neg` answers
 /// for a name id; `dirneg` remembers answers (0 unknown, 1 yes, 2 no), so
@@ -3006,6 +3009,7 @@ impl Scan<'_> {
     /// Pos-empty scan: `ok(name id)` decides whether an entry's own name
     /// passes the name-side predicates, `is_neg(name id)` whether it is
     /// negated (checked lazily up each visited entry's dir chain).
+    #[inline(always)]
     fn walk(&self, lo: usize, hi: usize, ok: &dyn Fn(u32) -> bool, is_neg: &dyn Fn(u32) -> bool) -> Vec<Hit> {
         let idx = &self.live.base;
         let (order, ostat, o_en, parent) = (&self.live.order[..], &self.live.ostat[..], &self.live.o_en[..], idx.parent());
@@ -3029,7 +3033,12 @@ impl Scan<'_> {
                 || b.mtime.0 > q.mtime.1
                 || q.kind.is_some_and(|k| b.kinds & (1 << k) == 0)
         };
-        let mut p = 0;
+        // A scope's best entries may come early in the disk-wide order, or
+        // not for millions of steps: past WALK_SCOPE times its size, the
+        // walk gives up and visits the scope in place instead.
+        let all = order.len();
+        let order = &order[..all.min(WALK_SCOPE.saturating_mul(hi - lo))];
+        let (mut p, mut settled) = (0, false);
         while p < order.len() {
             if stats && p % OBLK == 0 && excluded(&self.live.oblk[p / OBLK]) {
                 p += OBLK;
@@ -3044,6 +3053,7 @@ impl Scan<'_> {
             // still to come there is e (same-stat runs go ascending), so
             // key(ostat[p]+qb, e) is the largest remaining key.
             if key(ostat[p] + qb, e) <= top.floor {
+                settled = true;
                 break;
             }
             let i = e as usize;
@@ -3061,8 +3071,30 @@ impl Scan<'_> {
                 top.push(k);
             }
         }
+        if !settled && p < all {
+            return self.visit_scope(lo, hi, all_ok, ok, is_neg);
+        }
         if std::env::var_os("WALK_DBG").is_some() {
             eprintln!("walk: candidates={} results={}", dbg_scanned, top.buf.len());
+        }
+        top.cut();
+        top.buf.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32), over: None }).collect()
+    }
+
+    /// `walk` over the scope `lo..hi` in place.
+    #[inline(never)]
+    fn visit_scope(&self, lo: usize, hi: usize, all_ok: bool, ok: &dyn Fn(u32) -> bool, is_neg: &dyn Fn(u32) -> bool) -> Vec<Hit> {
+        let idx = &self.live.base;
+        let (en, parent) = (idx.ent_name(), idx.parent());
+        let mut dirneg = if self.need_dirs { vec![0u8; idx.d] } else { Vec::new() };
+        let (mut top, mut chain, mut pbuf) = (TopK::new(self.q.limit), Vec::new(), Vec::new());
+        for i in lo..hi {
+            if (all_ok || ok(en[i]))
+                && !(self.need_dirs && dir_neg_at(idx, parent[i] as usize, &mut dirneg, &mut chain, is_neg))
+                && let Some(k) = self.score(i, self.live.stat[i], OK_HIT, DirMemo::default(), top.floor, &mut pbuf)
+            {
+                top.push(k);
+            }
         }
         top.cut();
         top.buf.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32), over: None }).collect()
@@ -3919,6 +3951,12 @@ mod cache_tests {
             "kind:dir",
             "kind:link size:>1mb",
             "limit:900 size:>1mb",
+            // Small scopes, visited in place.
+            "in:/d014",
+            "in:/d014 size:>1500000",
+            "in:/d030 !f1",
+            "in:/d035 kind:link",
+            "in:/d007 limit:2000",
         ] {
             let q = Query::parse(text, "/").unwrap();
             let got: Vec<(u32, i32)> = s.search(&q).iter().map(|h| (h.idx, h.score)).collect();
