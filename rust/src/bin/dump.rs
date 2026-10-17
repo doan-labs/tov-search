@@ -46,7 +46,7 @@ fn main() {
     println!("n={} u={} d={}", idx.n, idx.u, idx.d);
     // stat histogram, buckets of 5
     let mut hist = std::collections::BTreeMap::new();
-    for &s in &live.stat {
+    for &s in live.stat.iter() {
         *hist.entry(s / 5 * 5).or_insert(0usize) += 1;
     }
     let mut cum = 0usize;
@@ -66,7 +66,7 @@ fn main() {
         }
     }
     // stat range + quantiles
-    let mut v = live.stat.clone();
+    let mut v = live.stat.to_vec();
     v.sort_unstable();
     for q in [50.0, 90.0, 99.0, 99.9, 100.0] {
         let i = ((v.len() - 1) as f64 * q / 100.0) as usize;
