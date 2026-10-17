@@ -1,7 +1,7 @@
 # tov/check.sh on Linux: every build answers like the oracle, every kernel
-# matches its Tov body, then the timing run. On Blacksmith runners, one job
-# per SIMD width: AVX-512, AVX2, NEON.
-# macOS is checked locally (tov/check.sh).
+# matches its Tov body, then the timing run. On the self-hosted x86_64 runner,
+# one job per SIMD width: AVX-512, AVX2.
+# macOS and arm64 are checked locally (tov/check.sh).
 name: tov
 # PRs only: main gets the code already checked on its PR.
 on:
@@ -23,14 +23,13 @@ jobs:
       || (github.event.action != 'labeled'
       && (contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association)
       || contains(fromJSON(vars.CI_TRUSTED || '[]'), github.event.pull_request.user.login)))))
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, custom-ci]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: x86_64 clang (AVX-512), os: blacksmith-2vcpu-ubuntu-2404, cc: clang, cflags: -mavx512bw, needs: avx512bw }
-          - { name: x86_64 gcc (AVX2), os: blacksmith-2vcpu-ubuntu-2404, cc: gcc, cflags: -mavx2 -mno-avx512f }
-          - { name: arm64 clang (NEON), os: blacksmith-2vcpu-ubuntu-2404-arm, cc: clang }
+          - { name: x86_64 clang (AVX-512), cc: clang, cflags: -mavx512bw, needs: avx512bw }
+          - { name: x86_64 gcc (AVX2), cc: gcc, cflags: -mavx2 -mno-avx512f }
     env:
       CC: ${{ matrix.cc }}
       CFLAGS: ${{ matrix.cflags }}
@@ -54,7 +53,7 @@ jobs:
           path: |
             ~/.cargo/bin/tov
             ~/.tov/src
-          key: tov-${{ env.TOV_PIN }}-${{ matrix.os }}
+          key: tov-${{ env.TOV_PIN }}-${{ runner.os }}-${{ runner.arch }}
       - name: tov at the pinned commit
         run: |
           [ -x "$HOME/.cargo/bin/tov" ] && exit 0
