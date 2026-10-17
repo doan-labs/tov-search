@@ -105,13 +105,20 @@ Two steps, both needed. Skip the second and `brew` keeps installing the
 old version.
 
 1. Bump `version` in `Cargo.toml`, merge, then tag `main` and push the tag:
-   `git tag v0.2.0 && git push origin v0.2.0`. The release workflow builds the
-   Apple Silicon and Linux (x86_64, arm64) binaries and attaches them to the
-   GitHub release.
-2. Once that run is green: `rust/tools/brew.sh v0.2.0`. It points the formula
+   `git tag v0.2.0 && git push origin v0.2.0`. There is no release workflow
+   (no macOS runner). Build each binary on its own platform from the tag, with
+   `T` the target and `CPU` its flag: `aarch64-apple-darwin` / `apple-m1` on an
+   Apple Silicon Mac, `x86_64-unknown-linux-gnu` / `x86-64-v3` and
+   `aarch64-unknown-linux-gnu` / `generic` on Linux (Ubuntu 22.04's glibc, so
+   it runs on older distros):
+   `RUSTFLAGS="-C target-cpu=$CPU" cargo build --release --locked --manifest-path rust/Cargo.toml`,
+   `tar -czf tov-search-$T.tar.gz -C rust/target/release tov-search`,
+   `shasum -a 256 tov-search-$T.tar.gz > tov-search-$T.tar.gz.sha256`.
+   Then `gh release create v0.2.0 --generate-notes tov-search-*.tar.gz*`
+   (later ones: `gh release upload v0.2.0 tov-search-$T.tar.gz*`).
+2. Once all three are attached: `rust/tools/brew.sh v0.2.0`. It points the formula
    in [doan-labs/homebrew-tap](https://github.com/doan-labs/homebrew-tap) at the
-   new build. It runs with your own `gh` login, so the release job needs no
-   token for the tap.
+   new build.
 
 Check: `brew update && brew upgrade tov-search` gets the new version.
 

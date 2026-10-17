@@ -60,7 +60,8 @@ machine, one job at a time. Put every number in the PR, including bad ones.
 
 ## fsearch and fff
 
-`gh workflow run compare.yml --ref <branch>` times Tov, Rust, fsearch and
-fff on holdout, a random list and the Linux source. It is one run and varies
+`compare/` times Tov, Rust, fsearch and fff on holdout, a random list and the
+Linux source (fsearch only builds on macOS, so run it on a Mac; CI no longer
+does). It is one run and varies
 ±20%, so it isn't proof. fff skips hidden and ignored files, so it searches
 fewer files.

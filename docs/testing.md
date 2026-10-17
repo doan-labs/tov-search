@@ -64,13 +64,14 @@ noise, Tov variants share generated files.
 
 ## CI
 
-CI runs `tov/check.sh` on Blacksmith Ubuntu, one job per SIMD width:
+CI runs `tov/check.sh` on the self-hosted `custom-ci` runner, one job per SIMD width:
 
 | arch | compiler | SIMD |
 |---|---|---|
 | x86-64 | clang | AVX-512 (fails if the runner lacks it) |
 | x86-64 | gcc | AVX2 |
-| arm64 | clang | NEON |
+
+arm64 (NEON) and macOS are not in CI: run `tov/check.sh` locally.
 
 `CFLAGS` also applies to portable builds, so the x86 SSE2 path is not tested
 in CI.
@@ -85,8 +86,7 @@ anyone else                                    once each time a maintainer adds 
 PRs from forks                                 never         (an org policy)
 ```
 
-`compare.yml` times Tov, Rust, upstream fsearch and fff on a Blacksmith M4
-and writes the tables to the run summary. See
+The head-to-head with fsearch and fff needs a Mac and no longer runs in CI. See
 [benchmarking.md](benchmarking.md#fsearch-and-fff).
 
 ## Final tuning results
