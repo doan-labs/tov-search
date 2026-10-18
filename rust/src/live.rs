@@ -63,6 +63,55 @@ impl Flat {
     }
 }
 
+/// A read-only table kept in a deleted temp file and mapped, like
+/// `index.bin`: its pages are file cache the system can drop and read back
+/// under memory pressure, not daemon memory to compress or swap. In memory
+/// if no temp file can be made.
+pub enum Paged<T> {
+    Map(memmap2::Mmap, usize, std::marker::PhantomData<T>),
+    Mem(Vec<T>),
+}
+
+impl<T: Copy> Paged<T> {
+    pub fn new(v: Vec<T>) -> Paged<T> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        if v.is_empty() {
+            return Paged::Mem(v);
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(&v[..])) };
+        let path = std::env::temp_dir().join(format!("tov-search-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+        let map = std::fs::File::options().read(true).write(true).create_new(true).open(&path).and_then(|mut f| {
+            let _ = std::fs::remove_file(&path);
+            f.write_all(bytes)?;
+            unsafe { memmap2::Mmap::map(&f) }
+        });
+        match map {
+            Ok(m) => {
+                // Fault the pages in now, not on the first searches.
+                let mut sum = 0u8;
+                for i in (0..m.len()).step_by(16 * 1024) {
+                    sum = sum.wrapping_add(unsafe { std::ptr::read_volatile(m.as_ptr().add(i)) });
+                }
+                std::hint::black_box(sum);
+                Paged::Map(m, v.len(), std::marker::PhantomData)
+            }
+            Err(_) => Paged::Mem(v),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Paged<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Paged::Map(m, n, _) => unsafe { std::slice::from_raw_parts(m.as_ptr() as *const T, *n) },
+            Paged::Mem(v) => v,
+        }
+    }
+}
+
 pub struct Live {
     pub base: Index,
     dead: Vec<u64>,
@@ -88,57 +137,57 @@ pub struct Live {
     /// Per base entry: dir_prior of its parent + rank_tweaks of its own
     /// name/kind/mtime — everything a query score adds on top of the name
     /// score, baked so a scan reads one array instead of three.
-    pub stat: Vec<i32>,
+    pub stat: Paged<i32>,
     /// Entries ordered by `stat` (desc), entry index (asc); `ostat[p]` is
     /// `stat[order[p]]`. A query whose score bound is known can top-k down
     /// this order and stop once the bound dips below its k-th best.
-    pub order: Vec<u32>,
-    pub ostat: Vec<i32>,
+    pub order: Paged<u32>,
+    pub ostat: Paged<i32>,
     /// `ent_name` in `order` (`o_en[p] == ent_name[order[p]]`), so a walk
     /// down `order` reads name ids sequentially instead of gathering them.
-    pub o_en: Vec<u32>,
+    pub o_en: Paged<u32>,
     /// `name_ents` with each name's list reordered by `stat` desc (same
     /// offsets), and `o_nestat[j] == stat[o_ne[j]]`: a name's best entry
     /// leads its list. `peak[id]` is that first stat (i16 covers it).
-    pub o_ne: Vec<u32>,
-    pub o_nestat: Vec<i16>,
-    pub peak: Vec<i16>,
+    pub o_ne: Paged<u32>,
+    pub o_nestat: Paged<i16>,
+    pub peak: Paged<i16>,
     /// `peak` minus the name's length penalty: what a name's best entry
     /// scores beyond its query-dependent part, for word-at-a-time pruning.
-    pub ubase: Vec<i16>,
+    pub ubase: Paged<i16>,
     /// Transposed name masks: `char_fit[b]` is the bitset of names whose
     /// `name_mask` carries char-class bit `b` (bits 0..41). A strict token's
     /// exact fit-set is the AND of its bits' bitsets — no mask rescan.
-    pub char_fit: Vec<u64>,
+    pub char_fit: Paged<u64>,
     /// `char_fit[b]`'s popcount: how many names hold char class `b` — the
     /// rarity estimate driving multi-token searches (`driven`).
     pub class_counts: Vec<u32>,
     /// Same transpose over the mask's word-start bits (41..64, 23 buckets):
     /// `start_fit[h]` is the bitset of names with a word starting with a
     /// byte hashing to `h`. `ranked` skips every name without one.
-    pub start_fit: Vec<u64>,
+    pub start_fit: Paged<u64>,
     /// Like `char_fit`, over each name's first half (`first_half[b]`) and
     /// second half (split at `len / 2`). A token's chars appear in order,
     /// so a name can only match if some prefix of the token fits its first
     /// half and the rest its second (`query::TokenBits`).
-    pub first_half: Vec<u64>,
-    pub second_half: Vec<u64>,
+    pub first_half: Paged<u64>,
+    pub second_half: Paged<u64>,
     /// `double_fit[b]`: names with char class `b` at least twice (a token
     /// with it twice needs it twice); `double_counts` their popcounts.
-    pub double_fit: Vec<u64>,
+    pub double_fit: Paged<u64>,
     pub double_counts: Vec<u32>,
     /// First char of each name (past a leading dot): low 6 bits = its
     /// char-class bit index, bit 6 = the name starts with '.' (the `off`
     /// `single_score` uses). With `first_fit`, `stem_pos` and `name_len8`
     /// a one-char query's placed score needs no name text at all.
-    pub first_cls: Vec<u8>,
+    pub first_cls: Paged<u8>,
     /// `first_fit[b]`: names whose first char maps to class bit `b`.
-    pub first_fit: Vec<u64>,
+    pub first_fit: Paged<u64>,
     /// Last '.' past `off`, else name length (clamped to u16).
-    pub stem_pos: Vec<u16>,
+    pub stem_pos: Paged<u16>,
     /// Name length clamped to u8 (>=255 means >=255; the score only needs
     /// `min(len,80)`).
-    pub name_len8: Vec<u8>,
+    pub name_len8: Paged<u8>,
     /// Folded extension — bytes after the last '.', or "" for a trailing
     /// dot — mapped to the names carrying it, ids ascending. Dotless names
     /// match no extension and appear under no key (`ext_ok`'s rule).
@@ -150,7 +199,7 @@ pub struct Live {
     /// token's cover still scores these, for the dir memo.
     pub dir_names: Vec<u64>,
     /// Per dir: its name id (`ent_name[dir_entry[k]]`), read sequentially.
-    pub dir_name: Vec<u32>,
+    pub dir_name: Paged<u32>,
     /// Recent tokens' covers (see `query::Cover`).
     pub cover_cache: crate::query::CoverCache,
 }
@@ -392,29 +441,29 @@ impl Live {
             posneg_cache: Default::default(),
             synced_at,
             priors: HashMap::new(),
-            stat,
-            order,
-            ostat,
-            o_en,
-            o_ne,
-            o_nestat,
-            ubase: peak.iter().zip(&name_len8).map(|(&p, &l)| p.saturating_sub(l.min(80) as i16 / 3)).collect(),
-            peak,
-            char_fit,
+            stat: Paged::new(stat),
+            order: Paged::new(order),
+            ostat: Paged::new(ostat),
+            o_en: Paged::new(o_en),
+            o_ne: Paged::new(o_ne),
+            o_nestat: Paged::new(o_nestat),
+            ubase: Paged::new(peak.iter().zip(&name_len8).map(|(&p, &l)| p.saturating_sub(l.min(80) as i16 / 3)).collect()),
+            peak: Paged::new(peak),
+            char_fit: Paged::new(char_fit),
             class_counts,
-            start_fit,
-            first_half,
-            second_half,
-            double_fit,
+            start_fit: Paged::new(start_fit),
+            first_half: Paged::new(first_half),
+            second_half: Paged::new(second_half),
+            double_fit: Paged::new(double_fit),
             double_counts,
-            first_cls,
-            first_fit,
-            stem_pos,
-            name_len8,
+            first_cls: Paged::new(first_cls),
+            first_fit: Paged::new(first_fit),
+            stem_pos: Paged::new(stem_pos),
+            name_len8: Paged::new(name_len8),
             ext_names,
             oblk,
             dir_names,
-            dir_name,
+            dir_name: Paged::new(dir_name),
             cover_cache: Default::default(),
         }
     }
@@ -451,7 +500,7 @@ impl Live {
         self.dead[i as usize >> 6] & (1 << (i & 63)) != 0
     }
 
-    fn kill(&mut self, i: u32) {
+    pub(crate) fn kill(&mut self, i: u32) {
         let w = &mut self.dead[i as usize >> 6];
         if *w & (1 << (i & 63)) == 0 {
             *w |= 1 << (i & 63);

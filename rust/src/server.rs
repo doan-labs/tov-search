@@ -54,6 +54,12 @@ fn keep_warm() -> Option<Duration> {
 }
 
 fn handle(conn: UnixStream, engine: &Engine) {
+    // Requests are parsed, answered and written on this thread: keep it on
+    // the performance cores, like the search pool.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
     let Ok(r) = conn.try_clone() else { return };
     let Ok(mut w) = conn.try_clone() else { return };
     let mut out = Vec::new();
