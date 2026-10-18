@@ -1,7 +1,8 @@
 //! Checks the Tov app against this one on a real disk.
 //!
 //!   realcheck scan <root> <disk-file>          scan like the daemon, write a disk file
-//!   realcheck engine <disk-file> <home> [linux] bench/PROTOCOL.md, ranked like the daemon
+//!   realcheck engine <disk-file> <home> [linux] bench/PROTOCOL.md, ranked like the daemon; also
+//!                                              `!content <dir>` and content searches (grepcheck.py)
 //!   realcheck serve <disk-file> <home> [linux]  the daemon's JSON replies, on stdin/stdout
 //!
 //! A folder the scan did not enter (a mount point, or skipped) carries
@@ -10,6 +11,8 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;
+use tov_search::Grep;
+use tov_search::content::{self, Content};
 use tov_search::index::{Index, linux_prior_adjust};
 use tov_search::live::Live;
 use tov_search::query::{NOW_OVERRIDE, Query, Searcher};
@@ -98,8 +101,54 @@ fn load(path: &str, home: &str, linux: bool, pin: bool) -> Live {
     Live::new(idx)
 }
 
+/// A new content index of home's files in dir, built as the daemon's content
+/// worker does on its first sync. Returns how many files it indexed.
+fn index_content(live: &Live, home: &str, dir: &str) -> (Content, usize) {
+    let mut c = Content::open(std::path::PathBuf::from(dir));
+    let todo = c.diff(content::wants(live, home.as_bytes(), &[], &[home.as_bytes().to_vec()]));
+    for batch in todo.batches() {
+        let id = c.alloc_id();
+        if let Some(seg) = content::build_segment(&c.dir.clone(), id, &todo, batch) {
+            c.push(seg);
+        }
+    }
+    while let Some(ids) = c.merge_plan() {
+        let id = c.alloc_id();
+        let merged = content::merge(&c.dir.clone(), id, &c.segments(&ids));
+        match merged {
+            Some(seg) => c.replace(&ids, seg),
+            None => break,
+        }
+    }
+    (c, todo.len())
+}
+
+/// A content search's answer, no time budget: candidates and whether all were
+/// read, then per file its path and its lines (number, tab, text).
+fn grep(live: &Live, content: Option<&Content>, home: &str, mut q: Query, out: &mut impl Write) {
+    let Ok(mut g) = Grep::new(&q.grep.take().unwrap(), q.grep_mode) else {
+        out.write_all(b"error\n").unwrap();
+        return;
+    };
+    g.budget = None;
+    let r = if q.scope.as_ref().is_none_or(|s| content::in_scope(s, home.as_bytes())) {
+        content.map(|c| c.search(&g, &q)).unwrap_or_default()
+    } else {
+        content::verify(&g, &content::scan_paths(live, q.clone_for_scan()), q.limit)
+    };
+    writeln!(out, "{} {}", r.candidates, r.complete).unwrap();
+    for f in &r.files {
+        out.write_all(&f.path).unwrap();
+        out.write_all(b"\n").unwrap();
+        for (n, t) in &f.lines {
+            writeln!(out, "{n}\t{t}").unwrap();
+        }
+    }
+}
+
 fn engine(path: &str, home: &str, linux: bool) {
     let mut live = load(path, home, linux, true);
+    let mut content: Option<Content> = None;
     let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout().lock());
     out.write_all(b"ready\n").unwrap();
     out.flush().unwrap();
@@ -113,8 +162,17 @@ fn engine(path: &str, home: &str, linux: bool) {
             out.flush().unwrap();
             continue;
         }
+        // Not a query: index home's file contents into a new content index there.
+        if let Some(dir) = line.strip_prefix("!content ") {
+            let (c, n) = index_content(&live, home, dir);
+            content = Some(c);
+            writeln!(out, "{n}\n").unwrap();
+            out.flush().unwrap();
+            continue;
+        }
         match Query::parse(&line, home) {
             Err(_) => out.write_all(b"error\n").unwrap(),
+            Ok(q) if q.grep.is_some() => grep(&live, content.as_ref(), home, q, &mut out),
             Ok(q) => {
                 for h in (Searcher { live: &live }).search(&q) {
                     match &h.over {

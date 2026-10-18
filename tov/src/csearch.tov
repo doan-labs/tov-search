@@ -1,0 +1,505 @@
+// Content search (rust/src/content.rs Content::search, candidates, eval,
+// verify): the trigram plan picks candidate files per segment, the query's
+// words and filters narrow them by path, and they are read fresh from disk
+// best-ranked first (your files before dot-folders and logs, then the newest)
+// until enough match. Results never show stale content.
+
+import { KIND_FILE } from "./consts"
+import { Query } from "./query"
+import { loadQueryTables } from "./score"
+import { pathMatches, liveSearch, hitIdx, hitMtime, hitPath } from "./live"
+import { MAX_FILE, NOT_TEXT } from "./cscope"
+import { segId, segN, segNtri, segMap, segLiveDocs, BITSET, triKey, triOff, postAt, docSize, docMtime, docRankOf,
+  docPath, pathCmp, pathStarts, byPath, isDeadDoc, bloomRange, bloomWord, rankKey } from "./segs"
+import { TQ_ALL, TQ_TRI, TQ_PAIR, TQ_AND, TQ_OR, tqKind, tqVal, tqSubs } from "./plan"
+import { grepPlan, probes, matchFile, lineNo, lineText, gBudgetMs } from "./grep"
+import { bloomBit } from "./cgrams"
+import { readDocs } from "./io"
+import { enc } from "./bytes"
+
+// Candidates read in the first round.
+const FIRST = 512
+// Files read ahead at once.
+const AHEAD = 8
+
+// The last search: matching files (paths, and their lines from lineAt[f]
+// to lineAt[f + 1]), candidates, files read, and whether every candidate was
+// read (false: the time budget ran out).
+export let resPaths: u8[][] = []
+export let resLineAt: int[] = [0]
+export let resLineNo: int[] = []
+export let resLineText: u8[][] = []
+export let resCandidates = 0
+export let resRead = 0
+export let resComplete = true
+
+// ------------------------------------------------------------------ posting lists
+
+// Index of key t in segment s, or -1.
+function findKey(s: int, t: int): int {
+  let lo = 0
+  let hi = segNtri[s]!
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (triKey(s, mid) < t) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return lo < segNtri[s]! && triKey(s, lo) === t ? lo : -1
+}
+
+// First key index at or above t.
+function keyBound(s: int, t: int): int {
+  let lo = 0
+  let hi = segNtri[s]!
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (triKey(s, mid) < t) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return lo
+}
+
+// List k's docs within [lo, hi), ascending.
+function decode(s: int, k: int, lo: int, hi: int): int[] {
+  const m = segMap[s]!
+  const base = postAt(s)
+  const o0 = triOff(s, k)
+  const a = base + (o0 & (BITSET - 1))
+  const b = base + (triOff(s, k + 1) & (BITSET - 1))
+  const out: int[] = []
+  if ((o0 & BITSET) !== 0) {
+    for (let w = a + (lo >> 3); w < b && (w - a) * 8 < hi; w++) {
+      const x = int(m[w]!)
+      if (x === 0) {
+        continue
+      }
+      for (let t = 0; t < 8; t++) {
+        const d = (w - a) * 8 + t
+        if (((x >> t) & 1) !== 0 && d >= lo && d < hi) {
+          out.push(d)
+        }
+      }
+    }
+    return out
+  }
+  let last = 0
+  let p = a
+  while (p < b) {
+    let v = 0
+    let sh = 0
+    for (;;) {
+      const x = int(m[p]!)
+      p += 1
+      v = v | ((x & 127) << sh)
+      if (x < 128 || p >= b) {
+        break
+      }
+      sh += 7
+    }
+    last += v
+    if (last >= hi) {
+      break
+    }
+    if (last >= lo) {
+      out.push(last)
+    }
+  }
+  return out
+}
+
+function intersect(a: int[], b: int[]): int[] {
+  const out: int[] = []
+  let i = 0
+  let j = 0
+  while (i < a.length && j < b.length) {
+    if (a[i]! < b[j]!) {
+      i += 1
+    } else if (a[i]! > b[j]!) {
+      j += 1
+    } else {
+      out.push(a[i]!)
+      i += 1
+      j += 1
+    }
+  }
+  return out
+}
+
+function sortedUnion(a: int[]): int[] {
+  let v = a
+  v.sort((x, y) => x - y)
+  const out: int[] = []
+  for (const x of v) {
+    if (out.length === 0 || out[out.length - 1]! !== x) {
+      out.push(x)
+    }
+  }
+  return out
+}
+
+// Docs in [lo, hi) of segment s the plan node q allows, ascending; all is
+// true when it allows every doc.
+type Ids = { all: bool, ids: int[] }
+
+function evalq(s: int, q: int, lo: int, hi: int): Ids {
+  const kind = tqKind[q]!
+  if (kind === TQ_ALL) {
+    return { all: true, ids: [] }
+  }
+  if (kind === TQ_TRI) {
+    const k = findKey(s, tqVal[q]!)
+    return { all: false, ids: k < 0 ? [] : decode(s, k, lo, hi) }
+  }
+  if (kind === TQ_PAIR) {
+    const p = tqVal[q]!
+    let acc: int[] = []
+    for (let k = keyBound(s, p); k < segNtri[s]! && triKey(s, k) <= (p | 255); k++) {
+      acc = acc.concat(decode(s, k, lo, hi))
+    }
+    return { all: false, ids: sortedUnion(acc) }
+  }
+  if (kind === TQ_AND) {
+    let acc: Ids = { all: true, ids: [] }
+    for (const x of tqSubs[q]!) {
+      const r = evalq(s, x, lo, hi)
+      if (r.all) {
+        continue
+      }
+      acc = acc.all ? r : { all: false, ids: intersect(acc.ids, r.ids) }
+      if (acc.ids.length === 0) {
+        break
+      }
+    }
+    return acc
+  }
+  let acc: int[] = []
+  for (const x of tqSubs[q]!) {
+    const r = evalq(s, x, lo, hi)
+    if (r.all) {
+      return r
+    }
+    acc = acc.concat(r.ids)
+  }
+  return { all: false, ids: sortedUnion(acc) }
+}
+
+// ------------------------------------------------------------------ candidates
+
+// Doc range of segment s holding the paths under prefix, and whether it is
+// the whole segment (every path starts with it).
+function docRange(s: int, prefix: u8[]): int[] {
+  const n = segN[s]!
+  if (n === 0) {
+    return [0, 0, 0]
+  }
+  const first = byPath(s, 0)
+  const last = byPath(s, n - 1)
+  if (pathCmp(s, last, prefix) < 0 || (pathCmp(s, first, prefix) > 0 && !pathStarts(s, first, prefix))) {
+    return [0, 0, 0]
+  }
+  if (pathStarts(s, first, prefix) && pathStarts(s, last, prefix)) {
+    return [0, n, 1]
+  }
+  let a = 0
+  let hi = n
+  while (a < hi) {
+    const mid = (a + hi) >> 1
+    if (pathCmp(s, byPath(s, mid), prefix) < 0) {
+      a = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  let z = a
+  hi = n
+  while (z < hi) {
+    const mid = (z + hi) >> 1
+    if (pathStarts(s, byPath(s, mid), prefix)) {
+      z = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  if ((z - a) * 2 > n) {
+    return [0, n, 0]
+  }
+  let lo = 2147483647
+  let top = 0
+  for (let i = a; i < z; i++) {
+    const d = byPath(s, i)
+    lo = d < lo ? d : lo
+    top = d + 1 > top ? d + 1 : top
+  }
+  return [lo < top ? lo : top, top, 0]
+}
+
+// The query checks nothing a doc's scope settles: no words, kinds files
+// pass, no ext, size, mtime or regex filters.
+function onlyScope(q: Query): bool {
+  return q.tokens.length === 0 && q.exts.length === 0 && q.sizeLo === 0 && q.sizeHi === 9223372036854775807 &&
+    q.mtimeLo === 0 && q.mtimeHi === 4294967295 && q.nameRe === "" && q.pathRe === "" && (q.kind < 0 || q.kind === KIND_FILE)
+}
+
+// Candidates, best first: rank keys, and segment << 32 | doc.
+let cKey: int[] = []
+let cDoc: int[] = []
+
+// Stable sort of the candidates by rank key, 12 bits a pass (keys < 2^36).
+function sortCands(): void {
+  let key = cKey
+  let doc = cDoc
+  for (let shift = 0; shift < 36; shift += 12) {
+    const count: int[] = []
+    for (let j = 0; j <= 4096; j++) {
+      count.push(0)
+    }
+    for (const k of key) {
+      count[((k >> shift) & 4095) + 1] = count[((k >> shift) & 4095) + 1]! + 1
+    }
+    for (let j = 0; j < 4096; j++) {
+      count[j + 1] = count[j + 1]! + count[j]!
+    }
+    const nk: int[] = []
+    const nd: int[] = []
+    for (let j = 0; j < key.length; j++) {
+      nk.push(0)
+      nd.push(0)
+    }
+    for (let j = 0; j < key.length; j++) {
+      const b = (key[j]! >> shift) & 4095
+      nk[count[b]!] = key[j]!
+      nd[count[b]!] = doc[j]!
+      count[b] = count[b]! + 1
+    }
+    key = nk
+    doc = nd
+  }
+  cKey = key
+  cDoc = doc
+}
+
+// Every candidate doc for the plan, filtered by the query, in cKey/cDoc,
+// best-ranked first. Ties settle by segment, then doc.
+function candidates(plan: int, filt: Query): void {
+  cKey = []
+  cDoc = []
+  let prefix: u8[] = []
+  if (filt.hasScope) {
+    prefix = filt.scope.concat([u8(47)])
+  }
+  const only = onlyScope(filt)
+  loadQueryTables(filt)
+  for (let s = 0; s < segId.length; s++) {
+    let r = [0, segN[s]!, 1]
+    if (filt.hasScope) {
+      r = docRange(s, prefix)
+    }
+    if (segLiveDocs[s]! === 0 || r[0]! >= r[1]!) {
+      continue
+    }
+    const check = !(only && r[2]! === 1)
+    const ev = evalq(s, plan, r[0]!, r[1]!)
+    const n = ev.all ? r[1]! - r[0]! : ev.ids.length
+    for (let j = 0; j < n; j++) {
+      const d = ev.all ? r[0]! + j : ev.ids[j]!
+      if (isDeadDoc(s, d)) {
+        continue
+      }
+      const rank = docRankOf(s, d)
+      if (rank === NOT_TEXT || (check && !pathMatches(filt, docPath(s, d), docSize(s, d), docMtime(s, d)))) {
+        continue
+      }
+      // The rank key without its constant high part: (127 - rank) is 127..130.
+      cKey.push(rankKey(rank, docMtime(s, d)) - (127 << 32))
+      cDoc.push((s << 32) | d)
+    }
+  }
+  sortCands()
+}
+
+// ------------------------------------------------------------------ reading
+
+let shortProbes: int[] = []
+let longProbes: int[] = []
+
+// Can doc d of segment s hold every probed gram, by its bloom filters? An
+// empty filter (no text) never vetoes.
+function mayContain(s: int, d: int): bool {
+  for (let x = 0; x < 2; x++) {
+    const long = x === 1
+    const ps = long ? longProbes : shortProbes
+    if (ps.length === 0) {
+      continue
+    }
+    const r = bloomRange(s, d, long)
+    const words = r[1]! - r[0]!
+    if (words === 0) {
+      continue
+    }
+    for (const h of ps) {
+      for (let y = 0; y < 2; y++) {
+        const b = bloomBit(h, words, y === 1)
+        if (((bloomWord(s, r[0]! + (b >> 6), long) >> u64(b & 63)) & u64(1)) === u64(0)) {
+          return false
+        }
+      }
+    }
+  }
+  return true
+}
+
+let started: f64 = 0
+
+function reset(): void {
+  resPaths = []
+  resLineAt = [0]
+  resLineNo = []
+  resLineText = []
+  resRead = 0
+  resComplete = true
+}
+
+function pathReq(paths: u8[][]): u8[] {
+  let out: u8[] = []
+  for (const p of paths) {
+    for (let j = 0; j < 4; j++) {
+      out.push(u8((p.length >> (8 * j)) & 255))
+    }
+    pushAll(&out, p)
+  }
+  return out
+}
+
+function pushAll(inout out: u8[], b: u8[]): void {
+  for (const c of b) {
+    out.push(c)
+  }
+}
+
+function r32(b: u8[], p: int): int {
+  return int(b[p]!) | (int(b[p + 1]!) << 8) | (int(b[p + 2]!) << 16) | (int(b[p + 3]!) << 24)
+}
+
+// Reads candidates paths[i] in order (an empty path: ruled out by the
+// index), until limit files have matched or the time budget is spent.
+// Returns how many candidates it got through.
+function verify(paths: u8[][], limit: int): int {
+  let i = 0
+  let found = 0
+  while (i < paths.length) {
+    // A few files at once, read ahead in parallel.
+    const batch: u8[][] = []
+    const at: int[] = []
+    let j = i
+    while (j < paths.length && batch.length < AHEAD) {
+      if (paths[j]!.length > 0) {
+        batch.push(paths[j]!)
+        at.push(j)
+      }
+      j += 1
+    }
+    const b = batch.length > 0 ? new TextEncoder().encode(readDocs(pathReq(batch), 4 * MAX_FILE)) : enc("")
+    let p = 0
+    let k = 0
+    while (i < j) {
+      if (found >= limit || (gBudgetMs > 0 && performance.now() - started > gBudgetMs)) {
+        return i
+      }
+      if (k >= at.length || at[k]! !== i) {
+        i += 1
+        continue
+      }
+      const n = r32(b, p)
+      p += 4
+      resRead += 1
+      if (n !== 4294967295) {
+        if (matchFile(b.slice(p, p + n))) {
+          found += 1
+          resPaths.push(batch[k]!)
+          for (let x = 0; x < lineNo.length; x++) {
+            resLineNo.push(lineNo[x]!)
+            resLineText.push(lineText[x]!)
+          }
+          resLineAt.push(resLineNo.length)
+        }
+        p += n
+      }
+      k += 1
+      i += 1
+    }
+  }
+  return i
+}
+
+// The candidates' paths in cKey/cDoc order from a to b: empty when the bloom
+// filters rule the file out.
+function candPaths(a: int, b: int): u8[][] {
+  const out: u8[][] = []
+  for (let i = a; i < b; i++) {
+    const s = cDoc[i]! >> 32
+    const d = cDoc[i]! & 4294967295
+    out.push(mayContain(s, d) ? docPath(s, d) : [])
+  }
+  return out
+}
+
+// Searches the content index for the pattern (grepSet), in the files the
+// query filt allows; results in res*.
+export function contentSearch(filt: Query): void {
+  reset()
+  const plan = grepPlan()
+  candidates(plan, filt)
+  shortProbes = probes(false)
+  longProbes = probes(true)
+  started = performance.now()
+  const total = cKey.length
+  const limit = filt.limit
+  // Most searches are done within the best few hundred candidates; then
+  // the next few thousand, then the rest.
+  const ends = [total < FIRST ? total : FIRST, total < 9 * FIRST ? total : 9 * FIRST, total]
+  let a = 0
+  for (const e of ends) {
+    if (e <= a) {
+      continue
+    }
+    const done = verify(candPaths(a, e), limit - resPaths.length)
+    resComplete = done === e - a || resPaths.length >= limit
+    if (resPaths.length >= limit || done < e - a) {
+      break
+    }
+    a = e
+  }
+  resCandidates = total
+}
+
+// Files to read where the content index doesn't reach (in:/etc), picked
+// from the name index, newest first: the query's files up to MAX_FILE.
+export function scanPaths(q: Query): u8[][] {
+  const sq = q
+  sq.kind = KIND_FILE
+  sq.limit = 200000
+  sq.sizeHi = sq.sizeHi < MAX_FILE ? sq.sizeHi : MAX_FILE
+  liveSearch(sq)
+  const ix: int[] = []
+  for (let j = 0; j < hitIdx.length; j++) {
+    ix.push(j)
+  }
+  ix.sort((a, b) => hitMtime(hitIdx[b]!) - hitMtime(hitIdx[a]!))
+  return ix.map((j) => hitPath(hitIdx[j]!))
+}
+
+// Searches files picked by the name index instead (folders the content
+// index doesn't cover, like in:/etc), as paths in the order to read them.
+export function scanSearch(paths: u8[][], limit: int): void {
+  reset()
+  started = performance.now()
+  const done = verify(paths, limit)
+  resComplete = done === paths.length || resPaths.length >= limit
+  resCandidates = paths.length
+}

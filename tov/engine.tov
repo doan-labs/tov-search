@@ -16,12 +16,12 @@
 // lines are the globals that kernel gets; see inject.py for the contract and
 // build/hooks.h for the prototypes.
 
-import { MAXV, setHome } from "./src/consts"
+import { home, setHome } from "./src/consts"
 import { enc } from "./src/bytes"
 import { readDisk } from "./src/disk"
 import { setLinuxPriors } from "./src/prior"
 import { build, putPath } from "./src/index"
-import { Query, parse } from "./src/query"
+import { Query, parse, emptyQuery } from "./src/query"
 import { namesAlloc } from "./src/names"
 import { memosAlloc } from "./src/memos"
 import { extIndexBuild } from "./src/exts"
@@ -29,22 +29,64 @@ import { topScore, topIdx } from "./src/topk"
 import { search } from "./src/search"
 import { readLine, writeOut } from "./src/io"
 import { liveReset, applyDir, liveSearch, hitScore, hitIdx, hitPath, deadCount, overCount } from "./src/live"
+import { contentOpen } from "./src/segs"
+import { syncNow } from "./src/content"
+import { inScope } from "./src/cscope"
+import { grepSet, setBudget } from "./src/grep"
+import { contentSearch, scanSearch, scanPaths, resPaths, resLineAt, resLineNo, resLineText, resCandidates,
+  resComplete } from "./src/csearch"
 import { cli } from "./src/app"
 
 let out: u8[] = []
 
+function put(s: string): void {
+  for (const c of enc(s)) {
+    out.push(c)
+  }
+}
+
+// A content search's answer: candidates and whether all were read, then per
+// file its path and its lines (number, tab, text), then an empty line.
+function answerGrep(q: Query): void throws Error {
+  if (grepSet(q.grep, q.grepMode) !== "") {
+    writeOut(enc("error\n\n"))
+    return
+  }
+  setBudget(0)
+  if (!q.hasScope || inScope(q.scope, enc(home))) {
+    contentSearch(q)
+  } else {
+    scanSearch(scanPaths(q), q.limit)
+  }
+  put(`${resCandidates} ${resComplete}\n`)
+  for (let f = 0; f < resPaths.length; f++) {
+    for (const c of resPaths[f]!) {
+      out.push(c)
+    }
+    out.push(u8(10))
+    for (let x = resLineAt[f]!; x < resLineAt[f + 1]!; x++) {
+      put(`${resLineNo[x]!}\t${try new TextDecoder().decode(resLineText[x]!)}\n`)
+    }
+  }
+  out.push(u8(10))
+  writeOut(out)
+}
+
 // Writes the answer to one query line: score, tab and path per hit, then an
 // empty line.
-function answer(line: string): void {
+function answer(line: string): void throws Error {
   out = []
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50,
-    nameRe: "", pathRe: "" }
+  let q = emptyQuery()
   try {
     q = parse(line)
   } catch (e) {
     // Named here, not through enc(): the modules may use TextEncoder only
     // when the entry module names it (tov/bugs/codec-entry-only).
     writeOut(new TextEncoder().encode("error\n\n"))
+    return
+  }
+  if (q.hasGrep) {
+    try answerGrep(q)
     return
   }
   if (deadCount === 0 && overCount === 0 && q.pathRe === "") {
@@ -104,6 +146,13 @@ function main(): void throws Error {
       writeOut(enc("\n"))
       continue
     }
-    answer(line)
+    // Not a query (tools/grepcheck.py): index home's file contents into a
+    // new content index there.
+    if (line.startsWith("!content ")) {
+      contentOpen(line.slice(9), true)
+      writeOut(enc(`${syncNow(enc(home), [], [enc(home)])}\n\n`))
+      continue
+    }
+    try answer(line)
   }
 }

@@ -1,0 +1,517 @@
+// Writing content segments (rust/src/content.rs build_segment, merge,
+// write_segment): from files read fresh, or by merging segments and
+// dropping their tombstoned docs. Posting lists are delta varints, or a
+// bitset over the segment's docs once more than 1 in 8 docs hold the key.
+
+import { MAX_FILE, NOT_TEXT, docRank } from "./cscope"
+import { gramCount, gramFill, setRun, setCounts, setOutputs, gCnt, gTri, gSym, gBloom, gLong } from "./cgrams"
+import { Docs, MAGIC, BITSET, sectionLens, layout, segPath, segMap, segN, segNtri, segOff, S_TRI_KEY, S_TRI_OFF, S_POST,
+  S_BLOOM, S_LONG, triKey, triOff, docPath, docSize, docMtime, docRankOf, bloomRange, isDeadDoc, pathLess, pushBytes,
+  r32 } from "./segs"
+import { enc, zerosU32, zerosU64 } from "./bytes"
+import { readDocs, writeFile } from "./io"
+
+// File bytes per segment build: bounds the build's memory.
+const SEG_BYTES = 67108864
+// Files read at once.
+const RUN = 256
+
+// Index ranges [b[i], b[i + 1]) of about SEG_BYTES of file data each (by
+// the sizes the name index knows).
+export function batches(docs: Docs): int[] {
+  const out: int[] = [0]
+  let bytes = 0
+  for (let i = 0; i < docs.paths.length; i++) {
+    if (bytes >= SEG_BYTES) {
+      out.push(i)
+      bytes = 0
+    }
+    bytes += docs.sizes[i]!
+  }
+  if (out[out.length - 1]! < docs.paths.length) {
+    out.push(docs.paths.length)
+  }
+  return out
+}
+
+// ------------------------------------------------------------------ the segment being written
+
+let wPaths: u8[][] = []
+let wSizes: int[] = []
+let wMtimes: int[] = []
+let wRanks: int[] = []
+let wBloom: u64[] = []
+let wBloomAt: int[] = [0]
+let wLong: u64[] = []
+let wLongAt: int[] = [0]
+// Posting lists: keys ascending, where each starts in wPost (with BITSET).
+let wKeys: int[] = []
+let wOffs: int[] = []
+let wPost: u8[] = []
+
+function resetSeg(): void {
+  wPaths = []
+  wSizes = []
+  wMtimes = []
+  wRanks = []
+  wBloom = []
+  wBloomAt = [0]
+  wLong = []
+  wLongAt = [0]
+  wKeys = []
+  wOffs = []
+  wPost = []
+}
+
+// Key's docs (ascending), in a segment of n docs.
+function pushList(n: int, key: int, docs: int[], from: int, to: int): void {
+  wKeys.push(key)
+  if ((to - from) * 8 > n) {
+    wOffs.push(wPost.length | BITSET)
+    const at = wPost.length
+    for (let j = 0; j < (n + 7) >> 3; j++) {
+      wPost.push(u8(0))
+    }
+    for (let i = from; i < to; i++) {
+      const d = docs[i]!
+      wPost[at + (d >> 3)] = wPost[at + (d >> 3)]! | u8(1 << (d & 7))
+    }
+    return
+  }
+  wOffs.push(wPost.length)
+  let last = 0
+  for (let i = from; i < to; i++) {
+    let v = docs[i]! - last
+    last = docs[i]!
+    while (v >= 128) {
+      wPost.push(u8((v & 127) | 128))
+      v = v >> 7
+    }
+    wPost.push(u8(v))
+  }
+}
+
+function put32(inout out: u8[], v: int): void {
+  out.push(u8(v & 255))
+  out.push(u8((v >> 8) & 255))
+  out.push(u8((v >> 16) & 255))
+  out.push(u8((v >> 24) & 255))
+}
+
+function put64(inout out: u8[], v: int): void {
+  put32(&out, v & 4294967295)
+  put32(&out, (v >> 32) & 4294967295)
+}
+
+function putWord(inout out: u8[], x: u64): void {
+  for (let j = 0; j < 8; j++) {
+    out.push(u8(int((x >> u64(8 * j)) & u64(255))))
+  }
+}
+
+function padTo(inout out: u8[], at: int): void {
+  while (out.length < at) {
+    out.push(u8(0))
+  }
+}
+
+// Writes the segment held in w* as file id of dir; false if it has no docs
+// or can't be written.
+function writeSegment(dir: string, id: int): bool {
+  const ndocs = wPaths.length
+  if (ndocs === 0) {
+    return false
+  }
+  const pathOff: int[] = [0]
+  let pathsLen = 0
+  for (const p of wPaths) {
+    pathsLen += p.length
+    pathOff.push(pathsLen)
+  }
+  const byPath: int[] = []
+  for (let d = 0; d < ndocs; d++) {
+    byPath.push(d)
+  }
+  byPath.sort((a, b) => (pathLess(wPaths[a]!, wPaths[b]!) ? -1 : pathLess(wPaths[b]!, wPaths[a]!) ? 1 : 0))
+  const off = layout(sectionLens(ndocs, wKeys.length, wPost.length, pathsLen, wBloom.length, wLong.length))
+  let out: u8[] = enc(MAGIC)
+  for (const v of [ndocs, wKeys.length, wPost.length, pathsLen, wBloom.length, wLong.length]) {
+    put64(&out, v)
+  }
+  padTo(&out, off[0]!)
+  for (const k of wKeys) {
+    put32(&out, k)
+  }
+  padTo(&out, off[1]!)
+  for (const o of wOffs) {
+    put32(&out, o)
+  }
+  put32(&out, wPost.length)
+  padTo(&out, off[2]!)
+  pushBytes(&out, wPost)
+  padTo(&out, off[3]!)
+  for (const o of pathOff) {
+    put32(&out, o)
+  }
+  padTo(&out, off[4]!)
+  for (const p of wPaths) {
+    pushBytes(&out, p)
+  }
+  padTo(&out, off[5]!)
+  for (const s of wSizes) {
+    put64(&out, s)
+  }
+  padTo(&out, off[6]!)
+  for (const m of wMtimes) {
+    put32(&out, m)
+  }
+  padTo(&out, off[7]!)
+  for (const d of byPath) {
+    put32(&out, d)
+  }
+  padTo(&out, off[8]!)
+  for (const r of wRanks) {
+    out.push(u8(r & 255))
+  }
+  padTo(&out, off[9]!)
+  for (const o of wBloomAt) {
+    put32(&out, o)
+  }
+  padTo(&out, off[10]!)
+  for (const x of wBloom) {
+    putWord(&out, x)
+  }
+  padTo(&out, off[11]!)
+  for (const o of wLongAt) {
+    put32(&out, o)
+  }
+  padTo(&out, off[12]!)
+  for (const x of wLong) {
+    putWord(&out, x)
+  }
+  padTo(&out, off[13]!)
+  resetSeg()
+  return writeFile(segPath(dir, id), out) === ""
+}
+
+// ------------------------------------------------------------------ build
+
+// Non-negative ints (below 2^63) sorted ascending, 16 bits a pass.
+function radixSort(a: int[]): int[] {
+  let src = a
+  for (let shift = 0; shift < 64; shift += 16) {
+    const count: int[] = []
+    for (let j = 0; j <= 65536; j++) {
+      count.push(0)
+    }
+    for (const v of src) {
+      count[((v >> shift) & 65535) + 1] = count[((v >> shift) & 65535) + 1]! + 1
+    }
+    for (let j = 0; j < 65536; j++) {
+      count[j + 1] = count[j + 1]! + count[j]!
+    }
+    const dst: int[] = []
+    for (let j = 0; j < src.length; j++) {
+      dst.push(0)
+    }
+    for (const v of src) {
+      const k = (v >> shift) & 65535
+      dst[count[k]!] = v
+      count[k] = count[k]! + 1
+    }
+    src = dst
+  }
+  return src
+}
+
+function pushU32s(inout out: u32[], src: u32[], from: int, to: int): void {
+  for (let i = from; i < to; i++) {
+    out.push(src[i]!)
+  }
+}
+
+function pushU64s(inout out: u64[], src: u64[], from: int, to: int): void {
+  for (let i = from; i < to; i++) {
+    out.push(src[i]!)
+  }
+}
+
+function pathReq(docs: Docs, lo: int, hi: int): u8[] {
+  let out: u8[] = []
+  for (let i = lo; i < hi; i++) {
+    put32(&out, docs.paths[i]!.length)
+    pushBytes(&out, docs.paths[i]!)
+  }
+  return out
+}
+
+// Builds docs[lo, hi) (sorted by path) into segment id of dir. Files that
+// turn out not to be text are recorded with no grams. False if nothing was
+// written.
+export function buildSegment(dir: string, id: int, docs: Docs, lo: int, hi: int): bool {
+  resetSeg()
+  const n = hi - lo
+  let tri: u32[] = []
+  const triAt: int[] = [0]
+  let sym: u32[] = []
+  const symAt: int[] = [0]
+  for (let s = lo; s < hi; s += RUN) {
+    const e = s + RUN < hi ? s + RUN : hi
+    const b = new TextEncoder().encode(readDocs(pathReq(docs, s, e), MAX_FILE + 1))
+    const start: u32[] = []
+    const len: u32[] = []
+    const text: u8[] = []
+    let p = 0
+    for (let i = s; i < e; i++) {
+      const l = r32(b, p)
+      p += 4
+      let ok = l !== 4294967295 && l <= MAX_FILE
+      if (ok) {
+        for (let j = 0; j < (l < 8192 ? l : 8192) && ok; j++) {
+          ok = b[p + j]! !== u8(0)
+        }
+      }
+      let size = 0
+      if (ok) {
+        size = l
+      }
+      start.push(u32(p))
+      len.push(u32(size))
+      text.push(u8(ok ? 1 : 0))
+      if (l !== 4294967295) {
+        p += l
+      }
+    }
+    const k = e - s
+    setRun(b, start, len, text)
+    setCounts(zerosU32(4 * k))
+    gramCount(k)
+    const at: u32[] = []
+    const tot = [0, 0, 0, 0]
+    for (let i = 0; i < k; i++) {
+      for (let x = 0; x < 4; x++) {
+        at.push(u32(tot[x]!))
+        tot[x] = tot[x]! + int(gCnt[4 * i + x]!)
+      }
+    }
+    setOutputs(at, zerosU32(tot[0]!), zerosU32(tot[1]!), zerosU64(tot[2]!), zerosU64(tot[3]!))
+    gramFill(k)
+    for (let i = 0; i < k; i++) {
+      const d = s + i
+      const ok = int(text[i]!) === 1
+      wPaths.push(docs.paths[d]!)
+      wSizes.push(docs.sizes[d]!)
+      wMtimes.push(docs.mtimes[d]!)
+      wRanks.push(ok ? docRank(docs.paths[d]!) : NOT_TEXT)
+      const a = int(at[4 * i]!)
+      pushU32s(&tri, gTri, a, a + int(gCnt[4 * i]!))
+      triAt.push(tri.length)
+      const a1 = int(at[4 * i + 1]!)
+      pushU32s(&sym, gSym, a1, a1 + int(gCnt[4 * i + 1]!))
+      symAt.push(sym.length)
+      const a2 = int(at[4 * i + 2]!)
+      pushU64s(&wBloom, gBloom, a2, a2 + int(gCnt[4 * i + 2]!))
+      wBloomAt.push(wBloom.length)
+      const a3 = int(at[4 * i + 3]!)
+      pushU64s(&wLong, gLong, a3, a3 + int(gCnt[4 * i + 3]!))
+      wLongAt.push(wLong.length)
+    }
+    setRun([], [], [], [])
+    setOutputs([], [], [], [], [])
+  }
+  // Trigram postings, 2^16 keys at a time: each doc's keys are sorted, so a
+  // cursor per doc walks its keys of the current first byte.
+  const cur: int[] = triAt.slice(0, n)
+  const count: int[] = []
+  for (let j = 0; j <= 65536; j++) {
+    count.push(0)
+  }
+  for (let hb = 0; hb < 256; hb++) {
+    const lows: int[] = []
+    const ds: int[] = []
+    for (let d = 0; d < n; d++) {
+      let i = cur[d]!
+      const end = triAt[d + 1]!
+      while (i < end && (int(tri[i]!) >> 16) === hb) {
+        lows.push(int(tri[i]!) & 65535)
+        ds.push(d)
+        i += 1
+      }
+      cur[d] = i
+    }
+    if (lows.length === 0) {
+      continue
+    }
+    for (const x of lows) {
+      count[x + 1] = count[x + 1]! + 1
+    }
+    for (let j = 0; j < 65536; j++) {
+      count[j + 1] = count[j + 1]! + count[j]!
+    }
+    const placed: int[] = []
+    for (let j = 0; j < lows.length; j++) {
+      placed.push(0)
+    }
+    const fill: int[] = count.slice(0)
+    for (let j = 0; j < lows.length; j++) {
+      placed[fill[lows[j]!]!] = ds[j]!
+      fill[lows[j]!] = fill[lows[j]!]! + 1
+    }
+    for (let x = 0; x < 65536; x++) {
+      if (count[x + 1]! > count[x]!) {
+        pushList(n, (hb << 16) | x, placed, count[x]!, count[x + 1]!)
+      }
+    }
+    for (let j = 0; j <= 65536; j++) {
+      count[j] = 0
+    }
+  }
+  tri = []
+  // Definition keys (above 2^31): (key - 2^31) << 32 | doc, sorted.
+  const pairs: int[] = []
+  for (let d = 0; d < n; d++) {
+    for (let i = symAt[d]!; i < symAt[d + 1]!; i++) {
+      pairs.push(((int(sym[i]!) - 2147483648) << 32) | d)
+    }
+  }
+  sym = []
+  const sorted = radixSort(pairs)
+  const list: int[] = []
+  let i = 0
+  while (i < sorted.length) {
+    const key = sorted[i]! >> 32
+    let j = i
+    while (j < sorted.length && (sorted[j]! >> 32) === key) {
+      list.push(sorted[j]! & 4294967295)
+      j += 1
+    }
+    pushList(n, key + 2147483648, list, list.length - (j - i), list.length)
+    i = j
+  }
+  return writeSegment(dir, id)
+}
+
+// ------------------------------------------------------------------ merge
+
+// Doc ids of segment s's posting list k, ascending.
+function listOf(s: int, k: int): int[] {
+  const m = segMap[s]!
+  const base = segOff[s]![S_POST]!
+  const o0 = triOff(s, k)
+  const o1 = triOff(s, k + 1)
+  const a = base + (o0 & (BITSET - 1))
+  const b = base + (o1 & (BITSET - 1))
+  const out: int[] = []
+  if ((o0 & BITSET) !== 0) {
+    for (let w = a; w < b; w++) {
+      const x = int(m[w]!)
+      if (x === 0) {
+        continue
+      }
+      for (let t = 0; t < 8; t++) {
+        if (((x >> t) & 1) !== 0) {
+          out.push((w - a) * 8 + t)
+        }
+      }
+    }
+    return out
+  }
+  let last = 0
+  let p = a
+  while (p < b) {
+    let v = 0
+    let sh = 0
+    for (;;) {
+      const x = int(m[p]!)
+      p += 1
+      v = v | ((x & 127) << sh)
+      if (x < 128 || p >= b) {
+        break
+      }
+      sh += 7
+    }
+    last += v
+    out.push(last)
+  }
+  return out
+}
+
+// Merges segments segs (open indices, in segment order) into segment id of
+// dir, without their tombstoned docs. Docs are renumbered segment by
+// segment, so posting lists stay in order; bloom filters carry over.
+export function mergeSegs(dir: string, id: int, segs: int[]): bool {
+  resetSeg()
+  const remap: int[][] = []
+  for (const s of segs) {
+    const r: int[] = []
+    for (let d = 0; d < segN[s]!; d++) {
+      if (isDeadDoc(s, d)) {
+        r.push(-1)
+        continue
+      }
+      r.push(wPaths.length)
+      wPaths.push(docPath(s, d))
+      wSizes.push(docSize(s, d))
+      wMtimes.push(docMtime(s, d))
+      wRanks.push(docRankOf(s, d))
+      const br = bloomRange(s, d, false)
+      for (let w = br[0]!; w < br[1]!; w++) {
+        wBloom.push(word(s, S_BLOOM, w))
+      }
+      wBloomAt.push(wBloom.length)
+      const lr = bloomRange(s, d, true)
+      for (let w = lr[0]!; w < lr[1]!; w++) {
+        wLong.push(word(s, S_LONG, w))
+      }
+      wLongAt.push(wLong.length)
+    }
+    remap.push(r)
+  }
+  const n = wPaths.length
+  const pos: int[] = []
+  for (const s of segs) {
+    pos.push(0)
+  }
+  for (;;) {
+    let t = -1
+    for (let x = 0; x < segs.length; x++) {
+      const s = segs[x]!
+      if (pos[x]! < segNtri[s]!) {
+        const k = triKey(s, pos[x]!)
+        if (t < 0 || k < t) {
+          t = k
+        }
+      }
+    }
+    if (t < 0) {
+      break
+    }
+    const list: int[] = []
+    for (let x = 0; x < segs.length; x++) {
+      const s = segs[x]!
+      if (pos[x]! < segNtri[s]! && triKey(s, pos[x]!) === t) {
+        const r = remap[x]!
+        for (const d of listOf(s, pos[x]!)) {
+          if (r[d]! >= 0) {
+            list.push(r[d]!)
+          }
+        }
+        pos[x] = pos[x]! + 1
+      }
+    }
+    if (list.length > 0) {
+      pushList(n, t, list, 0, list.length)
+    }
+  }
+  return writeSegment(dir, id)
+}
+
+function word(s: int, sec: int, w: int): u64 {
+  const m = segMap[s]!
+  const at = segOff[s]![sec]! + 8 * w
+  let x = u64(0)
+  for (let j = 7; j >= 0; j--) {
+    x = (x << u64(8)) | u64(int(m[at + j]!))
+  }
+  return x
+}

@@ -1,0 +1,340 @@
+// What the content index records per text file (rust/src/content.rs
+// trigrams, symbols, bloom): its sorted distinct case-folded trigrams, plus
+// the end-of-file pair key; the definitions it makes (`sym:`); and two bloom
+// filters of its folded 5- and 7-byte grams. A file holding ſ or the Kelvin
+// sign is also read with them as s and k (odd folds), since a
+// case-insensitive search for s or k matches them.
+//
+// gramCount and gramFill do a run of files at once: the first counts what
+// each file needs, the caller sizes the outputs, the second fills them.
+
+import { enc } from "./bytes"
+
+export const SHORT = 5
+export const LONG = 7
+
+// The run's files: file k is gBuf[gStart[k], gStart[k] + gLen[k]), and text
+// (indexed) when gText[k] is 1.
+export let gBuf: u8[] = []
+export let gStart: u32[] = []
+export let gLen: u32[] = []
+export let gText: u8[] = []
+// Per file: trigram keys, definition keys, short bloom words, long bloom words.
+export let gCnt: u32[] = []
+// Per file, where its four outputs start in gTri, gSym, gBloom, gLong.
+export let gAt: u32[] = []
+export let gTri: u32[] = []
+export let gSym: u32[] = []
+export let gBloom: u64[] = []
+export let gLong: u64[] = []
+
+export function setRun(buf: u8[], start: u32[], len: u32[], text: u8[]): void {
+  gBuf = buf
+  gStart = start
+  gLen = len
+  gText = text
+}
+
+export function setCounts(cnt: u32[]): void {
+  gCnt = cnt
+}
+
+export function setOutputs(at: u32[], tri: u32[], sym: u32[], bloom: u64[], long: u64[]): void {
+  gAt = at
+  gTri = tri
+  gSym = sym
+  gBloom = bloom
+  gLong = long
+}
+
+export function fold(b: int): int {
+  return b >= 65 && b <= 90 ? b + 32 : b
+}
+
+// A folded gram's 24-bit hash: the top 24 of the low 64 bits of
+// g * 0x9E3779B97F4A7C15 (g < 2^56), worked out in 16-bit limbs.
+export function gramHash(g: int): int {
+  const g0 = g & 65535
+  const g1 = (g >> 16) & 65535
+  const g2 = (g >> 32) & 65535
+  const g3 = (g >> 48) & 65535
+  const v0 = g0 * 31765
+  const v1 = (v0 >> 16) + g0 * 32586 + g1 * 31765
+  const v2 = (v1 >> 16) + g0 * 31161 + g1 * 32586 + g2 * 31765
+  const v3 = (v2 >> 16) + g0 * 40503 + g1 * 31161 + g2 * 32586 + g3 * 31765
+  return ((v2 & 65535) >> 8) | ((v3 & 65535) << 8)
+}
+
+// The two bits a gram hash sets in a bloom filter of `words` u64s.
+export function bloomBit(h: int, words: int, second: bool): int {
+  const x = second ? (h * 2654435761) & 16777215 : h
+  return (x * words * 64) >> 24
+}
+
+// The posting key for "the file's last two bytes are a, b".
+export function eofKey(a: int, b: int): int {
+  return (fold(a) << 16) | (fold(b) << 8)
+}
+
+// buf[s, s + n) with ſ (C5 BF) and the Kelvin sign (E2 84 AA) read as s and k,
+// or [] if it holds neither.
+export function oddFolds(buf: u8[], s: int, n: int): u8[] {
+  let any = false
+  for (let i = s; i + 1 < s + n && !any; i++) {
+    const b = int(buf[i]!)
+    any = (b === 197 && int(buf[i + 1]!) === 191) || (b === 226 && i + 2 < s + n && int(buf[i + 1]!) === 132 && int(buf[i + 2]!) === 170)
+  }
+  const out: u8[] = []
+  if (!any) {
+    return out
+  }
+  let i = s
+  while (i < s + n) {
+    const b = int(buf[i]!)
+    if (b === 197 && i + 1 < s + n && int(buf[i + 1]!) === 191) {
+      out.push(u8(115))
+      i += 2
+    } else if (b === 226 && i + 2 < s + n && int(buf[i + 1]!) === 132 && int(buf[i + 2]!) === 170) {
+      out.push(u8(107))
+      i += 3
+    } else {
+      out.push(u8(b))
+      i += 1
+    }
+  }
+  return out
+}
+
+function sortedDistinct(a: int[]): int[] {
+  let s = a
+  s.sort((x, y) => x - y)
+  const out: int[] = []
+  for (const v of s) {
+    if (out.length === 0 || out[out.length - 1]! !== v) {
+      out.push(v)
+    }
+  }
+  return out
+}
+
+function addTrigrams(buf: u8[], s: int, n: int, inout keys: int[]): void {
+  if (n >= 2) {
+    keys.push(eofKey(int(buf[s + n - 2]!), int(buf[s + n - 1]!)))
+  }
+  if (n >= 3) {
+    let t = (fold(int(buf[s]!)) << 8) | fold(int(buf[s + 1]!))
+    for (let i = s + 2; i < s + n; i++) {
+      t = ((t << 8) | fold(int(buf[i]!))) & 16777215
+      keys.push(t)
+    }
+  }
+}
+
+function addHashes(buf: u8[], s: int, n: int, w: int, inout hs: int[]): void {
+  for (let i = s; i + w <= s + n; i++) {
+    let g = 0
+    for (let j = 0; j < w; j++) {
+      g = (g << 8) | fold(int(buf[i + j]!))
+    }
+    hs.push(gramHash(g))
+  }
+}
+
+// Keywords a definition starts with (`sym:`).
+const DEFINES = ["fn", "func", "function", "def", "class", "struct", "enum", "trait", "interface", "type", "typealias", "impl",
+  "let", "const", "var", "val", "static", "module", "mod", "protocol", "extension", "macro_rules!", "define", "typedef",
+  "union", "object", "record", "namespace", "actor"].map(enc)
+
+export function isWord(b: int): bool {
+  return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95
+}
+
+function identStart(b: int): bool {
+  return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95
+}
+
+function sepAt(buf: u8[], i: int, end: int): bool {
+  if (i >= end) {
+    return false
+  }
+  const b = int(buf[i]!)
+  return b === 32 || b === 9 || b === 42 || b === 38
+}
+
+function blankAt(buf: u8[], i: int, end: int): bool {
+  return i < end && (int(buf[i]!) === 32 || int(buf[i]!) === 9)
+}
+
+// Where the name of a definition starting with a keyword at p begins (the
+// definition regex `\b(?:DEFINES)(?:<[^>\n]*>)?[ \t*&]+(?:mut[ \t]+)?` then a
+// name), or -1. p is at a word boundary.
+export function defNameAt(buf: u8[], p: int, end: int): int {
+  for (const k of DEFINES) {
+    if (p + k.length > end) {
+      continue
+    }
+    let same = true
+    for (let j = 0; j < k.length && same; j++) {
+      same = buf[p + j]! === k[j]!
+    }
+    if (!same) {
+      continue
+    }
+    let q = p + k.length
+    if (q < end && int(buf[q]!) === 60) {
+      let r = q + 1
+      while (r < end && int(buf[r]!) !== 62 && int(buf[r]!) !== 10) {
+        r += 1
+      }
+      if (r >= end || int(buf[r]!) !== 62) {
+        continue
+      }
+      q = r + 1
+    }
+    let j = q
+    while (sepAt(buf, j, end)) {
+      j += 1
+    }
+    if (j === q) {
+      continue
+    }
+    if (j + 3 < end && int(buf[j]!) === 109 && int(buf[j + 1]!) === 117 && int(buf[j + 2]!) === 116 && blankAt(buf, j + 3, end)) {
+      let m = j + 3
+      while (blankAt(buf, m, end)) {
+        m += 1
+      }
+      if (m < end && identStart(int(buf[m]!))) {
+        return m
+      }
+    }
+    if (j < end && identStart(int(buf[j]!))) {
+      return j
+    }
+  }
+  return -1
+}
+
+// The posting key for "this file defines name": a hash above the 24-bit
+// trigram space (FNV-1a with the top bit set).
+export function symbolKey(buf: u8[], s: int, e: int): int {
+  let h = 2166136261
+  for (let i = s; i < e; i++) {
+    h = ((h ^ int(buf[i]!)) * 16777619) & 4294967295
+  }
+  return h | 2147483648
+}
+
+// The sorted distinct definition keys of buf[s, s + n).
+function symbols(buf: u8[], s: int, n: int): int[] {
+  const end = s + n
+  const keys: int[] = []
+  let p = s
+  while (p < end) {
+    if (identStart(int(buf[p]!)) && (p === s || !isWord(int(buf[p - 1]!)))) {
+      const at = defNameAt(buf, p, end)
+      if (at >= 0) {
+        let e = at
+        while (e < end && isWord(int(buf[e]!))) {
+          e += 1
+        }
+        keys.push(symbolKey(buf, at, e))
+        // The name may itself be a keyword ("static func main"): look
+        // again from it, not past it.
+        p = at
+        continue
+      }
+    }
+    p += 1
+  }
+  return sortedDistinct(keys)
+}
+
+// File k's grams: trigram keys, definition keys, short and long gram hashes.
+function grams(k: int): { tri: int[], sym: int[], short: int[], long: int[] } {
+  const s = int(gStart[k]!)
+  const n = int(gLen[k]!)
+  const alt = oddFolds(gBuf, s, n)
+  let tri: int[] = []
+  addTrigrams(gBuf, s, n, &tri)
+  addTrigrams(alt, 0, alt.length, &tri)
+  let sh: int[] = []
+  addHashes(gBuf, s, n, SHORT, &sh)
+  addHashes(alt, 0, alt.length, SHORT, &sh)
+  let lg: int[] = []
+  addHashes(gBuf, s, n, LONG, &lg)
+  addHashes(alt, 0, alt.length, LONG, &lg)
+  return { tri: sortedDistinct(tri), sym: symbols(gBuf, s, n), short: sortedDistinct(sh), long: sortedDistinct(lg) }
+}
+
+function longBits(k: int): int {
+  return int(gLen[k]!) >= 16384 ? 3 : 2
+}
+
+// hook: per text file k < n, what it needs in each output (4 per file into
+// gCnt): trigram keys, definition keys, short and long bloom words.
+// reads: gBuf gStart gLen gText
+// writes: gCnt
+export function gramCount(n: int): void {
+  for (let k = 0; k < n; k++) {
+    let c0 = 0
+    let c1 = 0
+    let c2 = 0
+    let c3 = 0
+    if (gText[k]! !== u8(0)) {
+      const g = grams(k)
+      c0 = g.tri.length
+      c1 = g.sym.length
+      c2 = Math.trunc((g.short.length * 3 + 63) / 64)
+      c3 = Math.trunc((g.long.length * longBits(k) + 63) / 64)
+    }
+    gCnt[4 * k] = u32(c0)
+    gCnt[4 * k + 1] = u32(c1)
+    gCnt[4 * k + 2] = u32(c2)
+    gCnt[4 * k + 3] = u32(c3)
+  }
+}
+
+// hook: per text file k < n, its trigram and definition keys and bloom
+// words, at gAt[4k..4k+4) in gTri, gSym, gBloom, gLong (sized by gramCount).
+// reads: gBuf gStart gLen gText gCnt gAt
+// writes: gTri gSym gBloom gLong
+export function gramFill(n: int): void {
+  for (let k = 0; k < n; k++) {
+    if (gText[k]! === u8(0)) {
+      continue
+    }
+    const g = grams(k)
+    let at = int(gAt[4 * k]!)
+    for (const t of g.tri) {
+      gTri[at] = u32(t)
+      at += 1
+    }
+    at = int(gAt[4 * k + 1]!)
+    for (const t of g.sym) {
+      gSym[at] = u32(t)
+      at += 1
+    }
+    const bw = int(gCnt[4 * k + 2]!)
+    const b0 = int(gAt[4 * k + 2]!)
+    for (let w = 0; w < bw; w++) {
+      gBloom[b0 + w] = u64(0)
+    }
+    for (const h of g.short) {
+      for (let x = 0; x < 2; x++) {
+        const b = bloomBit(h, bw, x === 1)
+        gBloom[b0 + (b >> 6)] = gBloom[b0 + (b >> 6)]! | (u64(1) << u64(b & 63))
+      }
+    }
+    const lw = int(gCnt[4 * k + 3]!)
+    const l0 = int(gAt[4 * k + 3]!)
+    for (let w = 0; w < lw; w++) {
+      gLong[l0 + w] = u64(0)
+    }
+    for (const h of g.long) {
+      for (let x = 0; x < 2; x++) {
+        const b = bloomBit(h, lw, x === 1)
+        gLong[l0 + (b >> 6)] = gLong[l0 + (b >> 6)]! | (u64(1) << u64(b & 63))
+      }
+    }
+  }
+}

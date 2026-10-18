@@ -1,0 +1,161 @@
+// Which files the content index holds (rust/src/content.rs eligible,
+// name_ok, in_scope, doc_rank): text files of yours under home, without the
+// generated, vendored and app-data trees.
+
+import { enc, lowerAscii, bytesStart, bytesEnd } from "./bytes"
+
+export const MAX_FILE = 1048576
+// Rank of a doc that turned out not to be text: kept so diffs know we
+// looked at it, never a candidate.
+export const NOT_TEXT = -128
+
+// Folder names whose subtrees are generated, vendored, or caches.
+const SKIP_DIRS = ["node_modules", ".git", "target", "DerivedData", "__pycache__", ".venv", "venv", "site-packages", "Pods",
+  ".next", ".turbo", ".cache", "Library", "dist", "build", ".build", ".rustup", ".cargo", ".npm", ".bun",
+  ".nvm", "vendor", ".pnpm-store", "coverage", ".Trash", ".svn", ".hg", ".gradle", ".m2", ".pyenv",
+  ".rbenv", ".gem", ".conda", "miniconda3", "anaconda3", ".docker", ".orbstack", ".colima", ".lima",
+  ".ollama", ".android", ".expo", ".terraform.d", ".wrangler", ".vscode-server", "cache", "Cache", "caches",
+  "Caches"].map(enc)
+
+// Home-relative trees that are dependencies or app data, not your files.
+const SKIP_UNDER_HOME = ["go/pkg", ".cursor/extensions", ".vscode/extensions", ".local/share", ".local/state", ".config/gcloud",
+  ".codex/.tmp"].map(enc)
+
+// Package and library bundles: their insides are app data.
+const SKIP_SUFFIXES = [".app", ".photoslibrary", ".library", ".lrlibrary", ".musiclibrary", ".tvlibrary", ".imovielibrary",
+  ".xcassets", ".framework", ".bundle", ".xcarchive", ".xcresult", ".dSYM", ".salon", ".lrdata"].map(enc)
+
+const TEXT_EXTS = ["rs", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "m", "mm", "swift", "go", "py", "pyi", "js", "mjs", "cjs",
+  "ts", "mts", "cts", "tsx", "jsx", "java", "kt", "kts", "scala", "rb", "php", "cs", "fs", "sh", "zsh", "bash",
+  "fish", "lua", "sql", "html", "htm", "css", "scss", "sass", "less", "json", "jsonc", "json5", "yaml", "yml",
+  "toml", "xml", "vue", "svelte", "astro", "zig", "nim", "hs", "ml", "mli", "ex", "exs", "erl", "clj", "dart",
+  "r", "jl", "md", "mdx", "markdown", "txt", "text", "rst", "org", "tex", "csv", "tsv", "ini", "cfg", "conf",
+  "env", "properties", "plist", "metal", "glsl", "wgsl", "hlsl", "proto", "graphql", "gql", "nix", "tf", "hcl",
+  "gradle", "cmake", "mk", "make", "dockerfile", "log", "jsonl", "ndjson", "diff", "patch", "srt", "vtt", "rtf",
+  "svg", "pl", "pm", "ps1", "bat", "vim", "el", "lisp", "scm", "rkt", "elm", "purs", "sol", "v", "sv", "vhd",
+  "asm", "s", "d", "cr", "pas", "f90", "cmd", "service", "desktop", "gitignore", "editorconfig", "lock", "sum"].map(enc)
+
+const MIN_JS = enc(".min.js")
+const PACKAGE_LOCK = enc("package-lock.json")
+const LOW_RANK = [".jsonl", ".ndjson", ".log", ".lock", ".sum"].map(enc)
+
+function lastSlash(p: u8[]): int {
+  for (let j = p.length - 1; j >= 0; j--) {
+    if (int(p[j]!) === 47) {
+      return j
+    }
+  }
+  return -1
+}
+
+function sameCI(a: u8[], at: int, b: u8[]): bool {
+  if (a.length - at !== b.length) {
+    return false
+  }
+  for (let j = 0; j < b.length; j++) {
+    if (lowerAscii(int(a[at + j]!)) !== lowerAscii(int(b[j]!))) {
+      return false
+    }
+  }
+  return true
+}
+
+function same(a: u8[], lo: int, hi: int, b: u8[]): bool {
+  if (hi - lo !== b.length) {
+    return false
+  }
+  for (let j = 0; j < b.length; j++) {
+    if (a[lo + j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+// The name and size half of eligibility, checkable before building a path.
+export function nameOk(name: u8[], size: int): bool {
+  if (size > MAX_FILE) {
+    return false
+  }
+  let dot = -1
+  for (let j = name.length - 1; j > 0; j--) {
+    if (int(name[j]!) === 46) {
+      dot = j
+      break
+    }
+  }
+  if (dot < 0) {
+    return size <= 262144
+  }
+  let text = false
+  for (const x of TEXT_EXTS) {
+    if (sameCI(name, dot + 1, x)) {
+      text = true
+      break
+    }
+  }
+  return text && !bytesEnd(name, MIN_JS) && !same(name, 0, name.length, PACKAGE_LOCK)
+}
+
+// Whether a path (file or folder) is inside the indexed area.
+export function inScope(path: u8[], home: u8[]): bool {
+  if (!bytesStart(path, home)) {
+    return false
+  }
+  let rel = home.length
+  if (rel < path.length) {
+    if (int(path[rel]!) !== 47) {
+      return false
+    }
+    rel += 1
+  }
+  for (const s of SKIP_UNDER_HOME) {
+    if (path.length - rel >= s.length && same(path, rel, rel + s.length, s) &&
+      (path.length - rel === s.length || int(path[rel + s.length]!) === 47)) {
+      return false
+    }
+  }
+  let a = rel
+  while (a <= path.length) {
+    let b = a
+    while (b < path.length && int(path[b]!) !== 47) {
+      b += 1
+    }
+    for (const s of SKIP_DIRS) {
+      if (same(path, a, b, s)) {
+        return false
+      }
+    }
+    for (const x of SKIP_SUFFIXES) {
+      if (b - a > x.length && same(path, b - x.length, b, x)) {
+        return false
+      }
+    }
+    a = b + 1
+  }
+  return true
+}
+
+// Should this file be in the content index?
+export function eligible(path: u8[], size: int, home: u8[]): bool {
+  return nameOk(path.slice(lastSlash(path) + 1), size) && inScope(path, home)
+}
+
+// Candidate order tier: your files first, then dot-folders, logs and transcripts.
+export function docRank(path: u8[]): int {
+  let r = 0
+  for (let j = 0; j < path.length; j++) {
+    if (int(path[j]!) === 46 && (j === 0 || int(path[j - 1]!) === 47)) {
+      r -= 2
+      break
+    }
+  }
+  const name = path.slice(lastSlash(path) + 1)
+  for (const x of LOW_RANK) {
+    if (bytesEnd(name, x)) {
+      r -= 1
+      break
+    }
+  }
+  return r
+}

@@ -17,6 +17,9 @@ Hooks live in the module that owns their globals.
 | `markNegs` | `src/negs.tov` |
 | `fullPass` | `src/entries.tov` |
 | `trailingZeros64` | `src/masks.tov` |
+| `gramCount`, `gramFill` | `src/cgrams.tov` |
+| `grepRe`, `grepReNext` | `src/grep.tov` |
+| `readDocs`, `mapFile`, `unmapFile`, `spawnBg`, `childDone`, `background`, `docsChanged` (raw I/O, with the socket and watch hooks) | `src/io.tov` |
 
 ## Build and injection
 

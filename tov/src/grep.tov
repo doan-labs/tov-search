@@ -1,0 +1,442 @@
+// A content search's pattern (rust/src/content.rs Grep, Literal, lines_at):
+// how it is matched in a file, which lines it shows, and what it asks of the
+// index (the trigram plan and the bloom probes).
+//
+// Literals are found without a regex: their exact bytes when the pattern has
+// an upper-case letter, else in either case. `sym:` finds the name after a
+// declaring keyword. Regexes run on the system's POSIX regex (extended, with
+// \d \w \s as Rust has them), with lines separate as in Rust's multi-line mode.
+
+import { enc } from "./bytes"
+import { fold, gramHash, symbolKey, isWord, SHORT, LONG } from "./cgrams"
+import { tqReset, tqTri, literalPlan, regexPlan } from "./plan"
+
+export const MODE_LITERAL = 0
+export const MODE_REGEX = 1
+export const MODE_SYMBOL = 2
+
+const LIT_EXACT = 0
+const LIT_FOLDED = 1
+const LIT_DEF = 2
+const LIT_EMPTY = 3
+const LIT_REGEX = 4
+const LIT_NONE = 5
+
+// hook(raw): compiles the content search's regex (POSIX extended, \d \w \s
+// as in Rust, lines separate), ignoring case if ci. Returns "" or the error.
+function grepRe(pattern: string, ci: bool): string {
+  return ""
+}
+
+// hook(raw): the first match of the content regex in buf at or after from:
+// start << 32 | end, or -1.
+function grepReNext(buf: u8[], from: int): int {
+  return -1
+}
+
+let gPatternStr = ""
+export let gPattern: u8[] = []
+export let gMode = 0
+export let gCi = false
+let gKind = 0
+let gNeedle: u8[] = []
+let gOddS = false
+let gOddK = false
+export let gMaxPerFile = 5
+// Stop reading candidates after this many ms (0: read them all).
+export let gBudgetMs = 250
+
+export function setPerFile(n: int): void {
+  gMaxPerFile = n
+}
+
+export function setBudget(ms: int): void {
+  gBudgetMs = ms
+}
+
+// Upper case, as char::is_uppercase for the scripts people type.
+// ponytail: Latin, Greek and Cyrillic only; the rest count as lower case.
+function hasUpper(b: u8[]): bool {
+  let i = 0
+  while (i < b.length) {
+    const x = int(b[i]!)
+    if (x < 128) {
+      if (x >= 65 && x <= 90) {
+        return true
+      }
+      i += 1
+      continue
+    }
+    const n = x < 224 ? 2 : x < 240 ? 3 : 4
+    let c = x & (n === 2 ? 31 : n === 3 ? 15 : 7)
+    for (let j = 1; j < n && i + j < b.length; j++) {
+      c = (c << 6) | (int(b[i + j]!) & 63)
+    }
+    if ((c >= 192 && c <= 222 && c !== 215) || (c >= 256 && c <= 383 && c % 2 === 0 && c !== 312) ||
+      (c >= 913 && c <= 939) || (c >= 1024 && c <= 1071)) {
+      return true
+    }
+    i += n
+  }
+  return false
+}
+
+function isAscii(b: u8[]): bool {
+  for (const x of b) {
+    if (int(x) >= 128) {
+      return false
+    }
+  }
+  return true
+}
+
+// Sets the pattern. Returns "" or the error (a regex that doesn't compile).
+export function grepSet(pattern: string, mode: int): string {
+  gPatternStr = pattern
+  gPattern = enc(pattern)
+  gMode = mode
+  gCi = !hasUpper(gPattern) && mode !== MODE_SYMBOL
+  gNeedle = gPattern.map((b) => u8(gCi ? fold(int(b)) : int(b)))
+  gOddS = gCi && gNeedle.indexOf(u8(115)) >= 0
+  gOddK = gCi && gNeedle.indexOf(u8(107)) >= 0
+  gMaxPerFile = 5
+  gBudgetMs = 250
+  if (mode === MODE_REGEX) {
+    gKind = LIT_REGEX
+    return grepRe(pattern, gCi)
+  }
+  if (gPattern.length === 0) {
+    // ponytail: an empty sym: finds nothing (Rust matches any definition).
+    gKind = mode === MODE_SYMBOL ? LIT_NONE : LIT_EMPTY
+    return ""
+  }
+  // ponytail: a non-ASCII literal folds ASCII letters only (Rust folds all of Unicode).
+  gKind = mode === MODE_SYMBOL ? LIT_DEF : gCi ? LIT_FOLDED : LIT_EXACT
+  return ""
+}
+
+// ------------------------------------------------------------------ what the index can rule out
+
+// The trigram query (a plan node) for the pattern.
+export function grepPlan(): int {
+  tqReset()
+  if (gMode === MODE_SYMBOL && plainIdentifier(gPattern)) {
+    return tqTri(symbolKey(gPattern, 0, gPattern.length))
+  }
+  if (gMode === MODE_REGEX) {
+    return regexPlan(gPatternStr)
+  }
+  return literalPlan(gPattern)
+}
+
+function plainIdentifier(b: u8[]): bool {
+  if (b.length === 0) {
+    return false
+  }
+  const f = int(b[0]!)
+  if (!((f >= 65 && f <= 90) || (f >= 97 && f <= 122) || f === 95)) {
+    return false
+  }
+  for (const x of b) {
+    if (!isWord(int(x))) {
+      return false
+    }
+  }
+  return true
+}
+
+// Gram hashes every matching file must hold, per bloom filter: none for a
+// regex (it matches arbitrary things) or a case-insensitive non-ASCII
+// pattern (it can match on Unicode folds whose grams differ).
+export function probes(long: bool): int[] {
+  const out: int[] = []
+  if (gMode === MODE_REGEX || (gCi && !isAscii(gPattern))) {
+    return out
+  }
+  const w = long ? LONG : SHORT
+  for (let i = 0; i + w <= gPattern.length; i++) {
+    let g = 0
+    for (let j = 0; j < w; j++) {
+      g = (g << 8) | fold(int(gPattern[i + j]!))
+    }
+    out.push(gramHash(g))
+  }
+  out.sort((a, b) => a - b)
+  const d: int[] = []
+  for (const x of out) {
+    if (d.length === 0 || d[d.length - 1]! !== x) {
+      d.push(x)
+    }
+  }
+  return d
+}
+
+// ------------------------------------------------------------------ matching
+
+function exactAt(hay: u8[], c: int): bool {
+  for (let j = 0; j < gNeedle.length; j++) {
+    if (hay[c + j]! !== gNeedle[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+function foldedAt(hay: u8[], c: int): bool {
+  for (let j = 0; j < gNeedle.length; j++) {
+    if (fold(int(hay[c + j]!)) !== int(gNeedle[j]!)) {
+      return false
+    }
+  }
+  return true
+}
+
+// Where the needle matches at c with s and k also matching ſ and the Kelvin
+// sign (what the case-insensitive regex does): the match's end, or -1.
+function oddAt(hay: u8[], c: int): int {
+  let i = c
+  for (const nb of gNeedle) {
+    const n = int(nb)
+    if (i < hay.length && fold(int(hay[i]!)) === n) {
+      i += 1
+    } else if (n === 115 && i + 1 < hay.length && int(hay[i]!) === 197 && int(hay[i + 1]!) === 191) {
+      i += 2
+    } else if (n === 107 && i + 2 < hay.length && int(hay[i]!) === 226 && int(hay[i + 1]!) === 132 && int(hay[i + 2]!) === 170) {
+      i += 3
+    } else {
+      return -1
+    }
+  }
+  return i
+}
+
+// Whether hay holds the bytes s.
+function holds(hay: u8[], s: int[]): bool {
+  for (let i = 0; i + s.length <= hay.length; i++) {
+    let same = true
+    for (let j = 0; j < s.length && same; j++) {
+      same = int(hay[i + j]!) === s[j]!
+    }
+    if (same) {
+      return true
+    }
+  }
+  return false
+}
+
+const KEYWORDS = ["fn", "func", "function", "def", "class", "struct", "enum", "trait", "interface", "type", "typealias", "impl",
+  "let", "const", "var", "val", "static", "module", "mod", "protocol", "extension", "macro_rules!", "define", "typedef",
+  "union", "object", "record", "namespace", "actor"].map(enc)
+
+function blank(b: int): bool {
+  return b === 32 || b === 9
+}
+
+// Is the name at hay[p, p + len) defined there: an ASCII word boundary after
+// it, and before it on its line a declaring keyword, maybe generics, spaces
+// or *&, maybe `mut` (sym:'s regex, split at the name)?
+function definedAt(hay: u8[], p: int, len: int): bool {
+  const endWord = p + len < hay.length && isWord(int(hay[p + len]!))
+  if (isWord(int(hay[p + len - 1]!)) === endWord) {
+    return false
+  }
+  let line = p
+  while (line > 0 && int(hay[line - 1]!) !== 10) {
+    line -= 1
+  }
+  for (let q = line; q < p; q++) {
+    const b = int(hay[q]!)
+    if (!((b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b === 95) || (q > line && isWord(int(hay[q - 1]!)))) {
+      continue
+    }
+    for (const k of KEYWORDS) {
+      if (q + k.length > p) {
+        continue
+      }
+      let same = true
+      for (let j = 0; j < k.length && same; j++) {
+        same = hay[q + j]! === k[j]!
+      }
+      if (!same) {
+        continue
+      }
+      let r = q + k.length
+      if (r < p && int(hay[r]!) === 60) {
+        let e = r + 1
+        while (e < p && int(hay[e]!) !== 62 && int(hay[e]!) !== 10) {
+          e += 1
+        }
+        if (e >= p || int(hay[e]!) !== 62) {
+          continue
+        }
+        r = e + 1
+      }
+      let j = r
+      while (j < p && (blank(int(hay[j]!)) || int(hay[j]!) === 42 || int(hay[j]!) === 38)) {
+        j += 1
+      }
+      if (j === r) {
+        continue
+      }
+      if (j === p) {
+        return true
+      }
+      if (j + 3 < p && int(hay[j]!) === 109 && int(hay[j + 1]!) === 117 && int(hay[j + 2]!) === 116) {
+        let m = j + 3
+        while (m < p && blank(int(hay[m]!))) {
+          m += 1
+        }
+        if (m === p && m > j + 3) {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+// Does hay hold ſ or the Kelvin sign where the needle has s or k?
+function needsOdd(hay: u8[]): bool {
+  return (gOddS && holds(hay, [197, 191])) || (gOddK && holds(hay, [226, 132, 170]))
+}
+
+// Where matches start in hay, left to right: the first at or after `from`,
+// with where the search goes on; -1 when there is none.
+function nextMatch(hay: u8[], from: int, odd: bool): int[] {
+  const n = gNeedle.length
+  if (gKind === LIT_EMPTY) {
+    if (from === 0) {
+      return [0, 1]
+    }
+    for (let i = from - 1; i < hay.length; i++) {
+      if (int(hay[i]!) === 10) {
+        return [i + 1, i + 2]
+      }
+    }
+    return [-1, 0]
+  }
+  if (gKind === LIT_REGEX) {
+    const m = grepReNext(hay, from)
+    if (m < 0) {
+      return [-1, 0]
+    }
+    const s = m >> 32
+    const e = m & 4294967295
+    return [s, e > s ? e : s + 1]
+  }
+  if (gKind === LIT_NONE) {
+    return [-1, 0]
+  }
+  for (let c = from; c + n <= hay.length; c++) {
+    if (gKind === LIT_FOLDED && odd) {
+      const e = oddAt(hay, c)
+      if (e >= 0) {
+        return [c, e]
+      }
+    } else if (gKind === LIT_FOLDED) {
+      if (foldedAt(hay, c)) {
+        return [c, c + n]
+      }
+    } else if (exactAt(hay, c)) {
+      if (gKind === LIT_EXACT) {
+        return [c, c + n]
+      }
+      if (definedAt(hay, c, n)) {
+        return [c, c + 1]
+      }
+    }
+  }
+  return [-1, 0]
+}
+
+// ------------------------------------------------------------------ lines
+
+const WS3 = [225, 154, 128, 227, 128, 128, 226, 129, 159, 226, 128, 168, 226, 128, 169, 226, 128, 175]
+
+// b[a, e) without trailing Unicode white space (as Rust's trim_end).
+function trimEnd(b: u8[], a: int, e: int): int {
+  let z = e
+  for (;;) {
+    if (z > a) {
+      const x = int(b[z - 1]!)
+      if (x === 32 || (x >= 9 && x <= 13)) {
+        z -= 1
+        continue
+      }
+    }
+    if (z - 2 >= a && int(b[z - 2]!) === 194 && (int(b[z - 1]!) === 133 || int(b[z - 1]!) === 160)) {
+      z -= 2
+      continue
+    }
+    if (z - 3 >= a) {
+      const x = int(b[z - 3]!)
+      const y = int(b[z - 2]!)
+      const w = int(b[z - 1]!)
+      let ws = x === 226 && y === 128 && w >= 128 && w <= 138
+      for (let k = 0; k < WS3.length && !ws; k += 3) {
+        ws = x === WS3[k]! && y === WS3[k + 1]! && w === WS3[k + 2]!
+      }
+      if (ws) {
+        z -= 3
+        continue
+      }
+    }
+    return z
+  }
+}
+
+// The matched lines of the last matchFile: numbers and text (as shown: at
+// most 400 bytes, trailing white space trimmed).
+export let lineNo: int[] = []
+export let lineText: u8[][] = []
+
+// Finds the pattern in a file's bytes: the first gMaxPerFile lines holding a
+// match (by where matches start), into lineNo and lineText. Whether any.
+export function matchFile(buf: u8[]): bool {
+  lineNo = []
+  lineText = []
+  const k = buf.length < 8192 ? buf.length : 8192
+  for (let i = 0; i < k; i++) {
+    if (buf[i]! === u8(0)) {
+      return false
+    }
+  }
+  const odd = gKind === LIT_FOLDED && needsOdd(buf)
+  let no = 1
+  let counted = 0
+  let lastStart = -1
+  let from = 0
+  for (;;) {
+    const m = nextMatch(buf, from, odd)
+    const start = m[0]!
+    if (start < 0) {
+      break
+    }
+    from = m[1]!
+    for (let i = counted; i < start; i++) {
+      if (int(buf[i]!) === 10) {
+        no += 1
+      }
+    }
+    counted = start
+    let ls = start
+    while (ls > 0 && int(buf[ls - 1]!) !== 10) {
+      ls -= 1
+    }
+    if (ls === lastStart) {
+      continue
+    }
+    lastStart = ls
+    let le = start
+    while (le < buf.length && int(buf[le]!) !== 10) {
+      le += 1
+    }
+    const end = le < ls + 400 ? le : ls + 400
+    lineNo.push(no)
+    lineText.push(buf.slice(ls, trimEnd(buf, ls, end)))
+    if (lineNo.length >= gMaxPerFile) {
+      break
+    }
+  }
+  return lineNo.length > 0
+}

@@ -21,6 +21,16 @@ export type Query = {
   // re: and path: patterns ("" for none), compiled into reSet's slots 0 and 1.
   nameRe: string,
   pathRe: string,
+  // Content search: the pattern of grep:, regex: or sym: (the content
+  // layer's to handle), and its mode (grep.tov MODE_*).
+  hasGrep: bool,
+  grep: string,
+  grepMode: int,
+}
+
+export function emptyQuery(): Query {
+  return { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295,
+    limit: 50, nameRe: "", pathRe: "", hasGrep: false, grep: "", grepMode: 0 }
 }
 
 const TYPE_NAMES = ["image", "video", "audio", "doc", "code", "archive", "font"]
@@ -287,8 +297,13 @@ export function filter(q: Query, k: string, v: string): { known: bool, q: Query 
     case 11: // content
     case 12: // regex
     case 13: // sym
-    case 14: // symbol
+    case 14: { // symbol
+      const at = FILTERS.indexOf(k)
+      out.hasGrep = true
+      out.grep = v
+      out.grepMode = at === 12 ? 1 : at >= 13 ? 2 : 0
       break
+    }
     default:
       return { known: false, q: out }
   }
@@ -319,8 +334,7 @@ function splitWords(s: string): string[] {
 }
 
 export function parse(s: string): Query throws Error {
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50,
-    nameRe: "", pathRe: "" }
+  let q = emptyQuery()
   for (const word of splitWords(s)) {
     const colon = word.indexOf(":")
     if (colon >= 0) {

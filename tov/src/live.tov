@@ -5,7 +5,9 @@
 // repeated and late events are all harmless. Searches merge the overlay into
 // the base's answers exactly as the Rust app does.
 
-import { KIND_DIR, FLAG_MOUNT, NO } from "./consts"
+import { KIND_FILE, KIND_DIR, FLAG_MOUNT, NO } from "./consts"
+import { nameOk, inScope, eligible } from "./cscope"
+import { Docs, Want, noDocs, sortDocs } from "./segs"
 import { bytesKey, encDec, zerosU8 } from "./bytes"
 import { n, entName, entKind, entSize, entMtime, entParent, dirEntry, dirStart, dirLen, dirEnd, dirPrior, uoff, nb,
   scratch, putPath } from "./index"
@@ -43,6 +45,9 @@ export let overCount = 0
 let priors: Map<string, int> = new Map()
 // Folders added since the last call to takeAdded (Linux watches them).
 let added: u8[][] = []
+// Subtrees added or removed since the last call to takeTrees: the content
+// index syncs them whole.
+let trees: u8[][] = []
 let skip: u8[][] = []
 
 export function liveReset(skipped: u8[][]): void {
@@ -61,6 +66,7 @@ export function liveReset(skipped: u8[][]): void {
   overCount = 0
   priors = new Map()
   added = []
+  trees = []
   skip = skipped
 }
 
@@ -68,6 +74,12 @@ export function takeAdded(): u8[][] {
   const a = added
   added = []
   return a
+}
+
+export function takeTrees(): u8[][] {
+  const t = trees
+  trees = []
+  return t
 }
 
 function isDead(i: int): bool {
@@ -234,6 +246,7 @@ function dropOverSubtree(path: u8[]): void {
 }
 
 function removePath(p: u8[]): void {
+  trees.push(p)
   const e = baseAlive(p)
   if (e >= 0) {
     killSubtree(e)
@@ -248,6 +261,7 @@ function addNew(path: u8[], kind: int, size: int, mtime: int): void {
     return
   }
   added.push(path)
+  trees.push(path)
   const b = scanDisk(path, skip, 0)
   const nrec = rd32(b, 8)
   const paths: u8[][] = [path]
@@ -355,12 +369,120 @@ export function applyDir(path: u8[], recursive: bool): bool {
   }
   for (const c of cur.values()) {
     if (c >= 0) {
+      if ((int(entKind[c]!) & 3) === KIND_DIR) {
+        trees.push(join(p, nameBytes(c)))
+      }
       killSubtree(c)
     } else {
-      dropOverSubtree(oPath[-1 - c]!)
+      const op = oPath[-1 - c]!
+      if ((oKind[-1 - c]! & 3) === KIND_DIR) {
+        trees.push(op)
+      }
+      dropOverSubtree(op)
     }
   }
   return false
+}
+
+// What the index says should be in the content index under dir (its files
+// only, or with recursive its whole subtree), sorted by path.
+export function wanted(dir: u8[], recursive: bool, home: u8[]): Docs {
+  const want = noDocs()
+  if (!inScope(dir, home)) {
+    return want
+  }
+  const e = baseAlive(dir)
+  const k = e >= 0 ? dirOf(e) : -1
+  if (k >= 0) {
+    const a = int(dirStart[k]!)
+    const b = recursive ? int(dirEnd[k]!) : a + int(dirLen[k]!)
+    for (let i = a; i < b; i++) {
+      if ((int(entKind[i]!) & 3) !== KIND_FILE || isDead(i) || !nameOk(nameBytes(i), entSize[i]!)) {
+        continue
+      }
+      let p: u8[] = []
+      if (recursive) {
+        putPath(i, &p)
+      } else {
+        p = join(dir, nameBytes(i))
+      }
+      if (inScope(p, home)) {
+        want.paths.push(p)
+        want.sizes.push(entSize[i]!)
+        want.mtimes.push(int(entMtime[i]!))
+      }
+    }
+  }
+  const lo = join(dir, [])
+  for (let s = 0; s < oPath.length; s++) {
+    const op = oPath[s]!
+    if (op.length <= lo.length || (oKind[s]! & 3) !== KIND_FILE) {
+      continue
+    }
+    let under = true
+    for (let j = 0; j < lo.length && under; j++) {
+      under = op[j]! === lo[j]!
+    }
+    if (!under) {
+      continue
+    }
+    if (!recursive) {
+      for (let j = lo.length; j < op.length && under; j++) {
+        under = int(op[j]!) !== 47
+      }
+    }
+    if (under && eligible(op, oSize[s]!, home)) {
+      want.paths.push(op)
+      want.sizes.push(oSize[s]!)
+      want.mtimes.push(oMtime[s]!)
+    }
+  }
+  return sortDocs(want)
+}
+
+// The folders (dirs) and subtrees (trees) of one batch of changes, each with
+// what should be indexed there.
+export function wants(home: u8[], dirs: u8[][], trees: u8[][]): Want[] {
+  const ps: u8[][] = []
+  const rs: bool[] = []
+  for (let i = 0; i < dirs.length + trees.length; i++) {
+    const r = i >= dirs.length
+    const d = r ? trees[i - dirs.length]! : dirs[i]!
+    if (inScope(d, home)) {
+      ps.push(d)
+      rs.push(r)
+    } else if (r && startsWithBytes(home, d)) {
+      // A subtree holding home ("/" rescanned): sync all of home.
+      ps.push(home)
+      rs.push(true)
+    }
+  }
+  const ix: int[] = []
+  for (let i = 0; i < ps.length; i++) {
+    ix.push(i)
+  }
+  ix.sort((a, b) => (pathLess(ps[a]!, ps[b]!) ? -1 : pathLess(ps[b]!, ps[a]!) ? 1 : (rs[a]! ? 1 : 0) - (rs[b]! ? 1 : 0)))
+  const out: Want[] = []
+  for (const i of ix) {
+    const last = out.length - 1
+    if (last >= 0 && out[last]!.recursive === rs[i]! && !pathLess(out[last]!.dir, ps[i]!) && !pathLess(ps[i]!, out[last]!.dir)) {
+      continue
+    }
+    out.push({ dir: ps[i]!, recursive: rs[i]!, docs: wanted(ps[i]!, rs[i]!, home) })
+  }
+  return out
+}
+
+function startsWithBytes(a: u8[], b: u8[]): bool {
+  if (a.length < b.length) {
+    return false
+  }
+  for (let j = 0; j < b.length; j++) {
+    if (a[j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
 }
 
 // Every folder the index enters, except "/", alive, with its path.
@@ -407,7 +529,19 @@ function pathLess(a: u8[], b: u8[]): bool {
 // Query::match_path: it has no folder memo, so its folders are matched from
 // its path.
 function overlayScore(q: Query, s: int): int {
-  const path = oPath[s]!
+  return pathScore(q, oPath[s]!, oKind[s]!, oSize[s]!, oMtime[s]!, oMask[s]!, oPrior[s]!)
+}
+
+// Whether a file's path passes q's words and filters (q's tables loaded):
+// for content search's candidates.
+export function pathMatches(q: Query, path: u8[], size: int, mtime: int): bool {
+  const name = path.slice(lastSlash(path) + 1)
+  return pathScore(q, path, KIND_FILE, size, mtime, nameMask(scratch(name), name.length), 0) !== NO
+}
+
+// The score of an entry not in the base for q (its name's mask m, its
+// folder's prior), or NO.
+function pathScore(q: Query, path: u8[], kind: int, size: int, mtime: int, m: u64, prior: int): int {
   if (q.hasScope) {
     const sc = q.scope
     if (path.length <= sc.length || int(path[sc.length]!) !== 47) {
@@ -420,9 +554,6 @@ function overlayScore(q: Query, s: int): int {
     }
   }
   const cut = lastSlash(path)
-  const kind = oKind[s]!
-  const size = oSize[s]!
-  const mtime = oMtime[s]!
   if (cut + 1 >= path.length || (q.kind >= 0 && (kind & 3) !== q.kind) || size < q.sizeLo || size > q.sizeHi ||
     mtime < q.mtimeLo || mtime > q.mtimeHi) {
     return NO
@@ -433,7 +564,6 @@ function overlayScore(q: Query, s: int): int {
   if (q.exts.length > 0 && !extOk(no, nl)) {
     return NO
   }
-  const m = oMask[s]!
   if (qNpos > 0) {
     let any = false
     for (let t = 0; t < qNpos && !any; t++) {
@@ -496,7 +626,7 @@ function overlayScore(q: Query, s: int): int {
   if ((q.nameRe !== "" && !reMatch(0, path.slice(cut + 1))) || (q.pathRe !== "" && !reMatch(1, path))) {
     return NO
   }
-  return score + oPrior[s]! + rankTweaksAt(nameFlags(no, nl), kind, mtime, clock !== 0 ? clock : now)
+  return score + prior + rankTweaksAt(nameFlags(no, nl), kind, mtime, clock !== 0 ? clock : now)
 }
 
 // The top q.limit hits over the base (without its gone entries) and the

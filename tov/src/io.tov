@@ -117,3 +117,46 @@ export function uid(): int {
 export function sleepMs(ms: int): void {
   return
 }
+
+// hook(raw): reads files (req: u32 length + path each) on every core, up to
+// max bytes each, not following links and only regular files: per file its
+// length (u32, 0xFFFFFFFF if it could not be read) then its bytes. On macOS
+// iCloud placeholders are not downloaded for it.
+export function readDocs(req: u8[], max: int): string {
+  return ""
+}
+
+// hook(raw): the file mapped read-only, as an array that is never written
+// to or freed (unmapFile ends it); [] if it can't be opened.
+export function mapFile(path: string): u8[] {
+  return []
+}
+
+// hook(raw): unmaps an array from mapFile; nothing may use it after.
+export function unmapFile(a: u8[]): void {
+  return
+}
+
+// hook(raw): starts this program with args in the background, output
+// appended to log. Returns its pid, or -1.
+export function spawnBg(args: string[], log: string): int {
+  return -1
+}
+
+// hook(raw): -1 while child pid runs, else its exit status.
+export function childDone(pid: int): int {
+  return 0
+}
+
+// hook(raw): makes this process background work: lower CPU priority, and on
+// macOS the utility QoS (a lower IO tier). Threads started later inherit it.
+export function background(): void {
+  return
+}
+
+// hook(raw): per file in req (u32 length + path + u64 size each), one byte:
+// 1 if it is gone, was modified at or after since, or has another size.
+// Checked on every core.
+export function docsChanged(req: u8[], since: int): string {
+  return ""
+}
