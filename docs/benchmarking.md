@@ -49,18 +49,18 @@ per query, averaged so one big query can't dominate. Below 1 means faster.
 ```
 
 ```sh
-bench ab dev     /abs/old /abs/new --pairs 9      # bench = rust/bench/target/release/bench
+bench ab dev     /abs/old /abs/new --pairs 9      # bench = bench/target/release/bench
 bench ab holdout /abs/old /abs/new --pairs 9
-python3 compare/compare.py gen rust/bench/data/disk.bin /tmp/random.txt
-python3 compare/compare.py run /tmp/random.txt --disk rust/bench/data/disk.bin --engine old=/abs/old --engine new=/abs/new
+python3 compare/compare.py gen bench/data/disk.bin /tmp/random.txt
+python3 compare/compare.py run /tmp/random.txt --disk bench/data/disk.bin --engine old=/abs/old --engine new=/abs/new
 ```
 
-Run the last line on `rust/bench/traces/holdout.txt` too. Use one idle
+Run the last line on `bench/traces/holdout.txt` too. Use one idle
 machine, one job at a time. Put every number in the PR, including bad ones.
 
 ## fsearch and fff
 
-`compare/` times Tov, Rust, fsearch and fff on holdout, a random list and the
+`compare/` times Tov, fsearch and fff on holdout, a random list and the
 Linux source (fsearch only builds on macOS, so run it on a Mac; CI no longer
 does). It is one run and varies
 ±20%, so it isn't proof. fff skips hidden and ignored files, so it searches

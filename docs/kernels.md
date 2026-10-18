@@ -127,9 +127,9 @@ Copying bytes back into a possibly aliased array was unsafe (see
 
 | Change | Tov | Also update |
 |---|---|---|
-| Syntax or filters | `parse()`, `filter()`, `pushToken()`, range/unit helpers | Compare with Rust `Query::parse()`/`filter()`. Name-side filter changes also affect `nameKey()`/`narrows()` and C name scoring. |
+| Syntax or filters | `parse()`, `filter()`, `pushToken()`, range/unit helpers | Name-side filter changes also affect `nameKey()`/`narrows()` and C name scoring. |
 | Scoring | `fuzzyScore()`, `tokenScore()`, typo helpers, `rankTweaks()`/`scoreEntry()` | Matching helpers in `par/scoreNamesLoop.c` or `par/fullPass.c`. These C ports bypass Tov helper calls, so changing only the Tov helper leaves fast builds stale. |
-| Layout, scope or priors | `readDisk()`, `build()`, `encDec()`, `priorAdjust()`, `lookup()` | Compare Rust `Index::build()` and accessors. Revisit kernel topology plans, padding and ID assumptions. |
+| Layout, scope or priors | `readDisk()`, `build()`, `encDec()`, `priorAdjust()`, `lookup()` | Revisit kernel topology plans, padding and ID assumptions. |
 | Ranked index build | `rankedIndexBuild()` | See below. |
 | Candidate pruning, cache reuse | `prefilter()`, `scoreNamesLoop()`, `nameKey()`/`narrows()`, `search()` | Their kernels. Keep partial and negative names for directory memos, not just final usable names. |
 

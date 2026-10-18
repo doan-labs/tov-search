@@ -1,7 +1,6 @@
 target/
-rust/bench/data/
-rust/bench/out/
-rust/bin/
+bench/data/
+bench/out/
 .DS_Store
 .probe/
 .diff-check/

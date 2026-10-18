@@ -16,20 +16,14 @@ keystroke does in `tov/engine.tov` and the modules in `tov/src/`.
 | `tov/inject.py` | Parses hook contracts, validates generated C, emits typed interfaces and replacement/shadow shims. |
 | `tov/build.sh`, `tov/check.sh` | Compiler pipeline; complete correctness gate. `tov/build/` is generated output. |
 | `tov/tools/diff_oracle.py`, `tov/bugs/` | Offline transcript comparison; minimal Tov compiler bug repros. |
-| `rust/src/index.rs`, `live.rs`, `query.rs` | Reference semantics: `Index`, `Live`, `Query`, `Searcher`. Check these when porting or settling behavior. |
-| `rust/src/bin/engine.rs`, `rust/build.sh` | Rust adapter for the same disk/stdin protocol. Builds `rust/bin/engine`. |
-| `rust/bench/` | **Frozen spec:** harness, disk generator/fingerprint, traces, saved oracle answers, `PROTOCOL.md`. |
-| `rust/tools/` | Differential/stress checks, real-disk tools, more A/B tools. Check each script's supported query shapes before using it for Tov. |
-| `rust/src/{walk,fsevents,engine,server,main,content}.rs` | Crawl, live updates, daemon/CLI and content search around the Rust name engine. Not part of the Tov benchmark pipeline. |
-| `docs/rust-architecture.md` | Rust reference design, optimization decisions and history. Its paths and notes may predate current code. |
+| `tov/tools/diff-check.py`, `stress-check.py`, `ab2.py` | Two builds on synthetic disks and query chains, byte-compared; interleaved A/B timing. |
+| `bench/` | **Frozen spec:** harness, disk generator/fingerprint, traces, saved oracle answers, `PROTOCOL.md`. |
+| `compare/` | Timing against fsearch and fff. |
 | `.github/workflows/tov.yml` | Linux compiler/platform matrix; pinned Tov install. |
 
-## Reference and oracle
+## Oracle
 
-- `rust/bench/oracle/` is the byte-level answer spec.
-- Tov was ported from reference commit `04a402e`. Current Rust has extra
-  caches, pruning and search routes. Don't assume its control flow exists
-  in Tov.
+- `bench/oracle/` is the byte-level answer spec.
 - Old notebooks and dumps are at `history/pre-cleanup`, not in the working
   tree.
 
@@ -39,12 +33,11 @@ keystroke does in `tov/engine.tov` and the modules in `tov/src/`.
 main()  ->  readDisk()  ->  build()  ->  allocate query tables  ->  extIndexBuild()  ->  print "ready"  ->  answer stdin until EOF
 ```
 
-The engine reads a disk snapshot. It does not read the real filesystem or a
-saved Rust `FSIDX007` index.
+The engine reads a disk snapshot. It does not read the real filesystem.
 
 ## Disk format
 
-From the [protocol](../rust/bench/PROTOCOL.md), little-endian:
+From the [protocol](../bench/PROTOCOL.md), little-endian:
 
 ```
 header   FSDISK01 | n:u64 | now:u32
@@ -136,7 +129,7 @@ bytes after a name's last dot.
 
 - `dirPrior` folds `priorAdjust()` down the tree: home/location boosts,
   cache/bundle penalties, clamped to [-100, 60].
-- `encDec()` makes `entSize` match Rust's lossy `enc_size()`/`dec_size()`.
+- `encDec()` makes `entSize` the oracle's lossy encoded size.
   Filtering raw disk sizes instead would change answers.
 - `statOrder` holds entries 1..n-1, stable, descending by
   `dirPrior[entParent] + rankTweaks(nameFlags, kind, mtime)`.
@@ -256,7 +249,7 @@ answer -> parse -> search -> [ranked walk] -> prefilter -> scoreNamesLoop -> mem
 ## Ranked walk
 
 Before the table path, an eligible single fuzzy token may use the
-Rust-equivalent ranked walk. kind, size and mtime filters are allowed; the
+ranked walk. kind, size and mtime filters are allowed; the
 walk skips entries that fail `passes()`.
 
 ```
@@ -294,8 +287,8 @@ may still describe a previous query and don't form a complete
 | `hScore`, `hBits`, `hFlags` | `scoreEntry()` (called by `fullPass()`/`byNamePass()`) |
 | `hFlags` | no-positive entry path |
 
-The ranked stop and incomplete-settle comparisons are strict copies of
-Rust's `>` boundaries. Equality coverage:
+The ranked stop and incomplete-settle comparisons are strict `>`
+boundaries, as the oracle needs. Equality coverage:
 
 | Boundary | Status |
 |---|---|
@@ -306,14 +299,12 @@ Both equality mutant sites remain untested at equality.
 
 ## Content index
 
-`grep:`, `regex:` and `sym:` search file contents. Not in the benchmark; the
-Rust app is the reference (`rust/src/content.rs`).
+`grep:`, `regex:` and `sym:` search file contents. Not in the benchmark.
 
-- Format `BFCSEG02`, the Rust app's: each segment is an immutable file in
+- Format `BFCSEG02`: each segment is an immutable file in
   `<data dir>/content/` (4 KiB header, then 13 aligned sections: trigram
   keys and posting lists, doc table, paths, bloom filters). `.dead` files
   tombstone docs that changed or went away; `manifest` lists the segments.
-  Either app opens the other's index.
 - Segments are mapped read-only (`mapFile`). `segs.tov` opens them and diffs
   folders against the docs held; `plan.tov` turns a pattern into a trigram
   AND/OR; `csearch.tov` picks candidates per segment, drops those the bloom
@@ -326,8 +317,6 @@ Rust app is the reference (`rust/src/content.rs`).
   the manifest only after the child exits, so searches go on meanwhile.
 - A changed folder is synced once it has been quiet for 2 s, or 5 min after
   its first change.
-- `tools/grepcheck.py` checks the segment files and the answers against the
-  Rust app byte for byte.
 
 ## Hooks
 

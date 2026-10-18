@@ -9,19 +9,21 @@ Needs the pinned Tov compiler, Python 3, a C compiler and Cargo. Commands
 start at the repo root. Generate the disk once per machine.
 
 ```sh
-(cd rust/bench && cargo build --release && target/release/bench gen)
+(cd bench && cargo build --release && target/release/bench gen)
 tov/build.sh simd par
-rust/bench/target/release/bench run dev --engine tov/build/engine-simd-par
-rust/bench/target/release/bench run holdout --engine tov/build/engine-simd-par
+bench/target/release/bench run dev --engine tov/build/engine-simd-par
+bench/target/release/bench run holdout --engine tov/build/engine-simd-par
 tov/check.sh
 ```
 
-- Always pass `--engine` to `bench run`. Without it, the harness runs
-  `rust/bin/engine` from the checkout it was built in (it embeds
-  `CARGO_MANIFEST_DIR` at compile time), not the Tov binary.
-- `--engine` does not move the compiled-in trace and oracle paths. Rebuild
-  the harness after moving a checkout.
-- `bench gen` checks the deterministic disk against `rust/bench/DATASET`.
+Cargo builds the benchmark harness (and installs the Tov compiler).
+
+- Always pass `--engine` to `bench run`: its default engine path no longer
+  exists.
+- `--engine` does not move the compiled-in trace and oracle paths (the
+  harness embeds `CARGO_MANIFEST_DIR` at compile time). Rebuild the harness
+  after moving a checkout.
+- `bench gen` checks the deterministic disk against `bench/DATASET`.
 
 ## tov/check.sh
 
@@ -40,9 +42,9 @@ Shadow is for correctness, not speed. To check one shadow transcript by hand:
 
 ```sh
 tov/build.sh simd par shadow
-sed -n 's/^@@ //p' rust/bench/oracle/dev.tsv |
-  tov/build/engine-simd-par-shadow rust/bench/data/disk.bin > tov/build/shadow-dev.out
-python3 tov/tools/diff_oracle.py rust/bench/oracle/dev.tsv tov/build/shadow-dev.out
+sed -n 's/^@@ //p' bench/oracle/dev.tsv |
+  tov/build/engine-simd-par-shadow bench/data/disk.bin > tov/build/shadow-dev.out
+python3 tov/tools/diff_oracle.py bench/oracle/dev.tsv tov/build/shadow-dev.out
 ```
 
 ## Changes to what is visited
@@ -51,10 +53,10 @@ A change to which names or entries are visited also needs a check shown to
 fail when broken: a planted bug, a unit test, or a differential check on
 arbitrary disks.
 
-`rust/tools/diff-check.py` includes `re:` and `path:` queries that Tov does
-not support, so passing it alone does not prove a Tov change. Pick checks
-that cover the semantics you ported. Never change the frozen benchmark to fit
-a candidate.
+`tov/tools/diff-check.py` and `stress-check.py` compare a candidate build
+with a reference build (e.g. the plain one, or `main`'s) on synthetic disks.
+Pick checks that cover the semantics you changed. Never change the frozen
+benchmark to fit a candidate.
 
 ## Speed claims
 
@@ -104,7 +106,7 @@ Setup:
 - Linux x86-64, 8 logical CPUs, Intel Xeon (model exposed only as
   `Intel(R) Xeon(R) Processor`), AVX2, no AVX-512.
 - Both Tov engines: Clang 14.0.0, `simd par`, native `-march=native`, `-O3`
-  and LTO, no extra `CFLAGS`. Rust 1.97.1 with `-C target-cpu=native`.
+  and LTO, no extra `CFLAGS`.
 - Builds and timed runs did not overlap.
 - Frozen disk: 10,000,541 entries, fingerprint `b4f408863e4a658d`. No frozen
   harness, generator, trace or oracle was changed.
@@ -116,12 +118,9 @@ absolute times with earlier AVX-512 or Apple Silicon runs.
 |---|---:|---:|
 | Tov main, 79b67b0 | 3529.189 | 3178.164 |
 | Tov final, 0ebc30a | 2277.560 | 1727.169 |
-| Rust reference from 0ebc30a | 816.583 | 740.275 |
 
-- Tov rows: medians from `bench ab ... --pairs 9`. Final is **35.47% faster
-  on dev and 45.66% faster on holdout, winning 9/9 pairs on both**.
-- Rust row: separate `bench run` totals (five timed rounds after warmup),
-  not paired with Tov. Rust is still faster on both traces.
+- Medians from `bench ab ... --pairs 9`. Final is **35.47% faster on dev and
+  45.66% faster on holdout, winning 9/9 pairs on both**.
 - All oracles passed.
 - No fresh fsearch/fff comparison was run at this revision.
 
@@ -131,11 +130,11 @@ Each disk ran once, after the final dev gate passed, with its unchanged
 prewritten trace and `compare/compare.py run`: five timed rounds after warmup
 per pass, median of three rotated passes. This is not a nine-pair A/B.
 
-| disk | entries | Tov main ms | Tov final ms | change | Rust ms |
-|---|---:|---:|---:|---:|---:|
-| alternate seed | 10,000,861 | 3187.2 | 2247.1 | -29.50% | 738.3 |
-| Linux a5ebb76 | 102,402 | 176.1 | 125.1 | -28.96% | 90.3 |
-| LLVM 19.1.0 | 160,632 | 312.1 | 217.6 | -30.28% | 180.1 |
+| disk | entries | Tov main ms | Tov final ms | change |
+|---|---:|---:|---:|---:|
+| alternate seed | 10,000,861 | 3187.2 | 2247.1 | -29.50% |
+| Linux a5ebb76 | 102,402 | 176.1 | 125.1 | -28.96% |
+| LLVM 19.1.0 | 160,632 | 312.1 | 217.6 | -30.28% |
 
 Every disk improved. All timed runs had zero unstable keys. These are the
 original Linux check disks, not the separately generated Mac disks. Sources
@@ -150,7 +149,6 @@ dev/holdout query keys:
 |---|---:|---:|
 | Tov main | 4.717 | 1,216,316 |
 | Tov final | 5.026 | 1,216,324 |
-| Rust | 3.319 | 1,730,580 |
 
 Final ÷ main in this pass: startup **1.066×**, peak RSS **1.000007×**, both
 below the 1.5× limit.
@@ -177,8 +175,8 @@ unfavorable pair or startup outlier was removed or rerun.
 - both shadow variants matched all 409 dev and 371 holdout keys
 - planted `findFolded` mutant caught
 
-The kept final and Rust binaries also matched byte for byte on all nine check
-disk × trace combinations: 2,703 keystrokes, zero mismatches.
+The kept final also matched the reference answers byte for byte on all nine
+check disk × trace combinations: 2,703 keystrokes, zero mismatches.
 
 ### What was kept and rejected
 
@@ -216,4 +214,3 @@ a reason to keep it.
 |---|---|
 | main 79b67b0 | `2baae56f514c0a458f1ce887b6b4aa4e7172f2493abef568a4233389e96eba91` |
 | final 0ebc30a | `cddccdd27845a1b843959fbf2d173e784a4d54312ae900ac1bba067f2bacddfc` |
-| Rust from 0ebc30a | `948b92fd9218f10494d9890666e65d4c7a7d3dff274f6f84989c7cd795eef083` |

@@ -8,7 +8,7 @@ functions. How it all works: [root README](../README.md).
 
 ```sh
 curl -fsSL https://tov.sh/install.sh | sh                                 # once: Tov
-(cd ../rust/bench && cargo build --release && target/release/bench gen)   # once: the benchmark disk
+(cd ../bench && cargo build --release && target/release/bench gen)        # once: the benchmark disk
 
 ./build.sh                     # build/engine                 plain Tov
 ./build.sh simd                # build/engine-simd            + SIMD kernels
@@ -16,7 +16,7 @@ curl -fsSL https://tov.sh/install.sh | sh                                 # once
 ./build.sh simd par shadow     # every kernel checked against its Tov body on each call
 ./build.sh simd par portable   # runs on any CPU of this family, not just this one
 
-../rust/bench/target/release/bench run dev --engine build/engine-simd-par
+../bench/target/release/bench run dev --engine build/engine-simd-par
 ./check.sh                     # run before any change lands
 ```
 
@@ -61,20 +61,38 @@ lengths as they were.
 | `inject.py` | reads the hooks, writes `hooks.h`, wires in kernels and shadow mode |
 | `build.sh`, `check.sh` | the build and the full check |
 | `tools/diff_oracle.py` | compares a raw engine transcript with the oracle |
-| `tools/grepcheck.py` | content index and `grep:`/`regex:`/`sym:` answers against the Rust app on a real disk file |
+| `tools/diff-check.py`, `stress-check.py` | two engine builds on synthetic disks and query chains, compared byte for byte |
+| `tools/ab2.py` | interleaved A/B timing of two builds, keystroke by keystroke |
+| `tools/brew.sh` | points the Homebrew formula at a release |
 | `bugs/` | small repros of Tov compiler bugs, each with its workaround |
 
 ## Content search
 
-`grep:`, `regex:` and `sym:` work as in the Rust app, on the same index
-format. The background program builds and merges the index in a child
-process (`tov-search content-build`, `content-merge`), so searches are
-answered meanwhile. `tools/grepcheck.py` checks that the index files and the
-answers match the Rust app byte for byte.
+`grep:`, `regex:` and `sym:` search file contents through a trigram index
+(format `BFCSEG02`, see [architecture](../docs/architecture.md#content-index)).
+The background program builds and merges the index in a child process
+(`tov-search content-build`, `content-merge`), so searches are answered
+meanwhile. Regexes run on the system's POSIX regex.
 
-## Differences from Rust
+## Release
 
-- Regexes run on the system's POSIX regex, so a bad pattern's error text is
-  not Rust's.
-- `read`, the count of files opened by a content search, is exact in Tov. Rust
-  reads a few files ahead in parallel, so its count runs a few higher.
+Two steps, both needed. Skip the second and `brew` keeps installing the
+old version.
+
+1. Merge, then tag `main` and push the tag:
+   `git tag v0.2.0 && git push origin v0.2.0`. There is no release workflow
+   (no macOS runner). Build each binary on its own platform from the tag, with
+   `T` its name: `macos-arm64` on an Apple Silicon Mac
+   (`./build.sh simd par portable`), and `linux-x64` on x86_64 Linux, linked
+   statically so it runs on any distro
+   (`CC=gcc CFLAGS=-static ./build.sh simd par portable`). Then
+   `mkdir -p dist && cp build/engine-simd-par-portable dist/tov-search`,
+   `tar -czf tov-search-$T.tar.gz -C dist tov-search`,
+   `shasum -a 256 tov-search-$T.tar.gz > tov-search-$T.tar.gz.sha256`.
+   Then `gh release create v0.2.0 --generate-notes tov-search-*.tar.gz*`
+   (later ones: `gh release upload v0.2.0 tov-search-$T.tar.gz*`).
+2. Once both are attached: `tools/brew.sh v0.2.0`. It points the formula
+   in [doan-labs/homebrew-tap](https://github.com/doan-labs/homebrew-tap) at the
+   new build.
+
+Check: `brew update && brew upgrade tov-search` gets the new version.

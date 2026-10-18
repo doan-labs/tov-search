@@ -1,6 +1,5 @@
 // The JSON the background program speaks: requests are one flat object per
-// line, replies are written by hand in the Rust app's format (keys sorted,
-// no spaces), so clients of either see the same bytes.
+// line, replies are written by hand (keys sorted, no spaces).
 
 import { enc } from "./bytes"
 

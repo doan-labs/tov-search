@@ -1,4 +1,4 @@
-//! fff behind rust/bench/PROTOCOL.md. fff crawls a real directory, so this
+//! fff behind bench/PROTOCOL.md. fff crawls a real directory, so this
 //! takes the directory instead of a disk file.
 //!
 //!   fff-engine <dir>

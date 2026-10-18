@@ -1,5 +1,4 @@
-//! Upstream fsearch behind rust/bench/PROTOCOL.md: the same adapter as
-//! rust/src/bin/engine.rs, built against upstream's crate.
+//! Upstream fsearch behind bench/PROTOCOL.md, built against upstream's crate.
 //!
 //!   fsearch-engine <disk-file>
 

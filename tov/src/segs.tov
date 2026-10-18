@@ -1,9 +1,7 @@
-// The content index's segments, ported from rust/src/content.rs (Segment,
-// Content). A segment is an immutable file, mapped read-only: a doc table
+// The content index's segments. A segment is an immutable file, mapped read-only: a doc table
 // (paths, sizes, mtimes, ranks, bloom filters) and per trigram the docs
 // holding it. Docs that changed or went away are tombstoned in a .dead file
-// next to it; a manifest lists the segments in order. The file format is the
-// Rust app's, so the two read each other's index.
+// next to it; a manifest lists the segments in order.
 
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
 import { enc, zerosU64 } from "./bytes"

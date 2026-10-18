@@ -1,6 +1,5 @@
-// tov-search: whole-disk file search. The engine was ported to Tov from the
-// reference engine that wrote bench/oracle (src/{index,live,query}.rs at
-// 04a402e). Named tov-search, this is the app (src/app.tov); named engine*,
+// tov-search: whole-disk file search. Its answers must match bench/oracle
+// byte for byte. Named tov-search, this is the app (src/app.tov); named engine*,
 // it speaks bench/PROTOCOL.md:
 //
 //   engine <disk-file> [home [linux]]   build the index, print "ready", answer one query per stdin line
@@ -140,13 +139,13 @@ function main(): void throws Error {
     if (line === "\n") {
       break
     }
-    // Not a query (tools/livecheck.py): bring a folder in line with the disk.
+    // Not a query (for checks): bring a folder in line with the disk.
     if (line.startsWith("!apply ")) {
       applyDir(enc(line.slice(7)), false)
       writeOut(enc("\n"))
       continue
     }
-    // Not a query (tools/grepcheck.py): index home's file contents into a
+    // Not a query (for checks): index home's file contents into a
     // new content index there.
     if (line.startsWith("!content ")) {
       contentOpen(line.slice(9), true)

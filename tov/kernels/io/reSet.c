@@ -8,7 +8,7 @@ void par_for(size_t n, void *ctx, par_fn fn);
 static regex_t rx_slot[2];
 static int rx_used[2];
 
-/* Rust's \d \w \s (and capitals) as bracket expressions, outside brackets. */
+/* Perl's \d \w \s (and capitals) as bracket expressions, outside brackets. */
 static char *rx_translate(const char *p) {
     size_t n = strlen(p);
     char *o = malloc(n * 12 + 1), *w = o;

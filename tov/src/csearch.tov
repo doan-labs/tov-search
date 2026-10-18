@@ -1,5 +1,4 @@
-// Content search (rust/src/content.rs Content::search, candidates, eval,
-// verify): the trigram plan picks candidate files per segment, the query's
+// Content search: the trigram plan picks candidate files per segment, the query's
 // words and filters narrow them by path, and they are read fresh from disk
 // best-ranked first (your files before dot-folders and logs, then the newest)
 // until enough match. Results never show stale content.

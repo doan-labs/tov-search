@@ -7,7 +7,7 @@
 # Run from anywhere, on macOS or Linux. Stops at the first failure.
 set -e
 cd "$(dirname "$0")"
-BENCH=../rust/bench
+BENCH=../bench
 B=$BENCH/target/release/bench
 DISK=$BENCH/data/disk.bin
 
