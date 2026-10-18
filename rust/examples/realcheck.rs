@@ -99,19 +99,28 @@ fn load(path: &str, home: &str, linux: bool, pin: bool) -> Live {
 }
 
 fn engine(path: &str, home: &str, linux: bool) {
-    let live = load(path, home, linux, true);
-    let s = Searcher { live: &live };
+    let mut live = load(path, home, linux, true);
     let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout().lock());
     out.write_all(b"ready\n").unwrap();
     out.flush().unwrap();
     let mut p = Vec::new();
     for line in std::io::stdin().lock().lines() {
         let line = line.expect("stdin");
+        // Not a query: bring a folder in line with the disk, as the daemon does on an event.
+        if let Some(dir) = line.strip_prefix("!apply ") {
+            live.apply_dir(dir.as_bytes(), false);
+            out.write_all(b"\n").unwrap();
+            out.flush().unwrap();
+            continue;
+        }
         match Query::parse(&line, home) {
             Err(_) => out.write_all(b"error\n").unwrap(),
             Ok(q) => {
-                for h in s.search(&q) {
-                    live.base.path(h.idx as usize, &mut p);
+                for h in (Searcher { live: &live }).search(&q) {
+                    match &h.over {
+                        Some(o) => p.clone_from(o),
+                        None => live.base.path(h.idx as usize, &mut p),
+                    }
                     write!(out, "{}\t", h.score).unwrap();
                     out.write_all(&p).unwrap();
                     out.write_all(b"\n").unwrap();

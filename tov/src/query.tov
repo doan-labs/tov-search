@@ -150,7 +150,7 @@ const FILTERS = ["ext", "type", "kind", "in", "size", "mtime", "modified", "re",
 
 // What mtime: filters count ages from: the time of the request in the
 // background program, else the index's clock (which ranking always uses).
-let clock = 0
+export let clock = 0
 export function setClock(t: int): void {
   clock = t
 }

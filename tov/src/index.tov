@@ -43,6 +43,24 @@ export function nb(i: int): int {
   return int(unames[i]!)
 }
 
+// Bytes not in the index (an added file's path) go after the names, so the
+// scoring functions, which read names through nb, can read them too.
+let scratchAt = 0
+
+// Puts b after the names (and 64 zero bytes after it); returns its offset.
+export function scratch(b: u8[]): int {
+  while (unames.length > scratchAt) {
+    unames.pop()
+  }
+  for (const c of b) {
+    unames.push(c)
+  }
+  for (let j = 0; j < 64; j++) {
+    unames.push(u8(0))
+  }
+  return scratchAt
+}
+
 // Appends entry i's path to out: "/" and each name from the root down.
 export function putPath(i: int, inout out: u8[]): void {
   const ch: int[] = []
@@ -223,6 +241,7 @@ export function build(): void throws Error {
   for (let j = 0; j < 64; j++) {
     unames.push(u8(0)) // padding: a kernel may load 64 bytes (an AVX-512 vector) from any name
   }
+  scratchAt = unames.length
   diskRelease()
 
   umask = []

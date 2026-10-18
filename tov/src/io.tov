@@ -23,10 +23,11 @@ export function sockListen(sock: string, lock: string): string {
   return ""
 }
 
-// hook(raw): waits for the next request line on any connection to the
-// socket, accepting new ones meanwhile: the connection (u32) then the line,
-// without its "\n".
-export function sockNext(): string {
+// hook(raw): waits up to timeoutMs (-1: no limit) for the next request line
+// on any connection to the socket, accepting new ones meanwhile: the
+// connection (u32) then the line, without its "\n". Connection 0xFFFFFFFF:
+// file events are waiting (watchTake); 0xFFFFFFFE: the time ran out.
+export function sockNext(timeoutMs: int): string {
   return ""
 }
 
@@ -56,6 +57,54 @@ export function runCmd(args: string[], quiet: bool): int {
 // hook(raw): copies this program's file to dst (replacing, not overwriting:
 // a running or signed binary may sit there). Returns "" or the error.
 export function copySelf(dst: string): string {
+  return ""
+}
+
+// hook(raw): starts watching the disk for changes, reported per folder.
+// macOS: an FSEvents stream on / from event id since, replacing the last
+// one; returns its number. Linux: inotify, once (since unused); folders are
+// watched with watchAdd, and new ones as they appear (except under skip:
+// u32 length + path each); returns -1 if inotify is unavailable.
+export function watchStart(since: int, skip: u8[]): int {
+  return 0
+}
+
+// hook(raw): the folders watched for changes, added (Linux; nothing on
+// macOS, which watches the whole disk). req: u32 length + path each.
+// Returns how many folders could not be watched so far (the watch limit).
+export function watchAdd(req: u8[]): int {
+  return 0
+}
+
+// hook(raw): the change events since the last call, each flags u32 |
+// stream u32 | id u64 | path length u32 | path. Flags as FSEvents': 1 must
+// scan subfolders, 2 dropped before read, 4 dropped by the kernel, 16
+// history done.
+export function watchTake(): string {
+  return ""
+}
+
+// hook(raw): the newest event id now (macOS: FSEvents'; Linux: the time in ns).
+export function eventNow(): int {
+  return 0
+}
+
+// hook(raw): kind u8 | size u64 | mtime u32 of path (not following a
+// link), or "" if there is nothing there.
+export function lstatOne(path: u8[]): string {
+  return ""
+}
+
+// hook(raw): per path in req (u32 length + path each), one byte: 1 if it
+// exists and was modified at or after since. Checked on every core.
+export function mtimesSince(req: u8[], since: int): string {
+  return ""
+}
+
+// hook(raw): replaces this process with this program's `serve` (its files
+// and sockets close, its lock goes with them). Returns only on failure, with
+// the error.
+export function execServe(): string {
   return ""
 }
 

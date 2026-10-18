@@ -62,7 +62,7 @@ function nameEqCI(e: int, c: u8[], co: int, cl: int): bool {
 }
 
 // Resolve an absolute path to its entry, or -1.
-function lookup(path: u8[]): int {
+export function lookup(path: u8[]): int {
   let e = 0
   let i = 0
   while (i < path.length) {

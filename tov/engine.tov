@@ -28,6 +28,7 @@ import { extIndexBuild } from "./src/exts"
 import { topScore, topIdx } from "./src/topk"
 import { search } from "./src/search"
 import { readLine, writeOut } from "./src/io"
+import { liveReset, applyDir, liveSearch, hitScore, hitIdx, hitPath, deadCount, overCount } from "./src/live"
 import { cli } from "./src/app"
 
 let out: u8[] = []
@@ -45,13 +46,26 @@ function answer(line: string): void {
     writeOut(new TextEncoder().encode("error\n\n"))
     return
   }
-  search(q)
-  for (let j = 0; j < topScore.length; j++) {
-    for (const c of enc(`${topScore[j]!}\t`)) {
-      out.push(c)
+  if (deadCount === 0 && overCount === 0) {
+    search(q)
+    for (let j = 0; j < topScore.length; j++) {
+      for (const c of enc(`${topScore[j]!}\t`)) {
+        out.push(c)
+      }
+      putPath(topIdx[j]!, &out)
+      out.push(u8(10))
     }
-    putPath(topIdx[j]!, &out)
-    out.push(u8(10))
+  } else {
+    liveSearch(q)
+    for (let j = 0; j < hitScore.length; j++) {
+      for (const c of enc(`${hitScore[j]!}\t`)) {
+        out.push(c)
+      }
+      for (const c of hitPath(hitIdx[j]!)) {
+        out.push(c)
+      }
+      out.push(u8(10))
+    }
   }
   out.push(u8(10))
   writeOut(out)
@@ -76,11 +90,18 @@ function main(): void throws Error {
   namesAlloc()
   memosAlloc()
   extIndexBuild()
+  liveReset([])
   process.stdout.write("ready\n")
   for (;;) {
     const line = readLine()
     if (line === "\n") {
       break
+    }
+    // Not a query (tools/livecheck.py): bring a folder in line with the disk.
+    if (line.startsWith("!apply ")) {
+      applyDir(enc(line.slice(7)), false)
+      writeOut(enc("\n"))
+      continue
     }
     answer(line)
   }

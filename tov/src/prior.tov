@@ -79,6 +79,12 @@ export function priorAdjust(o: int, l: int, depth: int): int {
 }
 
 export function rankTweaks(flags: int, kind: int, mtime: int): int {
+  return rankTweaksAt(flags, kind, mtime, now)
+}
+
+// rankTweaks with ages counted from t (an added file ranks by the time of
+// the search).
+export function rankTweaksAt(flags: int, kind: int, mtime: int, t: int): int {
   let s = 0
   if ((flags & NF_DOT) !== 0) {
     s -= 8
@@ -90,7 +96,7 @@ export function rankTweaks(flags: int, kind: int, mtime: int): int {
   if ((k === KIND_DIR || k === KIND_LINK) && (flags & NF_APP) !== 0) {
     s += 25
   }
-  const age = satSub(now, mtime)
+  const age = satSub(t, mtime)
   if (age <= 86400) {
     s += 10
   } else if (age <= 604800) {

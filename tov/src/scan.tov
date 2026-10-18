@@ -18,7 +18,7 @@ function listQueue(req: u8[]): void {
 // length u32 | path | entry count u32 | entries, each kind u8 | size u64 |
 // mtime u32 | name_len u16 | name (a disk file record without its parent).
 // Kinds carry FLAG_HIDDEN and FLAG_MOUNT (a mount point not to enter). A
-// folder that can't be opened has no entries.
+// folder that can't be opened has count 0xFFFFFFFF and no entries.
 function listTake(): string {
   return ""
 }
@@ -57,8 +57,23 @@ function queue(path: u8[], rec: int): void {
   }
 }
 
+// One folder's entries, as listTake gives them (kind u8 | size u64 | mtime
+// u32 | name_len u16 | name each), or undefined if it can't be opened.
+export function listOne(path: u8[]): u8[] | undefined {
+  todo = []
+  queue(path, 0)
+  listQueue(todo)
+  todo = []
+  const ans = new TextEncoder().encode(listTake())
+  const at = 8 + path.length
+  if (rd32(ans, at) === 4294967295) {
+    return undefined
+  }
+  return ans.slice(at + 4)
+}
+
 // Whether path is one of skip, or inside one.
-function blocked(path: u8[], skip: u8[][]): bool {
+export function blocked(path: u8[], skip: u8[][]): bool {
   for (const s of skip) {
     if (path.length < s.length || (path.length > s.length && int(path[s.length]!) !== 47)) {
       continue
@@ -80,8 +95,7 @@ function blocked(path: u8[], skip: u8[][]): bool {
 // The disk file for everything under root, except the folders in skip (and
 // what's inside them), with now as its clock. Records come in the order
 // folders finish listing; a folder's record always precedes its entries.
-export function scanDisk(root: string, skip: string[], now: int): u8[] {
-  const skipB = skip.map(enc)
+export function scanDisk(r: u8[], skipB: u8[][], now: int): u8[] {
   disk = enc("FSDISK01")
   for (let j = 0; j < 8; j++) {
     disk.push(u8(0)) // record count, set at the end
@@ -94,7 +108,6 @@ export function scanDisk(root: string, skip: string[], now: int): u8[] {
   let nrec = 1
 
   todo = []
-  const r = enc(root)
   if (!blocked(r, skipB)) {
     queue(r, 0)
   }
@@ -112,7 +125,8 @@ export function scanDisk(root: string, skip: string[], now: int): u8[] {
       const rec = rd32(ans, p)
       const pathLen = rd32(ans, p + 4)
       const pathAt = p + 8
-      const count = rd32(ans, pathAt + pathLen)
+      const n = rd32(ans, pathAt + pathLen)
+      const count = n === 4294967295 ? 0 : n
       p = pathAt + pathLen + 4
       for (let k = 0; k < count; k++) {
         const nameLen = int(ans[p + 13]!) | (int(ans[p + 14]!) << 8)

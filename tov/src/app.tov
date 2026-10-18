@@ -3,20 +3,21 @@
 // Rust app's protocol (rust/src/server.rs), so its clients work unchanged.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
-import { MAXV, setHome, KIND_FILE, KIND_DIR, KIND_LINK } from "./consts"
-import { enc } from "./bytes"
+import { setHome, KIND_FILE, KIND_DIR, KIND_LINK } from "./consts"
+import { enc, bytesKey } from "./bytes"
 import { readDisk, setNow } from "./disk"
 import { setLinuxPriors } from "./prior"
-import { build, n, d, entKind, entSize, entMtime, putPath } from "./index"
+import { build, n, d } from "./index"
 import { Query, parse, filter, setClock } from "./query"
 import { namesAlloc } from "./names"
 import { memosAlloc } from "./memos"
 import { extIndexBuild } from "./exts"
-import { topScore, topIdx } from "./topk"
-import { search } from "./search"
 import { scanDisk } from "./scan"
+import { liveReset, takeAdded, applyDir, liveDirs, liveSearch, liveDisk, hitScore, hitIdx, hitKind, hitSize, hitMtime,
+  hitPath, overCount, deadCount } from "./live"
 import { Field, readObject, jstr } from "./json"
-import { writeFile, sockListen, sockNext, sockReply, sockAsk, spawnServe, runCmd, copySelf, sleepMs, uid } from "./io"
+import { writeFile, sockListen, sockNext, sockReply, sockAsk, spawnServe, runCmd, copySelf, sleepMs, uid, watchStart,
+  watchAdd, watchTake, eventNow, lstatOne, mtimesSince, execServe } from "./io"
 
 const USAGE = `usage:
   tov-search <query...> [--json]   search (starts the background program if needed)
@@ -84,35 +85,272 @@ function skipped(h: string): string[] {
     "Library/CloudStorage", "Pictures/Photos Library.photoslibrary"].map((x) => `${h}/${x}`).concat(["/Volumes"])
 }
 
+// The saved index: the disk file, and next to it the event id it is up to
+// date with and the second it was last known in sync ("<event id> <second>").
+function diskFile(h: string): string {
+  return `${dataDir(h)}/disk.bin`
+}
+
+function stateFile(h: string): string {
+  return `${dataDir(h)}/disk.state`
+}
+
+function save(h: string, disk: u8[], event: int, synced: int): void throws Error {
+  try mkdirSync(dataDir(h), { recursive: true })
+  const err = writeFile(diskFile(h), disk)
+  if (err !== "") {
+    throw new Error(`write ${diskFile(h)}: ${err}`)
+  }
+  try writeFileSync(stateFile(h), `${event} ${synced}\n`)
+}
+
 function index(root: string, h: string): void throws Error {
   const t = Date.now()
-  const disk = scanDisk(root, skipped(h), secs())
-  try mkdirSync(dataDir(h), { recursive: true })
-  const file = `${dataDir(h)}/disk.bin`
-  const err = writeFile(file, disk)
-  if (err !== "") {
-    throw new Error(`write ${file}: ${err}`)
-  }
+  // The events from here on are replayed after the scan: none is missed.
+  const event = eventNow()
+  const started = secs()
+  const disk = scanDisk(enc(root), skipped(h).map(enc), started)
+  try save(h, disk, event, started)
   log(`scanned ${root} in ${Math.round(Date.now() - t)} ms`)
 }
 
 // ------------------------------------------------------------------ background program
 
+// Applied up to this event id; in sync up to this second.
+let eventId = 0
+let syncedAt = 0
+let savedEventId = 0
+let lastSave: f64 = 0
+
 function load(h: string): void throws Error {
   const t = Date.now()
-  const file = `${dataDir(h)}/disk.bin`
-  if (!existsSync(file)) {
+  if (!existsSync(diskFile(h)) || !existsSync(stateFile(h))) {
     try index("/", h)
   }
+  const st = (try readFileSync(stateFile(h))).trim().split(" ")
+  eventId = parseInt(st[0] ?? "0") ?? 0
+  syncedAt = parseInt(st[1] ?? "0") ?? 0
+  savedEventId = eventId
   setHome(h)
   setLinuxPriors(process.platform === "linux")
-  try readDisk(file)
+  try readDisk(diskFile(h))
   setNow(secs())
   try build()
   namesAlloc()
   memosAlloc()
   extIndexBuild()
-  log(`loaded ${n} entries in ${Math.round(Date.now() - t)} ms`)
+  liveReset(skipped(h).map(enc))
+  lastSave = Date.now()
+  log(`loaded ${n} entries in ${Math.round(Date.now() - t)} ms, replaying events since ${eventId}`)
+}
+
+// File watching, as the Rust app does it (rust/src/engine.rs apply_loop).
+const MUST_SCAN = 1
+const USER_DROPPED = 2
+const KERNEL_DROPPED = 4
+const HISTORY_DONE = 16
+const MAC = process.platform === "darwin"
+const COMPACT_PENDING = 50000
+const COMPACT_EVERY_MS = 12 * 3600 * 1000
+const CATCH_UP_EVERY_MS = 30000
+
+let stream = 0
+let replaying = true
+let since = 0 // where the current stream started
+let gapFrom = -1 // events dropped before we read them: replay from here
+let gapAt: f64 = 0
+let replays = 0
+let degraded = false // Linux: some folders are not watched
+let lastCatchUp: f64 = 0
+let saveAsked = false
+
+// u32 length + path each, as the hooks take folders.
+// (The path's bytes go in through a helper: pushed in this loop, they would
+// overflow the array, tov/bugs/push-reserve-overflow.tov.)
+function pathReq(ps: u8[][]): u8[] {
+  let out: u8[] = []
+  for (const p of ps) {
+    for (let j = 0; j < 4; j++) {
+      out.push(u8((p.length >> (8 * j)) & 255))
+    }
+    pushAll(&out, p)
+  }
+  return out
+}
+
+function pushAll(inout out: u8[], b: u8[]): void {
+  for (const c of b) {
+    out.push(c)
+  }
+}
+
+function startWatching(h: string): void {
+  if (MAC) {
+    stream = watchStart(eventId, [])
+    since = eventId
+    replaying = true
+    return
+  }
+  const t = Date.now()
+  if (watchStart(0, pathReq(skipped(h).map(enc))) < 0) {
+    log("inotify unavailable: changes are picked up by a periodic catch-up")
+    degraded = true
+  } else {
+    const missed = watchAdd(pathReq([enc("/")].concat(liveDirs())))
+    degraded = missed > 0
+    log(`inotify: watching folders took ${Math.round(Date.now() - t)} ms${missed > 0 ? `, ${missed} not watched (fs.inotify.max_user_watches)` : ""}`)
+  }
+  relist("start")
+  replaying = false
+  lastCatchUp = Date.now()
+}
+
+// Lost track of the disk (dropped events, no history to replay, or a start
+// on Linux): relist every folder modified since we were last in sync.
+function relist(why: string): void {
+  const t = Date.now()
+  const started = secs()
+  const from = syncedAt > 120 ? syncedAt - 120 : 0
+  const dirs = liveDirs()
+  const changed: u8[][] = []
+  const hit = new TextEncoder().encode(mtimesSince(pathReq(dirs), from))
+  for (let i = 0; i < dirs.length; i++) {
+    if (int(hit[i]!) === 1) {
+      changed.push(dirs[i]!)
+    }
+  }
+  const root = new TextEncoder().encode(lstatOne(enc("/")))
+  if (root.length === 13 && (int(root[9]!) | (int(root[10]!) << 8) | (int(root[11]!) << 16) | (int(root[12]!) << 24)) >= from) {
+    changed.push(enc("/"))
+  }
+  for (const p of changed) {
+    applyDir(p, false)
+  }
+  syncedAt = started
+  const added = takeAdded()
+  if (!MAC && added.length > 0) {
+    degraded = watchAdd(pathReq(added)) > 0 || degraded
+  }
+  log(`caught up (${why}): relisted ${changed.length} folders changed since ${from} in ${Math.round(Date.now() - t)} ms`)
+}
+
+let rebuildFlags = -1 // >= 0: relist, for these root flags
+
+function onEvents(): bool {
+  const b = new TextEncoder().encode(watchTake())
+  const dirs: u8[][] = []
+  const deep: bool[] = []
+  const seen: Map<string, int> = new Map()
+  let maxId = 0
+  let lastGood = eventId
+  let p = 0
+  while (p + 20 <= b.length) {
+    const flags = rd32(b, p)
+    const from = rd32(b, p + 4)
+    const id = rd32(b, p + 8) | (rd32(b, p + 12) << 32)
+    const len = rd32(b, p + 16)
+    const path = b.slice(p + 20, p + 20 + len)
+    p += 20 + len
+    if (len === 1 && int(path[0]!) === 47 && (flags & MUST_SCAN) !== 0) {
+      // fseventsd still logged what it dropped for us: replay from the last
+      // event we did get, once the drops stop. A replaced stream's drop is
+      // covered by the stream that replaced it.
+      if (MAC && (flags & (USER_DROPPED | KERNEL_DROPPED)) === USER_DROPPED) {
+        if (from === stream) {
+          const f = replaying ? since : lastGood
+          gapFrom = gapFrom < 0 || f < gapFrom ? f : gapFrom
+          gapAt = Date.now()
+        }
+        continue
+      }
+      rebuildFlags = rebuildFlags < 0 ? flags : rebuildFlags | flags
+    }
+    maxId = id > maxId ? id : maxId
+    if (MAC && gapFrom < 0 && id > lastGood) {
+      lastGood = id
+    }
+    if ((flags & HISTORY_DONE) !== 0) {
+      if (replaying) {
+        replaying = false
+        log("replay done")
+      }
+      if (gapFrom < 0) {
+        replays = 0
+      }
+      continue
+    }
+    const k = bytesKey(path)
+    const at = seen.get(k)
+    if (at === undefined) {
+      seen.set(k, dirs.length)
+      dirs.push(path)
+      deep.push((flags & MUST_SCAN) !== 0)
+    } else if ((flags & MUST_SCAN) !== 0) {
+      deep[at] = true
+    }
+  }
+  for (let i = 0; i < dirs.length; i++) {
+    if (applyDir(dirs[i]!, deep[i]!) && rebuildFlags < 0) {
+      rebuildFlags = 0
+    }
+  }
+  takeAdded()
+  // With a gap, everything is applied only up to its start.
+  if (gapFrom >= 0) {
+    eventId = gapFrom < eventId ? gapFrom : eventId
+  } else if (maxId > eventId) {
+    eventId = maxId
+  }
+  return p > 0
+}
+
+function rd32(b: u8[], p: int): int {
+  return int(b[p]!) | (int(b[p + 1]!) << 8) | (int(b[p + 2]!) << 16) | (int(b[p + 3]!) << 24)
+}
+
+// After events or a quiet spell: replays, relists, catch-ups and saves.
+function afterEvents(h: string, hadEvents: bool): void throws Error {
+  const replay = gapFrom >= 0 && Date.now() - gapAt >= 2000 ? gapFrom : -1
+  if (replay >= 0 && replays >= 3) {
+    rebuildFlags = rebuildFlags < 0 ? USER_DROPPED : rebuildFlags | USER_DROPPED
+  }
+  if (rebuildFlags >= 0) {
+    const f = rebuildFlags
+    const why = (f & KERNEL_DROPPED) !== 0 ? (MAC ? "kernel dropped events" : "inotify queue overflowed") :
+      (f & USER_DROPPED) !== 0 ? (MAC ? "events dropped before we read them" : "some folders are unwatched") : "history unavailable"
+    relist(why)
+    rebuildFlags = -1
+    gapFrom = -1
+    replays = 0
+  } else if (replay >= 0) {
+    log(`FSEvents dropped events before we read them: replaying from ${replay}`)
+    stream = watchStart(replay, [])
+    since = replay
+    replaying = true
+    gapFrom = -1
+    replays += 1
+  } else if (hadEvents && gapFrom < 0 && !replaying) {
+    syncedAt = secs()
+  }
+  // Folders inotify could not watch are caught up by mtime instead.
+  if (!MAC && degraded && Date.now() - lastCatchUp >= CATCH_UP_EVERY_MS) {
+    lastCatchUp = Date.now()
+    relist("some folders are unwatched")
+  }
+  const stale = eventId !== savedEventId && Date.now() - lastSave > COMPACT_EVERY_MS
+  if (saveAsked || overCount + deadCount > COMPACT_PENDING || stale) {
+    try compact(h)
+  }
+}
+
+// Saves everything as the new index and restarts from it: a fresh build,
+// with no added or gone entries left to merge.
+function compact(h: string): void throws Error {
+  const t = Date.now()
+  const disk = liveDisk(secs())
+  try save(h, disk, eventId, syncedAt)
+  log(`saved ${overCount} added and ${deadCount} removed entries in ${Math.round(Date.now() - t)} ms; restarting from the saved index`)
+  log(`restart failed: ${execServe()}`)
 }
 
 function kindName(k: int): string {
@@ -169,29 +407,29 @@ function respond(line: string): string throws Error {
   if (op === "ping") {
     return `{"id":${id},"ok":true}\n`
   } else if (op === "save") {
+    saveAsked = true
     return `{"id":${id},"ok":true,"scheduled":true}\n`
   } else if (grep) {
     err = "content search is not in this version yet"
   } else if (op === "status") {
     return `{"content_bytes":0,"content_docs":0,"content_pending":0,"content_segments":0,"dirs":${d},"entries":${n},` +
-      `"event_id":0,"full_disk_access":${fullDiskAccess()},"id":${id},"index_bytes":0,"ok":true,"overlay":0,"owner":true,"removed":0}\n`
+      `"event_id":${eventId},"full_disk_access":${fullDiskAccess()},"id":${id},"index_bytes":0,"ok":true,"overlay":${overCount},` +
+      `"owner":true,"removed":${deadCount}}\n`
   } else if (op === "search") {
     setClock(secs())
     try {
       const q = try request(fs)
       const t = performance.now()
-      search(q)
+      liveSearch(q)
       const out: u8[] = []
       for (const c of enc(`{"hits":[`)) {
         out.push(c)
       }
-      for (let j = 0; j < topIdx.length; j++) {
-        const i = topIdx[j]!
-        let path: u8[] = []
-        putPath(i, &path)
+      for (let j = 0; j < hitIdx.length; j++) {
+        const i = hitIdx[j]!
         // Paths that aren't UTF-8 are shown with U+FFFD, as the Rust app does.
-        const hit = `${j > 0 ? "," : ""}{"kind":"${kindName(int(entKind[i]!))}","mtime":${entMtime[i]!},` +
-          `"path":${try jstr(try new TextDecoder().decode(path))},"score":${topScore[j]!},"size":${entSize[i]!}}`
+        const hit = `${j > 0 ? "," : ""}{"kind":"${kindName(hitKind(i))}","mtime":${hitMtime(i)},` +
+          `"path":${try jstr(try new TextDecoder().decode(hitPath(i)))},"score":${hitScore[j]!},"size":${hitSize(i)}}`
         for (const c of enc(hit)) {
           out.push(c)
         }
@@ -221,11 +459,20 @@ function serve(): void throws Error {
   }
   // Requests wait in the socket's queue while the index loads.
   try load(h)
+  startWatching(h)
   for (;;) {
-    const m = new TextEncoder().encode(sockNext())
-    const conn = int(m[0]!) | (int(m[1]!) << 8) | (int(m[2]!) << 16) | (int(m[3]!) << 24)
-    const line = try new TextDecoder().decode(m.slice(4))
-    sockReply(conn, enc(try respond(line)))
+    // Wake for a replay that waits for drops to stop, or the next catch-up.
+    const wait = MAC ? (gapFrom >= 0 ? 250 : 60000) : CATCH_UP_EVERY_MS
+    const m = new TextEncoder().encode(sockNext(wait))
+    const conn = rd32(m, 0)
+    if (conn === 4294967295) {
+      try afterEvents(h, onEvents())
+    } else if (conn === 4294967294) {
+      try afterEvents(h, false)
+    } else {
+      const line = try new TextDecoder().decode(m.slice(4))
+      sockReply(conn, enc(try respond(line)))
+    }
   }
 }
 

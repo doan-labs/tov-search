@@ -204,6 +204,8 @@ static void *ld_worker(void *arg) {
         if (fd >= 0) {
             ld_list(fd, o);
             close(fd);
+        } else {
+            o->count = UINT32_MAX; /* could not be opened */
         }
         pthread_mutex_lock(&ld_mu);
         o->next = ld_done;

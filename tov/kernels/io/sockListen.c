@@ -7,6 +7,7 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The background program's connections: what each has sent so far. eof:
@@ -52,7 +53,21 @@ static int sk_line(size_t i, tv_str *out) {
     }
 }
 
-static tv_str sk_next(void) {
+/* Written by the file watcher (watchStart.c) when it has events. */
+static int sk_wake[2] = {-1, -1};
+
+static int64_t sk_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static tv_str sk_mark(uint32_t m) {
+    return tv_str_from((const char *)&m, 4);
+}
+
+static tv_str sk_next(int64_t timeout) {
+    int64_t until = timeout < 0 ? -1 : sk_ms() + timeout;
     for (;;) {
         for (size_t i = 0; i < sk_n; i++) {
             tv_str s;
@@ -60,13 +75,27 @@ static tv_str sk_next(void) {
         }
         for (size_t i = sk_n; i-- > 0;)
             if (sk_c[i].eof) sk_drop(i);
-        struct pollfd *p = malloc((sk_n + 1) * sizeof *p);
+        struct pollfd *p = malloc((sk_n + 2) * sizeof *p);
         p[0] = (struct pollfd){sk_lfd, POLLIN, 0};
         for (size_t i = 0; i < sk_n; i++) p[i + 1] = (struct pollfd){sk_c[i].fd, POLLIN, 0};
         size_t n = sk_n;
-        if (poll(p, (nfds_t)(n + 1), -1) < 0) {
+        p[n + 1] = (struct pollfd){sk_wake[0], POLLIN, 0};
+        int64_t left = until < 0 ? -1 : until - sk_ms();
+        int r = poll(p, (nfds_t)(n + 2), left < 0 && until >= 0 ? 0 : (int)left);
+        if (r < 0) {
             free(p);
             continue;
+        }
+        if (r == 0) {
+            free(p);
+            return sk_mark(0xFFFFFFFEu); /* timed out */
+        }
+        if (p[n + 1].revents & POLLIN) {
+            char junk[256];
+            while (read(sk_wake[0], junk, sizeof junk) > 0) {
+            }
+            free(p);
+            return sk_mark(0xFFFFFFFFu); /* file events waiting */
         }
         for (size_t i = n; i-- > 0;) {
             if (!(p[i + 1].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -108,6 +137,12 @@ static void sk_reply(int64_t fd, const char *d, int64_t n) {
 }
 {
     signal(SIGPIPE, SIG_IGN);
+    if (pipe(sk_wake) == 0) {
+        for (int i = 0; i < 2; i++) {
+            fcntl(sk_wake[i], F_SETFL, O_NONBLOCK);
+            fcntl(sk_wake[i], F_SETFD, FD_CLOEXEC);
+        }
+    }
     int lk = open(p1.p->data, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
     if (lk < 0) return tv_str_from(strerror(errno), strlen(strerror(errno)));
     if (flock(lk, LOCK_EX | LOCK_NB) != 0) {
