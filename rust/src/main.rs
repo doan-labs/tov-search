@@ -204,6 +204,28 @@ fn bench(qs: &str) {
     // Between runs, another name search: a repeat would be answered from
     // the names cache, which only a repeat of the last query hits.
     let other = query::Query::parse("zzzzzz", &home).unwrap();
+    if std::env::var_os("TOV_BENCH_TYPE").is_some() {
+        // Typing: each prefix of the query in turn, median per keystroke.
+        let keys: Vec<query::Query> = (1..=qs.len()).map(|i| query::Query::parse(&qs[..i], &home).unwrap()).collect();
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut t = vec![Vec::new(); keys.len()];
+        for _ in 0..20 {
+            pool.install(|| query::Searcher { live: &live }.search(&other));
+            for (i, k) in keys.iter().enumerate() {
+                let (n0, s0) = (query::PROF_NAMES_NS.load(Relaxed), query::PROF_SCAN_NS.load(Relaxed));
+                let s = Instant::now();
+                pool.install(|| query::Searcher { live: &live }.search(k));
+                let us = s.elapsed().as_micros() as u64;
+                t[i].push((us, (query::PROF_NAMES_NS.load(Relaxed) - n0) / 1000, (query::PROF_SCAN_NS.load(Relaxed) - s0) / 1000));
+            }
+        }
+        for (i, mut v) in t.into_iter().enumerate() {
+            v.sort();
+            let (us, names, scan) = v[v.len() / 2];
+            eprintln!("{:>40} {us:6}us  names {names:5}  scan {scan:5}", &qs[..=i]);
+        }
+        return;
+    }
     let mut times = Vec::new();
     let mut out = Vec::new();
     for _ in 0..20 {

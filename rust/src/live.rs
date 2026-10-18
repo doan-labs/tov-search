@@ -500,7 +500,7 @@ impl Live {
         self.dead[i as usize >> 6] & (1 << (i & 63)) != 0
     }
 
-    fn kill(&mut self, i: u32) {
+    pub(crate) fn kill(&mut self, i: u32) {
         let w = &mut self.dead[i as usize >> 6];
         if *w & (1 << (i & 63)) == 0 {
             *w |= 1 << (i & 63);

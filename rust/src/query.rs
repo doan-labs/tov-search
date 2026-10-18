@@ -1318,7 +1318,8 @@ const DRIVEN_TRIES: usize = 2;
 const BINS: usize = 1024;
 const BIN0: i32 = 256;
 /// A `ranked` run scores FIRST_BATCH names, then four times as many each
-/// time up to LAST_BATCH; batches up to INLINE_NAMES run on the caller.
+/// time up to LAST_BATCH; batches up to INLINE_NAMES run on the caller
+/// (and so does a name-table rescan of that few names).
 const FIRST_BATCH: usize = 64;
 const LAST_BATCH: usize = 4096;
 const INLINE_NAMES: usize = 512;
@@ -2078,7 +2079,7 @@ impl Searcher<'_> {
             }
         }
         DRIVEN_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let names = self.score_names(q, pos, neg, Some(&bits), None, &[]);
+        let names = self.score_names(q, pos, neg, Some(&bits), None, None, &[]);
         let s = Scan {
             q,
             live: self.live,
@@ -2112,7 +2113,9 @@ impl Searcher<'_> {
         let key = NameKey::of(q);
         let prev = self.live.names_cache.0.lock().unwrap().clone();
         if let Some(p) = &prev {
-            if p.key == key && p.names.fast_limit.is_none_or(|limit| q.limit <= limit && self.prunable(q, pos, neg)) {
+            // A floor-pruned table's floor came from entries alive then.
+            if p.key == key && p.names.fast_limit.is_none_or(|limit| q.limit <= limit && self.prunable(q, pos, neg) && p.dead == self.live.dead_count)
+            {
                 return p.clone();
             }
         }
@@ -2141,6 +2144,8 @@ impl Searcher<'_> {
         });
         let mut cand: Vec<u64>;
         let prevb_hold: std::borrow::Cow<[u64]>;
+        // The scan set's nonzero words, ascending, when known without a pass.
+        let mut words: Option<Vec<u32>> = None;
         let scan: Option<&[u64]> = if pos.is_empty() {
             // Only names carrying a query extension can pass, and only a
             // name fitting a negation can be negated (a negated dir name
@@ -2167,8 +2172,20 @@ impl Searcher<'_> {
             // them as is: the pass below would just rebuild the same words.
             prevb_hold = p.names.maybe();
             let nw = prevb_hold.len();
-            let nz = prevb_hold.iter().filter(|&&w| w != 0).count();
-            if nz * 4 <= nw {
+            if p.names.pruned.is_empty() && p.names.dense.is_none() && !p.names.lazy {
+                // A small table lists its names: rescan only their words.
+                let tbs: Vec<TokenBits> = q.tokens.iter().map(|t| TokenBits::new(self.live, t)).collect();
+                cand = vec![0; nw];
+                let mut ws: Vec<u32> = p.names.sparse.iter().map(|e| e.0 >> 6).collect();
+                ws.dedup();
+                ws.retain(|&w| {
+                    let w = w as usize;
+                    cand[w] = prevb_hold[w] & tbs.iter().fold(0, |u, tb| u | tb.word(w).0);
+                    cand[w] != 0
+                });
+                words = Some(ws);
+                Some(&cand)
+            } else if prevb_hold.iter().filter(|&&w| w != 0).count() * 4 <= nw {
                 let tbs: Vec<TokenBits> = q.tokens.iter().map(|t| TokenBits::new(self.live, t)).collect();
                 cand = vec![0; nw];
                 for (w, &pv) in prevb_hold.iter().enumerate() {
@@ -2219,13 +2236,23 @@ impl Searcher<'_> {
                 used = Some((covers[t].clone(), t));
             }
         }
+        if restricted.is_some() {
+            words = None;
+        }
         let scan = restricted.as_ref().map_or(scan, |r| Some(&r.0[..]));
         let seeds: Vec<u32> = prev.as_ref().map_or_else(Vec::new, |p| p.names.top_names.iter().map(|e| e.0).collect());
-        let mut names = self.score_names(q, pos, neg, scan, carry, &seeds);
+        let mut names = self.score_names(q, pos, neg, scan, words, carry, &seeds);
         if let Some((_, x)) = restricted {
             names.pruned = x;
         }
-        let scored = std::sync::Arc::new(Scored { at: std::time::Instant::now(), key, names, memo: std::sync::OnceLock::new(), cover: used });
+        let scored = std::sync::Arc::new(Scored {
+            at: std::time::Instant::now(),
+            key,
+            dead: self.live.dead_count,
+            names,
+            memo: std::sync::OnceLock::new(),
+            cover: used,
+        });
         *self.live.names_cache.0.lock().unwrap() = Some(scored.clone());
         scored
     }
@@ -2251,8 +2278,6 @@ impl Searcher<'_> {
             && q.mtime == (0, u32::MAX)
             && q.path_re.is_none()
             && q.grep.is_none()
-            && self.live.dead_count == 0
-            && self.live.over.is_empty()
     }
 
     /// Score distinct names against the query's name-only predicates: every
@@ -2261,7 +2286,16 @@ impl Searcher<'_> {
     /// table the size of the name count.
     /// `seeds`: names likely to rank well (the last table's best), for
     /// warming a pruned table's floor.
-    fn score_names(&self, q: &Query, pos: &[&Token], neg: &[&Token], scan: Option<&[u64]>, carry: Option<PrevCtx>, seeds: &[u32]) -> NameTable {
+    fn score_names(
+        &self,
+        q: &Query,
+        pos: &[&Token],
+        neg: &[&Token],
+        scan: Option<&[u64]>,
+        words: Option<Vec<u32>>,
+        carry: Option<PrevCtx>,
+        seeds: &[u32],
+    ) -> NameTable {
         let idx = &self.live.base;
         let mask = idx.name_mask();
         let ne_off = idx.name_ents_off();
@@ -2284,9 +2318,11 @@ impl Searcher<'_> {
         let collect_merge = pos.len() == 1;
         // Per-chunk accumulator: ok-entry count, best scores for the query
         // bound, the ok names themselves (id-ascending), and the chunk's
-        // top names (asc by score) for seeding the merged scan.
+        // top names (asc by score) for seeding the merged scan, and whether
+        // it left names unscored (`pruned`).
         #[derive(Default)]
         struct Acc {
+            pruned: bool,
             ok_entries: usize,
             hi_score: i16,
             hi_best: [i16; 4],
@@ -2440,9 +2476,15 @@ impl Searcher<'_> {
         // `limit`-th real entry key bounds the answer's from below.
         use std::sync::atomic::Ordering::Relaxed;
         let shared = std::sync::atomic::AtomicU64::new(0);
-        if prune && q.limit > 0 {
-            // Seed it before the pass: real entries of a few likely names
-            // (the last table's best, the top-stat entries'), scored for
+        // The scan set's nonzero words, ascending: only these are visited.
+        let nz: Option<Vec<u32>> = scan.map(|s| words.unwrap_or_else(|| (0..s.len() as u32).filter(|&w| s[w as usize] != 0).collect()));
+        let few = nz.as_ref().is_some_and(|ws| ws.iter().map(|&w| scan.unwrap()[w as usize].count_ones() as usize).sum::<usize>() <= INLINE_NAMES);
+        // Only a live entry's key is a valid floor (a name's best entry may
+        // have been deleted since the index was built).
+        let dead = |e: u32| self.live.dead_count != 0 && self.live.is_dead(e);
+        if prune && q.limit > 0 && !few {
+            // Seed it before a pass over many names: real entries of a few
+            // likely names (the last table's best, the top-stat entries'), scored for
             // this query. Their `limit`-th best key is a valid floor from
             // the first word on. Names deduped: each entry counts once.
             let (o_ne, o_nestat, en) = (&self.live.o_ne, &self.live.o_nestat, idx.ent_name());
@@ -2466,7 +2508,7 @@ impl Searcher<'_> {
                 let Some(s) = pos[0].fits(m).then(|| token_score(idx.uname(id), m, pos[0])).flatten() else { continue };
                 let s = s.clamp(i16::MIN as i32, i16::MAX as i32);
                 let (a, b) = (ne_off[k] as usize, ne_off[k + 1] as usize);
-                top.extend((a..b.min(a + SEED_ENTRIES)).map(|j| key(s + o_nestat[j] as i32, o_ne[j])));
+                top.extend((a..b.min(a + SEED_ENTRIES)).filter(|&j| !dead(o_ne[j])).map(|j| key(s + o_nestat[j] as i32, o_ne[j])));
             }
             if top.len() >= q.limit {
                 top.select_nth_unstable_by(q.limit - 1, |a, b| b.cmp(a));
@@ -2480,9 +2522,8 @@ impl Searcher<'_> {
         let nw = idx.u.div_ceil(64);
         // Each chunk's slots and words of `bits` and `pruned`, handed out
         // by `par_each` — or all on this thread when the scan set has few
-        // words, which takes less time than waking threads.
+        // names, which takes less time than waking threads.
         let chunks = Cells::new(slot_chunks.into_iter().zip(bits.chunks_mut(NAME_CHUNK / 64)).zip(pruned.chunks_mut(NAME_CHUNK / 64)).map(Some));
-        let few = scan.is_some_and(|s| s.iter().filter(|&&w| w != 0).count() <= INLINE_WORDS);
         let each = |f: &(dyn Fn(usize) -> (usize, Acc) + Sync)| -> Vec<(usize, Acc)> {
             if few { (0..chunks.0.len()).map(f).collect() } else { par_each(chunks.0.len(), || (), |_, c| f(c)) }
         };
@@ -2555,7 +2596,7 @@ impl Searcher<'_> {
                                     acc.top.remove(0);
                                 }
                             }
-                            if ne_off[k] < ne_off[k + 1] {
+                            if ne_off[k] < ne_off[k + 1] && !dead(one[ne_off[k] as usize]) {
                                 bounds.push(key(s + pk[k] as i32, one[ne_off[k] as usize]));
                             }
                         }
@@ -2595,7 +2636,7 @@ impl Searcher<'_> {
                                         acc.top.remove(0);
                                     }
                                 }
-                                if ne_off[k] < ne_off[k + 1] {
+                                if ne_off[k] < ne_off[k + 1] && !dead(one[ne_off[k] as usize]) {
                                     bounds.push(key(s + pk[k] as i32, one[ne_off[k] as usize]));
                                 }
                             }
@@ -2610,6 +2651,7 @@ impl Searcher<'_> {
                     // id order `lazy_hit` binary-searches.
                     acc.ok_ids.sort_unstable_by_key(|e| e.1);
                     if skip_hi != i32::MIN {
+                        acc.pruned = true;
                         let s = skip_hi.min(i16::MAX as i32) as i16;
                         acc.hi_score = acc.hi_score.max(s);
                         acc.hi_best[0] = acc.hi_best[0].max(s);
@@ -2671,7 +2713,10 @@ impl Searcher<'_> {
                     let mut floor = TopK::new(q.limit);
                     let mut skip_hi = i32::MIN;
                     let mut per = vec![(0, 0, 0); tbs.len()];
-                    for w in a / 64..b.div_ceil(64) {
+                    let (wa, wb) = (a / 64, b.div_ceil(64));
+                    let listed =
+                        nz.as_deref().map_or(&[][..], |ws| &ws[ws.partition_point(|&w| (w as usize) < wa)..ws.partition_point(|&w| (w as usize) < wb)]);
+                    for w in (wa..if nz.is_some() { wa } else { wb }).chain(listed.iter().map(|&w| w as usize)) {
                         let mut m = scan.map_or_else(|| if b - w * 64 >= 64 { !0 } else { (1u64 << (b - w * 64)) - 1 }, |f| f[w]);
                         if m == 0 {
                             continue;
@@ -2719,7 +2764,7 @@ impl Searcher<'_> {
                             }
                             words[(k - a) >> 6] |= 1 << (k & 63);
                             n += 1;
-                            if prune && h.flags & NF_OK != 0 && ne_off[k] < ne_off[k + 1] {
+                            if prune && h.flags & NF_OK != 0 && ne_off[k] < ne_off[k + 1] && !dead(one[ne_off[k] as usize]) {
                                 let was = floor.floor;
                                 floor.push(key(h.score as i32 + pk[k] as i32, one[ne_off[k] as usize]));
                                 if floor.floor > was {
@@ -2729,6 +2774,7 @@ impl Searcher<'_> {
                         }
                     }
                     if skip_hi != i32::MIN {
+                        acc.pruned = true;
                         // Keep the query bound honest for skipped names
                         // (their score is at most `part`, length penalty aside).
                         let s = skip_hi.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -2739,7 +2785,7 @@ impl Searcher<'_> {
                 })
         };
         drop(chunks);
-        if !prune {
+        if !counts.iter().any(|c| c.1.pruned) {
             pruned = Vec::new();
         }
         let ok_entries = counts.iter().map(|c| c.1.ok_entries).sum();
@@ -3460,6 +3506,8 @@ struct PrevCtx<'a> {
 pub struct Scored {
     at: std::time::Instant,
     key: NameKey,
+    /// Dead entries when it was scored (see `names`).
+    dead: usize,
     names: NameTable,
     memo: std::sync::OnceLock<Vec<DirMemo>>,
     /// The cover the table was restricted to, and its token's index: every
@@ -3841,6 +3889,92 @@ mod cache_tests {
                 fresh.iter().map(|h| (h.idx, h.score)).collect::<Vec<_>>(),
                 "{query}",
             );
+        }
+    }
+
+    /// Deleted entries (dead in the base) must answer like an index built
+    /// without them: a dead name's best entry may not set a pruning floor.
+    #[test]
+    fn dead_entries_answer_like_a_rebuilt_index() {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut rng = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let tree: Vec<(String, Vec<String>)> = (0..40)
+            .map(|d| {
+                let mut files: Vec<String> = (0..200).map(|_| (0..2 + rng(8)).map(|_| b"abcab.xy"[rng(8) as usize] as char).collect()).collect();
+                files.sort();
+                files.dedup();
+                (format!("d{d}{}", ["", ".app", "x"][d % 3]), files)
+            })
+            .collect();
+        let gone = |d: usize, f: usize| (d * 7919 + f * 104729) % 10 < 3;
+        let build = |keep: &dyn Fn(usize, usize) -> bool| {
+            let mut root = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+            let mut ls = Vec::new();
+            for (d, (dn, files)) in tree.iter().enumerate() {
+                let id = d as u32 + 1;
+                root.ents.push(RawEnt { name_off: root.names.len() as u32, name_len: dn.len() as u16, kind: KIND_DIR, size: 1, mtime: 0, child: id });
+                root.names.extend(dn.as_bytes());
+                let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
+                for (f, n) in files.iter().enumerate().filter(|&(f, _)| keep(d, f)) {
+                    l.ents.push(RawEnt {
+                        name_off: l.names.len() as u32,
+                        name_len: n.len() as u16,
+                        kind: KIND_FILE,
+                        size: f as u64,
+                        mtime: 0,
+                        child: NONE,
+                    });
+                    l.names.extend(n.as_bytes());
+                }
+                ls.push(l);
+            }
+            ls.push(root);
+            Live::new(Index::build(ls, 0, 0, b"/"))
+        };
+        let mut killed = build(&|_, _| true);
+        let rebuilt = build(&|d, f| !gone(d, f));
+        for (d, (dn, files)) in tree.iter().enumerate() {
+            for (_, n) in files.iter().enumerate().filter(|&(f, _)| gone(d, f)) {
+                if let Some(e) = killed.base.lookup(format!("/{dn}/{n}").as_bytes()) {
+                    killed.kill(e);
+                }
+            }
+        }
+        let answer = |live: &Live, q: &str| {
+            let mut p = Vec::new();
+            Searcher { live }
+                .search(&Query::parse(q, "/").unwrap())
+                .iter()
+                .map(|h| {
+                    live.base.path(h.idx as usize, &mut p);
+                    (String::from_utf8_lossy(&p).into_owned(), h.score)
+                })
+                .collect::<Vec<_>>()
+        };
+        let live_paths = |live: &Live| {
+            let mut p = Vec::new();
+            let mut v: Vec<Vec<u8>> = (1..live.base.n)
+                .filter(|&i| !live.is_dead(i as u32))
+                .map(|i| {
+                    live.base.path(i, &mut p);
+                    p.clone()
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert!(live_paths(&killed) == live_paths(&rebuilt));
+        assert!(killed.dead_count > 1000);
+        for q in ["a", "b", "ab", "abc", "x", "y.", "ba", "limit:3 a", "limit:1 ab", "bax", "'ab", "^ab", "a$"] {
+            for _ in 0..2 {
+                // Twice: a fresh table, then the cached one.
+                assert_eq!(answer(&killed, q), answer(&rebuilt, q), "{q}");
+            }
         }
     }
 
