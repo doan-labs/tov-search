@@ -1,0 +1,9 @@
+// `tov build main.tov`: "unknown class `TextEncoder`" in lib.tov. The
+// imported module may use TextEncoder (and TextDecoder) only when the entry
+// module names one of them too: uncomment the line below and it builds.
+import { size } from "./lib"
+
+function main(): void {
+  // new TextEncoder()
+  process.stdout.write(`${size()}\n`)
+}

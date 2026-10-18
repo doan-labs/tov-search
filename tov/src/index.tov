@@ -1,7 +1,7 @@
 // The index: entries, dir blocks, interned names, per-name entry lists and
 // the static score order, all built once by build().
 
-import { HOME, NONE, KIND_DIR } from "./consts"
+import { home, NONE, KIND_DIR, FLAG_MOUNT } from "./consts"
 import { zerosU32, zerosU8, zerosI32, zerosI16, encDec, bytesEq } from "./bytes"
 import { buf, b8, nrec, rParent, rKind, rSize, rMtime, rOff, rLen, kids, sortKids,
   kidsNew, kidsSet, kidsClear, diskRelease } from "./disk"
@@ -41,6 +41,46 @@ export let peak: i16[] = []
 
 export function nb(i: int): int {
   return int(unames[i]!)
+}
+
+// Bytes not in the index (an added file's path) go after the names, so the
+// scoring functions, which read names through nb, can read them too.
+let scratchAt = 0
+
+// Puts b after the names (and 64 zero bytes after it); returns its offset.
+export function scratch(b: u8[]): int {
+  while (unames.length > scratchAt) {
+    unames.pop()
+  }
+  for (const c of b) {
+    unames.push(c)
+  }
+  for (let j = 0; j < 64; j++) {
+    unames.push(u8(0))
+  }
+  return scratchAt
+}
+
+// Appends entry i's path to out: "/" and each name from the root down.
+export function putPath(i: int, inout out: u8[]): void {
+  const ch: int[] = []
+  let e = i
+  while (e !== 0 && ch.length < 256) {
+    ch.push(e)
+    e = int(dirEntry[int(entParent[e]!)]!)
+  }
+  if (ch.length === 0) {
+    out.push(u8(47))
+  }
+  for (let j = ch.length - 1; j >= 0; j--) {
+    out.push(u8(47))
+    const id = int(entName[ch[j]!]!)
+    const a = int(uoff[id]!)
+    const b = int(uoff[id + 1]!)
+    for (let x = a; x < b; x++) {
+      out.push(unames[x]!)
+    }
+  }
 }
 
 export function build(): void throws Error {
@@ -97,7 +137,7 @@ export function build(): void throws Error {
       const c = int(kids[j]!)
       entRec[pos] = u32(c)
       par[pos] = u32(e)
-      if ((int(rKind[c]!) & 3) === KIND_DIR) {
+      if ((int(rKind[c]!) & 3) === KIND_DIR && (int(rKind[c]!) & FLAG_MOUNT) === 0) {
         kp.push(pos)
         kr.push(c)
       }
@@ -201,6 +241,7 @@ export function build(): void throws Error {
   for (let j = 0; j < 64; j++) {
     unames.push(u8(0)) // padding: a kernel may load 64 bytes (an AVX-512 vector) from any name
   }
+  scratchAt = unames.length
   diskRelease()
 
   umask = []
@@ -232,7 +273,7 @@ export function build(): void throws Error {
       dirEnd[p] = dirEnd[k2]!
     }
   }
-  const comps = HOME.split("/").filter((c) => c !== "").map((c) => new TextEncoder().encode(c))
+  const comps = home.split("/").filter((c) => c !== "").map((c) => new TextEncoder().encode(c))
   dirPrior = zerosI32(d)
   const depth: int[] = [0]
   const hm: int[] = [0]

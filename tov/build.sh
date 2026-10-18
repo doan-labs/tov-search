@@ -57,7 +57,8 @@ if [ -n "$portable" ]; then
 fi
 case "$(uname -s)" in
   # A 512 MiB main stack. Elsewhere Tov's main() moves itself to a 1 GiB thread.
-  Darwin) link="-DTVG_MAIN_STACK=1 -Wl,-stack_size,0x20000000" ;;
+  # CoreServices: FSEvents, for the app's live updates (kernels/io/watchStart.c).
+  Darwin) link="-DTVG_MAIN_STACK=1 -Wl,-stack_size,0x20000000 -framework CoreServices" ;;
   *) link=-pthread ;;
 esac
 

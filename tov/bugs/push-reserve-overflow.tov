@@ -1,0 +1,26 @@
+// Pushes 4 bytes in a counted loop, then each byte of another array: the
+// second loop's pushes get no room reserved and write past the buffer.
+function req(ps: u8[][]): u8[] {
+  const out: u8[] = []
+  for (const p of ps) {
+    for (let j = 0; j < 4; j++) {
+      out.push(u8(j))
+    }
+    for (const c of p) {
+      out.push(c)
+    }
+  }
+  return out
+}
+
+function main(): void {
+  const ps: u8[][] = []
+  for (let i = 0; i < 1000; i++) {
+    const p: u8[] = []
+    for (let j = 0; j < 100; j++) {
+      p.push(u8(j))
+    }
+    ps.push(p)
+  }
+  process.stdout.write(`${req(ps).length}\n`)
+}

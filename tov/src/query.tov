@@ -1,6 +1,6 @@
 // The query: its parsed form and the word/filter parser.
 
-import { HOME, KIND_FILE, KIND_DIR, KIND_LINK, FUZZY, EXACT, PREFIX, SUFFIX, Z, MAXV } from "./consts"
+import { home, KIND_FILE, KIND_DIR, KIND_LINK, FUZZY, EXACT, PREFIX, SUFFIX, Z, MAXV } from "./consts"
 import { enc, lowerAscii, satU64, satSub } from "./bytes"
 import { charBit, startBit } from "./masks"
 import { now } from "./disk"
@@ -18,6 +18,19 @@ export type Query = {
   mtimeLo: int,
   mtimeHi: int,
   limit: int,
+  // re: and path: patterns ("" for none), compiled into reSet's slots 0 and 1.
+  nameRe: string,
+  pathRe: string,
+  // Content search: the pattern of grep:, regex: or sym: (the content
+  // layer's to handle), and its mode (grep.tov MODE_*).
+  hasGrep: bool,
+  grep: string,
+  grepMode: int,
+}
+
+export function emptyQuery(): Query {
+  return { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295,
+    limit: 50, nameRe: "", pathRe: "", hasGrep: false, grep: "", grepMode: 0 }
 }
 
 const TYPE_NAMES = ["image", "video", "audio", "doc", "code", "archive", "font"]
@@ -148,8 +161,39 @@ function range(v: string, age: bool): int[] throws Error {
 
 const FILTERS = ["ext", "type", "kind", "in", "size", "mtime", "modified", "re", "path", "limit", "grep", "content", "regex", "sym", "symbol"]
 
+// What mtime: filters count ages from: the time of the request in the
+// background program, else the index's clock (which ranking always uses).
+export let clock = 0
+export function setClock(t: int): void {
+  clock = t
+}
+
+// hook(raw): the path with links resolved, or p itself if it doesn't exist.
+// The index holds real paths: /etc is /private/etc on a Mac.
+function realPath(p: string): string {
+  return p
+}
+
+// hook(raw): compiles pattern into regex slot 0 (re:, names) or 1 (path:,
+// whole paths): POSIX extended, ignoring case, with \d \w \s and their
+// capitals as in Rust's regex. Returns "" or the error.
+export function reSet(slot: int, pattern: string): string {
+  return ""
+}
+
+// hook(raw): whether regex slot matches the bytes b.
+export function reMatch(slot: int, b: u8[]): bool {
+  return true
+}
+
+// hook(raw): per name (names[off[k]..off[k+1]], k < u), 1 if regex slot
+// matches it, else 0. On every core.
+export function reNames(slot: int, names: u8[], off: u32[], u: int): string {
+  return ""
+}
+
 // Apply filter k:v; false if k is not a filter name.
-function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
+export function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
   const out = q
   switch (FILTERS.indexOf(k)) {
     case 0: // ext
@@ -189,7 +233,7 @@ function filter(q: Query, k: string, v: string): { known: bool, q: Query } throw
       }
       break
     case 3: { // in
-      let p = v.startsWith("~") ? HOME + v.slice(1) : v
+      let p = realPath(v.startsWith("~") ? home + v.slice(1) : v)
       while (p.endsWith("/")) {
         p = p.slice(0, p.byteLength - 1)
       }
@@ -208,16 +252,30 @@ function filter(q: Query, k: string, v: string): { known: bool, q: Query } throw
       const r = try range(v, true)
       const lo = r[0]!
       const hi = r[1]!
-      out.mtimeLo = satSub(now, hi < now ? hi : now)
-      out.mtimeHi = satSub(now, lo & 4294967295)
+      const t = clock !== 0 ? clock : now
+      out.mtimeLo = satSub(t, hi < t ? hi : t)
+      out.mtimeHi = satSub(t, lo & 4294967295)
       if (hi === MAXV) {
         out.mtimeLo = 0
       }
       break
     }
-    case 7: // re
-    case 8: // path
-      throw new Error("regex filters are not ported")
+    case 7: { // re
+      const err = reSet(0, v)
+      if (err !== "") {
+        throw new Error(err)
+      }
+      out.nameRe = v
+      break
+    }
+    case 8: { // path
+      const err = reSet(1, v)
+      if (err !== "") {
+        throw new Error(err)
+      }
+      out.pathRe = v
+      break
+    }
     case 9: { // limit
       let s = v.startsWith("+") ? v.slice(1) : v
       if (s === "" || s.byteLength > 18) {
@@ -239,8 +297,13 @@ function filter(q: Query, k: string, v: string): { known: bool, q: Query } throw
     case 11: // content
     case 12: // regex
     case 13: // sym
-    case 14: // symbol
+    case 14: { // symbol
+      const at = FILTERS.indexOf(k)
+      out.hasGrep = true
+      out.grep = v
+      out.grepMode = at === 12 ? 1 : at >= 13 ? 2 : 0
       break
+    }
     default:
       return { known: false, q: out }
   }
@@ -271,7 +334,7 @@ function splitWords(s: string): string[] {
 }
 
 export function parse(s: string): Query throws Error {
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  let q = emptyQuery()
   for (const word of splitWords(s)) {
     const colon = word.indexOf(":")
     if (colon >= 0) {

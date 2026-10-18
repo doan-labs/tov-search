@@ -39,8 +39,12 @@ Start with [README.md](README.md), then read the doc for your task.
 
 ## Git workflow
 
-- Branch from `main`; open PRs as drafts (`gh pr create --draft`). CI skips
-  drafts. Mark ready only once the work is complete and `tov/check.sh` passes.
+- Never open, push for, comment on or close a PR unless the owner asks for
+  that PR in so many words. Plans, notes and failures stay local. Commit on
+  a local branch and wait.
+- When asked, branch from `main`; open PRs as drafts (`gh pr create
+  --draft`). CI skips drafts. Mark ready only once the work is complete and
+  `tov/check.sh` passes.
 - Fill in the PR template: what happened, and real proof of work.
 - Squash-merge; never force-push. Merge `main` into shared branches rather
   than rebasing. Keep discarded experiment branches as history.

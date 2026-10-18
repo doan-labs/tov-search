@@ -1,0 +1,271 @@
+// The JSON the background program speaks: requests are one flat object per
+// line, replies are written by hand in the Rust app's format (keys sorted,
+// no spaces), so clients of either see the same bytes.
+
+import { enc } from "./bytes"
+
+// One key of a request: its value as written (raw, without spaces outside
+// strings), and decoded when it is a string.
+export type Field = { key: string, raw: string, str: string, isStr: bool }
+
+let b: u8[] = []
+let p = 0
+
+function ws(): void {
+  while (p < b.length && (int(b[p]!) === 32 || int(b[p]!) === 9 || int(b[p]!) === 10 || int(b[p]!) === 13)) {
+    p += 1
+  }
+}
+
+function expect(c: int): void throws Error {
+  if (p >= b.length || int(b[p]!) !== c) {
+    throw new Error(`unexpected character at column ${p + 1}`)
+  }
+  p += 1
+}
+
+function hex4(): int throws Error {
+  let v = 0
+  for (let j = 0; j < 4; j++) {
+    const c = p < b.length ? int(b[p]!) : 0
+    p += 1
+    if (c >= 48 && c <= 57) {
+      v = v * 16 + c - 48
+    } else if (c >= 97 && c <= 102) {
+      v = v * 16 + c - 87
+    } else if (c >= 65 && c <= 70) {
+      v = v * 16 + c - 55
+    } else {
+      throw new Error(`invalid escape at column ${p}`)
+    }
+  }
+  return v
+}
+
+function putUtf8(o: u8[], cp: int): u8[] {
+  const out = o
+  if (cp < 128) {
+    out.push(u8(cp))
+  } else if (cp < 2048) {
+    out.push(u8(192 | (cp >> 6)))
+    out.push(u8(128 | (cp & 63)))
+  } else if (cp < 65536) {
+    out.push(u8(224 | (cp >> 12)))
+    out.push(u8(128 | ((cp >> 6) & 63)))
+    out.push(u8(128 | (cp & 63)))
+  } else {
+    out.push(u8(240 | (cp >> 18)))
+    out.push(u8(128 | ((cp >> 12) & 63)))
+    out.push(u8(128 | ((cp >> 6) & 63)))
+    out.push(u8(128 | (cp & 63)))
+  }
+  return out
+}
+
+function readStr(): string throws Error {
+  try expect(34)
+  let o: u8[] = []
+  for (;;) {
+    if (p >= b.length) {
+      throw new Error("EOF while parsing a string")
+    }
+    const c = int(b[p]!)
+    p += 1
+    if (c === 34) {
+      break
+    }
+    if (c < 32) {
+      throw new Error(`control character found while parsing a string at column ${p}`)
+    }
+    if (c !== 92) {
+      o.push(u8(c))
+      continue
+    }
+    const e = p < b.length ? int(b[p]!) : 0
+    p += 1
+    if (e === 34 || e === 92 || e === 47) {
+      o.push(u8(e))
+    } else if (e === 98) {
+      o.push(u8(8))
+    } else if (e === 102) {
+      o.push(u8(12))
+    } else if (e === 110) {
+      o.push(u8(10))
+    } else if (e === 114) {
+      o.push(u8(13))
+    } else if (e === 116) {
+      o.push(u8(9))
+    } else if (e === 117) {
+      let cp = try hex4()
+      if (cp >= 55296 && cp < 56320) {
+        if (p + 1 >= b.length || int(b[p]!) !== 92 || int(b[p + 1]!) !== 117) {
+          throw new Error(`lone leading surrogate in hex escape at column ${p}`)
+        }
+        p += 2
+        const lo = try hex4()
+        if (lo < 56320 || lo >= 57344) {
+          throw new Error(`lone leading surrogate in hex escape at column ${p}`)
+        }
+        cp = 65536 + ((cp - 55296) << 10) + (lo - 56320)
+      } else if (cp >= 56320 && cp < 57344) {
+        throw new Error(`lone trailing surrogate in hex escape at column ${p}`)
+      }
+      o = putUtf8(o, cp)
+    } else {
+      throw new Error(`invalid escape at column ${p}`)
+    }
+  }
+  return try new TextDecoder().decode(o)
+}
+
+// Skips one value.
+function skipValue(): void throws Error {
+  const c = p < b.length ? int(b[p]!) : 0
+  if (c === 34) {
+    try readStr()
+    return
+  }
+  if (c === 123 || c === 91) {
+    const close = c === 123 ? 125 : 93
+    p += 1
+    ws()
+    if (p < b.length && int(b[p]!) === close) {
+      p += 1
+      return
+    }
+    for (;;) {
+      ws()
+      if (c === 123) {
+        try readStr()
+        ws()
+        try expect(58)
+        ws()
+      }
+      try skipValue()
+      ws()
+      if (p < b.length && int(b[p]!) === 44) {
+        p += 1
+        continue
+      }
+      try expect(close)
+      return
+    }
+  }
+  const start = p
+  while (p < b.length) {
+    const d = int(b[p]!)
+    if (!((d >= 48 && d <= 57) || (d >= 97 && d <= 122) || d === 45 || d === 43 || d === 46 || d === 69)) {
+      break
+    }
+    p += 1
+  }
+  if (p === start) {
+    throw new Error(`expected value at column ${p + 1}`)
+  }
+}
+
+// The value bytes [a, e) without the spaces outside strings.
+function compact(a: int, e: int): string throws Error {
+  const o: u8[] = []
+  let inStr = false
+  for (let j = a; j < e; j++) {
+    const c = int(b[j]!)
+    if (inStr) {
+      o.push(u8(c))
+      if (c === 92) {
+        j += 1
+        o.push(b[j]!)
+      } else if (c === 34) {
+        inStr = false
+      }
+    } else if (!(c === 32 || c === 9 || c === 10 || c === 13)) {
+      o.push(u8(c))
+      inStr = c === 34
+    }
+  }
+  return try new TextDecoder().decode(o)
+}
+
+// The keys of a JSON object, sorted (as serde_json's map iterates them).
+export function readObject(line: string): Field[] throws Error {
+  b = enc(line)
+  p = 0
+  let out: Field[] = []
+  ws()
+  try expect(123)
+  ws()
+  if (p < b.length && int(b[p]!) === 125) {
+    p += 1
+  } else {
+    for (;;) {
+      ws()
+      const key = try readStr()
+      ws()
+      try expect(58)
+      ws()
+      const at = p
+      const isStr = p < b.length && int(b[p]!) === 34
+      let str = ""
+      if (isStr) {
+        str = try readStr()
+      } else {
+        try skipValue()
+      }
+      const raw = try compact(at, p)
+      // A repeated key keeps its last value.
+      out = out.filter((f) => f.key !== key)
+      out.push({ key: key, raw: raw, str: str, isStr: isStr })
+      ws()
+      if (p < b.length && int(b[p]!) === 44) {
+        p += 1
+        continue
+      }
+      try expect(125)
+      break
+    }
+  }
+  ws()
+  if (p !== b.length) {
+    throw new Error(`trailing characters at column ${p + 1}`)
+  }
+  out.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0))
+  return out
+}
+
+// s as a JSON string, escaped as serde_json does.
+export function jstr(s: string): string throws Error {
+  const o: u8[] = [u8(34)]
+  const hex = enc("0123456789abcdef")
+  for (const c of enc(s)) {
+    const x = int(c)
+    if (x === 34 || x === 92) {
+      o.push(u8(92))
+      o.push(c)
+    } else if (x === 8) {
+      o.push(u8(92))
+      o.push(u8(98))
+    } else if (x === 12) {
+      o.push(u8(92))
+      o.push(u8(102))
+    } else if (x === 10) {
+      o.push(u8(92))
+      o.push(u8(110))
+    } else if (x === 13) {
+      o.push(u8(92))
+      o.push(u8(114))
+    } else if (x === 9) {
+      o.push(u8(92))
+      o.push(u8(116))
+    } else if (x < 32) {
+      for (const e of enc("\\u00")) {
+        o.push(e)
+      }
+      o.push(hex[x >> 4]!)
+      o.push(hex[x & 15]!)
+    } else {
+      o.push(c)
+    }
+  }
+  o.push(u8(34))
+  return try new TextDecoder().decode(o)
+}

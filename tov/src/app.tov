@@ -1,0 +1,916 @@
+// The tov-search app: the command line, and the background program that
+// keeps the index in memory and answers JSON lines on a unix socket, in the
+// Rust app's protocol (rust/src/server.rs), so its clients work unchanged.
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
+import { setHome, KIND_FILE, KIND_DIR, KIND_LINK } from "./consts"
+import { enc, bytesKey } from "./bytes"
+import { readDisk, setNow } from "./disk"
+import { setLinuxPriors } from "./prior"
+import { build, n, d } from "./index"
+import { Query, parse, filter, setClock } from "./query"
+import { namesAlloc } from "./names"
+import { memosAlloc } from "./memos"
+import { extIndexBuild } from "./exts"
+import { scanDisk } from "./scan"
+import { liveReset, takeAdded, takeTrees, applyDir, liveDirs, liveSearch, liveDisk, hitScore, hitIdx, hitKind, hitSize,
+  hitMtime, hitPath, overCount, deadCount, wants } from "./live"
+import { Field, readObject, jstr } from "./json"
+import { writeFile, sockListen, sockNext, sockReply, sockAsk, spawnServe, runCmd, copySelf, sleepMs, uid, watchStart,
+  watchAdd, watchTake, eventNow, lstatOne, mtimesSince, execServe, spawnBg, childDone } from "./io"
+import { inScope } from "./cscope"
+import { contentOpen, contentDocs, contentBytes, segId, cDir, diff, allocId, pushSeg, mergePlan, replaceSegs,
+  changedDirs } from "./segs"
+import { batches } from "./segbuild"
+import { writeTodo, contentChild } from "./content"
+import { MODE_LITERAL, MODE_REGEX, MODE_SYMBOL, grepSet, setPerFile, setBudget } from "./grep"
+import { contentSearch, scanSearch, scanPaths, resPaths, resLineAt, resLineNo, resLineText, resCandidates, resRead,
+  resComplete } from "./csearch"
+
+const USAGE = `usage:
+  tov-search <query...> [--json]   search (starts the background program if needed)
+  tov-search serve                 run the background program in the foreground
+  tov-search status
+  tov-search index [root]          scan the disk (or root) into the saved index now
+  tov-search install [--login]     copy to ~/.local/bin; --login also starts it at login
+  tov-search uninstall             stop starting it at login (keeps the index)
+`
+
+const LABEL = "mt.nd.tov-search"
+
+function die(msg: string): void {
+  process.stderr.write(`tov-search: ${msg}\n`)
+  process.exit(1)
+}
+
+function secs(): int {
+  return Math.trunc(Date.now() / 1000)
+}
+
+function log(msg: string): void {
+  process.stderr.write(`${secs()} ${msg}\n`)
+}
+
+function homeDir(): string {
+  return process.env.HOME ?? "/"
+}
+
+// Where the index lives: the Rust app's folder.
+function dataDir(h: string): string {
+  if (process.platform === "darwin") {
+    return `${h}/Library/Application Support/TovSearch`
+  }
+  const x = process.env.XDG_DATA_HOME ?? ""
+  return x.startsWith("/") ? `${x}/tov-search` : `${h}/.local/share/tov-search`
+}
+
+// macOS without Full Disk Access can't open the folders a consent prompt
+// guards; the scan would stop until someone answered it.
+function fullDiskAccess(): bool {
+  if (process.platform !== "darwin") {
+    return true
+  }
+  if ((process.env.TOV_SEARCH_RESTRICT ?? "") !== "") {
+    return false
+  }
+  try {
+    readFileSync("/Library/Application Support/com.apple.TCC/TCC.db")
+  } catch (e) {
+    return false
+  }
+  return true
+}
+
+// Folders not to scan.
+function skipped(h: string): string[] {
+  if (process.platform !== "darwin") {
+    return ["/proc", "/sys", "/dev", "/run"]
+  }
+  if (fullDiskAccess()) {
+    return []
+  }
+  return ["Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
+    "Library/CloudStorage", "Pictures/Photos Library.photoslibrary"].map((x) => `${h}/${x}`).concat(["/Volumes"])
+}
+
+// The saved index: the disk file, and next to it the event id it is up to
+// date with and the second it was last known in sync ("<event id> <second>").
+function diskFile(h: string): string {
+  return `${dataDir(h)}/disk.bin`
+}
+
+function stateFile(h: string): string {
+  return `${dataDir(h)}/disk.state`
+}
+
+function save(h: string, disk: u8[], event: int, synced: int): void throws Error {
+  try mkdirSync(dataDir(h), { recursive: true })
+  const err = writeFile(diskFile(h), disk)
+  if (err !== "") {
+    throw new Error(`write ${diskFile(h)}: ${err}`)
+  }
+  try writeFileSync(stateFile(h), `${event} ${synced}\n`)
+}
+
+function index(root: string, h: string): void throws Error {
+  const t = Date.now()
+  // The events from here on are replayed after the scan: none is missed.
+  const event = eventNow()
+  const started = secs()
+  const disk = scanDisk(enc(root), skipped(h).map(enc), started)
+  try save(h, disk, event, started)
+  log(`scanned ${root} in ${Math.round(Date.now() - t)} ms`)
+}
+
+// ------------------------------------------------------------------ background program
+
+// Applied up to this event id; in sync up to this second.
+let eventId = 0
+let syncedAt = 0
+let savedEventId = 0
+let lastSave: f64 = 0
+
+function load(h: string): void throws Error {
+  const t = Date.now()
+  if (!existsSync(diskFile(h)) || !existsSync(stateFile(h))) {
+    try index("/", h)
+  }
+  const st = (try readFileSync(stateFile(h))).trim().split(" ")
+  eventId = parseInt(st[0] ?? "0") ?? 0
+  syncedAt = parseInt(st[1] ?? "0") ?? 0
+  savedEventId = eventId
+  setHome(h)
+  setLinuxPriors(process.platform === "linux")
+  try readDisk(diskFile(h))
+  setNow(secs())
+  try build()
+  namesAlloc()
+  memosAlloc()
+  extIndexBuild()
+  liveReset(skipped(h).map(enc))
+  lastSave = Date.now()
+  contentOpen(`${dataDir(h)}/content`, true)
+  // Reconcile all of home once (cheap when nothing changed), then follow
+  // the name index's changes.
+  contentNote([], [enc(h)])
+  log(`loaded ${n} entries in ${Math.round(Date.now() - t)} ms, replaying events since ${eventId}`)
+}
+
+// ------------------------------------------------------------------ content index upkeep
+
+// Folders (and subtrees) to sync, each once it has been quiet for 2 s, or 5
+// min after its first change if it never goes quiet: a file you save lands
+// in ~2 s; files apps rewrite every second cost one sync per 5 min.
+const CONTENT_QUIET_MS = 2000
+const CONTENT_MAX_WAIT_MS = 300000
+let pendPath: u8[][] = []
+let pendRec: bool[] = []
+let pendFirst: f64[] = []
+let pendLast: f64[] = []
+// The child building or merging segments (0: none), and what it does.
+let cChild = 0
+let cBuildIds: int[] = []
+let cMergeIds: int[] = []
+let cMergeId = 0
+let cTodo = 0
+let cStarted: f64 = 0
+let cMergeStuck = false
+export let contentPending = 0
+
+function sameBytes(a: u8[], b: u8[]): bool {
+  if (a.length !== b.length) {
+    return false
+  }
+  for (let j = 0; j < a.length; j++) {
+    if (a[j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+function contentNote(dirs: u8[][], trees: u8[][]): void {
+  const hb = enc(homeDir())
+  const now = Date.now()
+  for (let i = 0; i < dirs.length + trees.length; i++) {
+    const r = i >= dirs.length
+    const p = r ? trees[i - dirs.length]! : dirs[i]!
+    // Most of the disk's churn (Library, caches) is outside the indexed area.
+    let holdsHome = r && p.length <= hb.length
+    for (let j = 0; j < p.length && holdsHome; j++) {
+      holdsHome = p[j]! === hb[j]!
+    }
+    if (!inScope(p, hb) && !holdsHome) {
+      continue
+    }
+    let at = -1
+    for (let k = 0; k < pendPath.length && at < 0; k++) {
+      if (pendRec[k]! === r && sameBytes(pendPath[k]!, p)) {
+        at = k
+      }
+    }
+    if (at >= 0) {
+      pendLast[at] = now
+    } else {
+      pendPath.push(p)
+      pendRec.push(r)
+      pendFirst.push(now)
+      pendLast.push(now)
+    }
+  }
+}
+
+// Whether content work is waiting or running (the serve loop wakes often then).
+function contentBusy(): bool {
+  return cChild > 0 || pendPath.length > 0
+}
+
+// One step of the content index's upkeep: collect a finished child, start
+// merging, or diff the ripe folders and start building what changed.
+function contentStep(h: string): void {
+  if (cChild > 0) {
+    const st = childDone(cChild)
+    if (st < 0) {
+      return
+    }
+    cChild = 0
+    if (cBuildIds.length > 0) {
+      for (const id of cBuildIds) {
+        pushSeg(id)
+      }
+      cBuildIds = []
+      contentPending = 0
+      cMergeStuck = false
+      if (cTodo > 100) {
+        log(`content: indexed ${cTodo} files in ${Math.round(Date.now() - cStarted)} ms`)
+      }
+    } else if (st === 0) {
+      replaceSegs(cMergeIds, cMergeId)
+    } else {
+      cMergeStuck = true
+    }
+  }
+  // Keep the segment count small: merge size tiers of 8.
+  let plan: int[] = []
+  if (!cMergeStuck) {
+    plan = mergePlan()
+  }
+  if (plan.length > 0) {
+    cMergeIds = plan
+    cMergeId = allocId()
+    const args = ["content-merge", cDir, `${cMergeId}`].concat(plan.map((x: int) => `${x}`))
+    cChild = spawnBg(args, `${dataDir(h)}/daemon.log`)
+    if (cChild < 0) {
+      cChild = 0
+      cMergeStuck = true
+    }
+    return
+  }
+  const now = Date.now()
+  const dirs: u8[][] = []
+  const trees: u8[][] = []
+  const keep: int[] = []
+  for (let k = 0; k < pendPath.length; k++) {
+    if (now - pendLast[k]! >= CONTENT_QUIET_MS || now - pendFirst[k]! >= CONTENT_MAX_WAIT_MS) {
+      if (pendRec[k]!) {
+        trees.push(pendPath[k]!)
+      } else {
+        dirs.push(pendPath[k]!)
+      }
+    } else {
+      keep.push(k)
+    }
+  }
+  if (dirs.length + trees.length === 0) {
+    return
+  }
+  pendPath = keep.map((k) => pendPath[k]!)
+  pendRec = keep.map((k) => pendRec[k]!)
+  pendFirst = keep.map((k) => pendFirst[k]!)
+  pendLast = keep.map((k) => pendLast[k]!)
+  cStarted = Date.now()
+  const todo = diff(wants(enc(h), dirs, trees))
+  if (todo.paths.length === 0) {
+    return
+  }
+  const file = `${cDir}/todo`
+  const err = writeTodo(file, todo)
+  if (err !== "") {
+    log(`content: ${file}: ${err}`)
+    return
+  }
+  const b = batches(todo)
+  const ids: int[] = []
+  for (let i = 0; i + 1 < b.length; i++) {
+    ids.push(allocId())
+  }
+  cChild = spawnBg(["content-build", cDir, file, `${ids[0]!}`], `${dataDir(h)}/daemon.log`)
+  if (cChild < 0) {
+    cChild = 0
+    log("content: cannot start indexing")
+    return
+  }
+  cBuildIds = ids
+  cTodo = todo.paths.length
+  contentPending = cTodo
+}
+
+// File watching, as the Rust app does it (rust/src/engine.rs apply_loop).
+const MUST_SCAN = 1
+const USER_DROPPED = 2
+const KERNEL_DROPPED = 4
+const HISTORY_DONE = 16
+const MAC = process.platform === "darwin"
+const COMPACT_PENDING = 50000
+const COMPACT_EVERY_MS = 12 * 3600 * 1000
+const CATCH_UP_EVERY_MS = 30000
+
+let stream = 0
+let replaying = true
+let since = 0 // where the current stream started
+let gapFrom = -1 // events dropped before we read them: replay from here
+let gapAt: f64 = 0
+let replays = 0
+let degraded = false // Linux: some folders are not watched
+let lastCatchUp: f64 = 0
+let saveAsked = false
+
+// u32 length + path each, as the hooks take folders.
+// (The path's bytes go in through a helper: pushed in this loop, they would
+// overflow the array, tov/bugs/push-reserve-overflow.tov.)
+function pathReq(ps: u8[][]): u8[] {
+  let out: u8[] = []
+  for (const p of ps) {
+    for (let j = 0; j < 4; j++) {
+      out.push(u8((p.length >> (8 * j)) & 255))
+    }
+    pushAll(&out, p)
+  }
+  return out
+}
+
+function pushAll(inout out: u8[], b: u8[]): void {
+  for (const c of b) {
+    out.push(c)
+  }
+}
+
+function startWatching(h: string): void {
+  if (MAC) {
+    stream = watchStart(eventId, [])
+    since = eventId
+    replaying = true
+    return
+  }
+  const t = Date.now()
+  if (watchStart(0, pathReq(skipped(h).map(enc))) < 0) {
+    log("inotify unavailable: changes are picked up by a periodic catch-up")
+    degraded = true
+  } else {
+    const missed = watchAdd(pathReq([enc("/")].concat(liveDirs())))
+    degraded = missed > 0
+    log(`inotify: watching folders took ${Math.round(Date.now() - t)} ms${missed > 0 ? `, ${missed} not watched (fs.inotify.max_user_watches)` : ""}`)
+  }
+  relist("start")
+  replaying = false
+  lastCatchUp = Date.now()
+}
+
+// Lost track of the disk (dropped events, no history to replay, or a start
+// on Linux): relist every folder modified since we were last in sync.
+function relist(why: string): void {
+  const t = Date.now()
+  const started = secs()
+  const from = syncedAt > 120 ? syncedAt - 120 : 0
+  const dirs = liveDirs()
+  const changed: u8[][] = []
+  const hit = new TextEncoder().encode(mtimesSince(pathReq(dirs), from))
+  for (let i = 0; i < dirs.length; i++) {
+    if (int(hit[i]!) === 1) {
+      changed.push(dirs[i]!)
+    }
+  }
+  const root = new TextEncoder().encode(lstatOne(enc("/")))
+  if (root.length === 13 && (int(root[9]!) | (int(root[10]!) << 8) | (int(root[11]!) << 16) | (int(root[12]!) << 24)) >= from) {
+    changed.push(enc("/"))
+  }
+  // Folders of indexed text files edited since (an edit in place doesn't
+  // touch its folder).
+  for (const p of changedDirs(from)) {
+    if (!changed.some((x) => sameBytes(x, p))) {
+      changed.push(p)
+    }
+  }
+  for (const p of changed) {
+    applyDir(p, false)
+  }
+  syncedAt = started
+  const added = takeAdded()
+  if (!MAC && added.length > 0) {
+    degraded = watchAdd(pathReq(added)) > 0 || degraded
+  }
+  contentNote(changed, takeTrees())
+  log(`caught up (${why}): relisted ${changed.length} folders changed since ${from} in ${Math.round(Date.now() - t)} ms`)
+}
+
+let rebuildFlags = -1 // >= 0: relist, for these root flags
+
+function onEvents(): bool {
+  const b = new TextEncoder().encode(watchTake())
+  const dirs: u8[][] = []
+  const deep: bool[] = []
+  const seen: Map<string, int> = new Map()
+  let maxId = 0
+  let lastGood = eventId
+  let p = 0
+  while (p + 20 <= b.length) {
+    const flags = rd32(b, p)
+    const from = rd32(b, p + 4)
+    const id = rd32(b, p + 8) | (rd32(b, p + 12) << 32)
+    const len = rd32(b, p + 16)
+    const path = b.slice(p + 20, p + 20 + len)
+    p += 20 + len
+    if (len === 1 && int(path[0]!) === 47 && (flags & MUST_SCAN) !== 0) {
+      // fseventsd still logged what it dropped for us: replay from the last
+      // event we did get, once the drops stop. A replaced stream's drop is
+      // covered by the stream that replaced it.
+      if (MAC && (flags & (USER_DROPPED | KERNEL_DROPPED)) === USER_DROPPED) {
+        if (from === stream) {
+          const f = replaying ? since : lastGood
+          gapFrom = gapFrom < 0 || f < gapFrom ? f : gapFrom
+          gapAt = Date.now()
+        }
+        continue
+      }
+      rebuildFlags = rebuildFlags < 0 ? flags : rebuildFlags | flags
+    }
+    maxId = id > maxId ? id : maxId
+    if (MAC && gapFrom < 0 && id > lastGood) {
+      lastGood = id
+    }
+    if ((flags & HISTORY_DONE) !== 0) {
+      if (replaying) {
+        replaying = false
+        log("replay done")
+      }
+      if (gapFrom < 0) {
+        replays = 0
+      }
+      continue
+    }
+    const k = bytesKey(path)
+    const at = seen.get(k)
+    if (at === undefined) {
+      seen.set(k, dirs.length)
+      dirs.push(path)
+      deep.push((flags & MUST_SCAN) !== 0)
+    } else if ((flags & MUST_SCAN) !== 0) {
+      deep[at] = true
+    }
+  }
+  const flat: u8[][] = []
+  const trees: u8[][] = []
+  for (let i = 0; i < dirs.length; i++) {
+    if (applyDir(dirs[i]!, deep[i]!) && rebuildFlags < 0) {
+      rebuildFlags = 0
+    }
+    if (deep[i]!) {
+      trees.push(dirs[i]!)
+    } else {
+      flat.push(dirs[i]!)
+    }
+  }
+  takeAdded()
+  contentNote(flat, trees.concat(takeTrees()))
+  // With a gap, everything is applied only up to its start.
+  if (gapFrom >= 0) {
+    eventId = gapFrom < eventId ? gapFrom : eventId
+  } else if (maxId > eventId) {
+    eventId = maxId
+  }
+  return p > 0
+}
+
+function rd32(b: u8[], p: int): int {
+  return int(b[p]!) | (int(b[p + 1]!) << 8) | (int(b[p + 2]!) << 16) | (int(b[p + 3]!) << 24)
+}
+
+// After events or a quiet spell: replays, relists, catch-ups and saves.
+function afterEvents(h: string, hadEvents: bool): void throws Error {
+  const replay = gapFrom >= 0 && Date.now() - gapAt >= 2000 ? gapFrom : -1
+  if (replay >= 0 && replays >= 3) {
+    rebuildFlags = rebuildFlags < 0 ? USER_DROPPED : rebuildFlags | USER_DROPPED
+  }
+  if (rebuildFlags >= 0) {
+    const f = rebuildFlags
+    const why = (f & KERNEL_DROPPED) !== 0 ? (MAC ? "kernel dropped events" : "inotify queue overflowed") :
+      (f & USER_DROPPED) !== 0 ? (MAC ? "events dropped before we read them" : "some folders are unwatched") : "history unavailable"
+    relist(why)
+    rebuildFlags = -1
+    gapFrom = -1
+    replays = 0
+  } else if (replay >= 0) {
+    log(`FSEvents dropped events before we read them: replaying from ${replay}`)
+    stream = watchStart(replay, [])
+    since = replay
+    replaying = true
+    gapFrom = -1
+    replays += 1
+  } else if (hadEvents && gapFrom < 0 && !replaying) {
+    syncedAt = secs()
+  }
+  // Folders inotify could not watch are caught up by mtime instead.
+  if (!MAC && degraded && Date.now() - lastCatchUp >= CATCH_UP_EVERY_MS) {
+    lastCatchUp = Date.now()
+    relist("some folders are unwatched")
+  }
+  const stale = eventId !== savedEventId && Date.now() - lastSave > COMPACT_EVERY_MS
+  // Not while a content child writes segments: the restarted program would
+  // hand out its segment ids again.
+  if ((saveAsked || overCount + deadCount > COMPACT_PENDING || stale) && cChild === 0) {
+    try compact(h)
+  }
+  contentStep(h)
+}
+
+// Saves everything as the new index and restarts from it: a fresh build,
+// with no added or gone entries left to merge.
+function compact(h: string): void throws Error {
+  const t = Date.now()
+  const disk = liveDisk(secs())
+  try save(h, disk, eventId, syncedAt)
+  log(`saved ${overCount} added and ${deadCount} removed entries in ${Math.round(Date.now() - t)} ms; restarting from the saved index`)
+  log(`restart failed: ${execServe()}`)
+}
+
+function kindName(k: int): string {
+  const x = k & 3
+  return x === KIND_FILE ? "file" : x === KIND_DIR ? "dir" : x === KIND_LINK ? "link" : "other"
+}
+
+function fieldOf(fs: Field[], key: string): Field | undefined {
+  for (const f of fs) {
+    if (f.key === key) {
+      return f
+    }
+  }
+  return undefined
+}
+
+// `q` is the query language; any filter key may also be its own field
+// ({"q": "main", "ext": "rs", "in": "~/Developer"}).
+function request(fs: Field[]): Query throws Error {
+  const qf = fieldOf(fs, "q")
+  let q = try parse(qf !== undefined && qf.isStr ? qf.str : "")
+  for (const f of fs) {
+    if (f.key === "limit") {
+      const x = f.isStr ? undefined : parseInt(f.raw)
+      if (x === undefined || `${x}` !== f.raw || x < 0) {
+        throw new Error("limit must be a number")
+      }
+      q.limit = x
+    } else {
+      q = (try filter(q, f.key, f.isStr ? f.str : f.raw)).q
+    }
+  }
+  return q
+}
+
+const GREP_KEYS = ["grep:", "regex:", "sym:", "content:", "symbol:"]
+
+// A field's whole number (JSON's u64), or -1.
+function wholeField(fs: Field[], key: string): int {
+  const f = fieldOf(fs, key)
+  if (f === undefined || f.isStr) {
+    return -1
+  }
+  const x = parseInt(f.raw)
+  return x !== undefined && `${x}` === f.raw && x >= 0 ? x : -1
+}
+
+// Content search. The pattern comes from `pattern` (with `mode`) or from a
+// grep:, regex: or sym: filter in q; the rest of the query narrows which
+// files are read.
+function grepReply(fs: Field[], id: string): string throws Error {
+  const q = try request(fs)
+  let mode = q.grepMode
+  const mf = fieldOf(fs, "mode")
+  if (mf !== undefined && mf.isStr) {
+    const at = ["literal", "regex", "symbol"].indexOf(mf.str)
+    if (at < 0) {
+      throw new Error(`unknown mode ${mf.str}`)
+    }
+    mode = at === 0 ? MODE_LITERAL : at === 1 ? MODE_REGEX : MODE_SYMBOL
+  }
+  const pf = fieldOf(fs, "pattern")
+  let pattern = q.grep
+  if (pf !== undefined && pf.isStr) {
+    pattern = pf.str
+  } else if (!q.hasGrep) {
+    throw new Error("grep needs a pattern")
+  }
+  const err = grepSet(pattern, mode)
+  if (err !== "") {
+    throw new Error(err)
+  }
+  const per = wholeField(fs, "per_file")
+  if (per >= 0) {
+    setPerFile(per)
+  }
+  const ms = wholeField(fs, "budget_ms")
+  if (ms >= 0) {
+    setBudget(ms)
+  }
+  const t = performance.now()
+  const indexed = !q.hasScope || inScope(q.scope, enc(homeDir()))
+  if (indexed) {
+    contentSearch(q)
+  } else {
+    scanSearch(scanPaths(q), q.limit)
+  }
+  const tookUs = Math.trunc((performance.now() - t) * 1000)
+  let files = ""
+  for (let f = 0; f < resPaths.length; f++) {
+    let ms2 = ""
+    for (let x = resLineAt[f]!; x < resLineAt[f + 1]!; x++) {
+      ms2 = ms2 + `${x > resLineAt[f]! ? "," : ""}{"line":${resLineNo[x]!},"text":${try jstr(try new TextDecoder().decode(resLineText[x]!))}}`
+    }
+    files = files + `${f > 0 ? "," : ""}{"matches":[${ms2}],"path":${try jstr(try new TextDecoder().decode(resPaths[f]!))}}`
+  }
+  return `{"candidates":${resCandidates},"complete":${resComplete},"files":[${files}],"id":${id},"indexing":${contentPending},` +
+    `"ok":true,"read":${resRead},"source":"${indexed ? "index" : "scan"}","took_us":${tookUs}}\n`
+}
+
+// The answer to one request line, as one line of JSON.
+function respond(line: string): string throws Error {
+  let fs: Field[] = []
+  try {
+    fs = readObject(line)
+  } catch (e) {
+    return `{"error":${try jstr(`bad json: ${e.message}`)},"ok":false}\n`
+  }
+  const idf = fieldOf(fs, "id")
+  const id = idf !== undefined ? idf.raw : "null"
+  const opf = fieldOf(fs, "op")
+  const op = opf !== undefined && opf.isStr ? opf.str : "search"
+  const qf = fieldOf(fs, "q")
+  const qs = qf !== undefined && qf.isStr ? qf.str : ""
+  const grep = op === "grep" || (op === "search" && GREP_KEYS.some((k) => qs.includes(k)))
+  let err = ""
+  if (op === "ping") {
+    return `{"id":${id},"ok":true}\n`
+  } else if (op === "save") {
+    saveAsked = true
+    return `{"id":${id},"ok":true,"scheduled":true}\n`
+  } else if (grep) {
+    setClock(secs())
+    try {
+      return try grepReply(fs, id)
+    } catch (e) {
+      err = e.message
+    }
+  } else if (op === "status") {
+    return `{"content_bytes":${contentBytes()},"content_docs":${contentDocs()},"content_pending":${contentPending},` +
+      `"content_segments":${segId.length},"dirs":${d},"entries":${n},` +
+      `"event_id":${eventId},"full_disk_access":${fullDiskAccess()},"id":${id},"index_bytes":0,"ok":true,"overlay":${overCount},` +
+      `"owner":true,"removed":${deadCount}}\n`
+  } else if (op === "search") {
+    setClock(secs())
+    try {
+      const q = try request(fs)
+      const t = performance.now()
+      liveSearch(q)
+      const out: u8[] = []
+      for (const c of enc(`{"hits":[`)) {
+        out.push(c)
+      }
+      for (let j = 0; j < hitIdx.length; j++) {
+        const i = hitIdx[j]!
+        // Paths that aren't UTF-8 are shown with U+FFFD, as the Rust app does.
+        const hit = `${j > 0 ? "," : ""}{"kind":"${kindName(hitKind(i))}","mtime":${hitMtime(i)},` +
+          `"path":${try jstr(try new TextDecoder().decode(hitPath(i)))},"score":${hitScore[j]!},"size":${hitSize(i)}}`
+        for (const c of enc(hit)) {
+          out.push(c)
+        }
+      }
+      const tookUs = Math.trunc((performance.now() - t) * 1000)
+      for (const c of enc(`],"id":${id},"ok":true,"took_us":${tookUs}}\n`)) {
+        out.push(c)
+      }
+      return try new TextDecoder().decode(out)
+    } catch (e) {
+      err = e.message
+    }
+  } else {
+    err = `unknown op ${op}`
+  }
+  return `{"error":${try jstr(err)},"id":${id},"ok":false}\n`
+}
+
+function serve(): void throws Error {
+  const h = homeDir()
+  const dir = dataDir(h)
+  try mkdirSync(dir, { recursive: true })
+  const err = sockListen(`${dir}/tov-search.sock`, `${dir}/socket.lock`)
+  if (err !== "") {
+    log(err)
+    return
+  }
+  // Requests wait in the socket's queue while the index loads.
+  try load(h)
+  startWatching(h)
+  for (;;) {
+    // Wake for a replay that waits for drops to stop, content work, or the
+    // next catch-up.
+    const wait = (MAC && gapFrom >= 0) || contentBusy() ? 250 : MAC ? 60000 : CATCH_UP_EVERY_MS
+    const m = new TextEncoder().encode(sockNext(wait))
+    const conn = rd32(m, 0)
+    if (conn === 4294967295) {
+      try afterEvents(h, onEvents())
+    } else if (conn === 4294967294) {
+      try afterEvents(h, false)
+    } else {
+      const line = try new TextDecoder().decode(m.slice(4))
+      sockReply(conn, enc(try respond(line)))
+      if (contentBusy()) {
+        contentStep(h)
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------ command line
+
+type Hit = { path: string }
+type Match = { line: int, text: string }
+type FileHit = { path: string, matches: Match[] }
+type Reply = { ok: bool, error?: string, hits?: Hit[], files?: FileHit[] }
+
+// The background program's answer to req, starting it if it isn't running.
+function ask(req: string): string {
+  const dir = dataDir(homeDir())
+  const sock = `${dir}/tov-search.sock`
+  let r = sockAsk(sock, req)
+  if (r === "") {
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch (e) {
+      die(`${dir}: ${e.message}`)
+    }
+    const err = spawnServe(`${dir}/daemon.log`, sock)
+    if (err !== "") {
+      die(`cannot reach the background program: ${err}`)
+    }
+    r = sockAsk(sock, req)
+  }
+  if (r === "") {
+    die("cannot reach the background program")
+  }
+  return r
+}
+
+function printOne(req: string, raw: bool): void throws Error {
+  const line = ask(req)
+  if (raw) {
+    process.stdout.write(`${line}\n`)
+    return
+  }
+  const v: Reply = try JSON.parse(line)
+  if (!v.ok) {
+    die(v.error ?? "error")
+    return
+  }
+  let out = ""
+  for (const h of v.hits ?? []) {
+    out = out + h.path + "\n"
+  }
+  for (const f of v.files ?? []) {
+    for (const m of f.matches) {
+      out = out + `${f.path}:${m.line}: ${m.text.trim()}\n`
+    }
+  }
+  process.stdout.write(out)
+}
+
+function install(login: bool): void throws Error {
+  const h = homeDir()
+  try mkdirSync(`${h}/.local/bin`, { recursive: true })
+  const bin = `${h}/.local/bin/tov-search`
+  const err = copySelf(bin)
+  if (err !== "") {
+    die(`copy: ${err}`)
+  }
+  if (!login) {
+    process.stdout.write(`installed ${bin}; the background program starts on first use\n`)
+    return
+  }
+  const dir = dataDir(h)
+  try mkdirSync(dir, { recursive: true })
+  const logFile = `${dir}/daemon.log`
+  if (process.platform === "darwin") {
+    const plist = `${h}/Library/LaunchAgents/${LABEL}.plist`
+    try writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array><string>${bin}</string><string>serve</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${logFile}</string>
+  <key>StandardErrorPath</key><string>${logFile}</string>
+</dict>
+</plist>
+`)
+    const domain = `gui/${uid()}`
+    runCmd(["launchctl", "bootout", `${domain}/${LABEL}`], true)
+    // bootout returns before the old job is fully gone; bootstrap fails until it is.
+    let ok = false
+    for (let i = 0; i < 50 && !ok; i++) {
+      ok = runCmd(["launchctl", "bootstrap", domain, plist], true) === 0
+      if (!ok) {
+        sleepMs(100)
+      }
+    }
+    if (!ok) {
+      die("launchctl bootstrap failed")
+    }
+    process.stdout.write(`installed ${bin} (LaunchAgent ${LABEL})\n`)
+    return
+  }
+  const unit = unitPath(h)
+  try mkdirSync(unit.slice(0, unit.byteLength - "/tov-search.service".byteLength), { recursive: true })
+  try writeFileSync(unit, `[Unit]
+Description=tov-search background program (whole-disk file search)
+
+[Service]
+ExecStart=${bin} serve
+Restart=always
+# A program started on first use may hold the socket; this one takes over
+# once it is gone.
+RestartSec=10
+StandardOutput=append:${logFile}
+StandardError=append:${logFile}
+
+[Install]
+WantedBy=default.target
+`)
+  const ok = runCmd(["systemctl", "--user", "daemon-reload"], false) === 0 &&
+    runCmd(["systemctl", "--user", "enable", "tov-search.service"], false) === 0 &&
+    runCmd(["systemctl", "--user", "restart", "tov-search.service"], false) === 0
+  if (!ok) {
+    die("systemctl --user failed (is there a user session? see `loginctl enable-linger`)")
+  }
+  process.stdout.write(`installed ${bin} (systemd user service tov-search.service)\n`)
+  process.stdout.write("it runs while you are logged in; to keep it running after logout: loginctl enable-linger\n")
+}
+
+function unitPath(h: string): string {
+  const x = process.env.XDG_CONFIG_HOME ?? ""
+  return `${x.startsWith("/") ? x : `${h}/.config`}/systemd/user/tov-search.service`
+}
+
+function uninstall(): void throws Error {
+  const h = homeDir()
+  if (process.platform === "darwin") {
+    runCmd(["launchctl", "bootout", `gui/${uid()}/${LABEL}`], true)
+    try {
+      unlinkSync(`${h}/Library/LaunchAgents/${LABEL}.plist`)
+    } catch (e) {
+      // not installed
+    }
+    process.stdout.write(`removed LaunchAgent ${LABEL}; index kept in ${dataDir(h)}\n`)
+    return
+  }
+  runCmd(["systemctl", "--user", "disable", "--now", "tov-search.service"], false)
+  try {
+    unlinkSync(unitPath(h))
+  } catch (e) {
+    // not installed
+  }
+  runCmd(["systemctl", "--user", "daemon-reload"], false)
+  process.stdout.write(`removed systemd user service tov-search.service; index kept in ${dataDir(h)}\n`)
+}
+
+export function cli(args: string[]): void throws Error {
+  const a = args.length > 0 ? args[0]! : "-h"
+  if (a === "-h" || a === "--help") {
+    process.stderr.write(USAGE)
+  } else if (a === "serve") {
+    try serve()
+  } else if (a === "status") {
+    try printOne(`{"op":"status"}`, true)
+  } else if (a === "index") {
+    try index(args.length > 1 ? args[1]! : "/", homeDir())
+  } else if (a === "install") {
+    try install(args.indexOf("--login") >= 0)
+  } else if (a === "uninstall") {
+    try uninstall()
+  } else if (a === "content-build" || a === "content-merge") {
+    // The background program's helpers (src/content.tov).
+    process.exit(try contentChild(args))
+  } else {
+    const q = args.filter((x) => x !== "--json")
+    try printOne(`{"q":${try jstr(q.join(" "))}}`, q.length < args.length)
+  }
+}
