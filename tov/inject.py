@@ -141,7 +141,7 @@ def parse_tov(mods, c: str):
     for path, src in mods:
         lines = src.split("\n")
         for i, line in enumerate(lines):
-            fm = re.match(r"(?:export\s+)?function (\w+)\((.*)\):\s*(\w+)\s*(?:throws \w+\s*)?\{", line)
+            fm = re.match(r"(?:export\s+)?function (\w+)\((.*)\):\s*(\w+(?:\[\])*)\s*(?:throws \w+\s*)?\{", line)
             if not fm:
                 continue
             doc, j = [], i - 1

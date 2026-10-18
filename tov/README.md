@@ -52,19 +52,29 @@ lengths as they were.
 
 | path | what it is |
 |---|---|
-| `engine.tov`, `src/*.tov` | the engine: a small entry module plus concern modules, about 3,400 lines of TypeScript |
+| `engine.tov`, `src/*.tov` | the engine: a small entry module plus concern modules, about 9,800 lines of TypeScript. `src/app.tov` is the command line and background program; `src/{cscope,cgrams,segs,segbuild,plan,grep,csearch,content}.tov` are content search |
 | `kernels/simd/` | SIMD prefilter, case-folding substring search, and zero-safe bit scan |
-| `kernels/par/` | multicore prefilter, name scoring, negation marking, folder scores, entry pass |
-| `kernels/io/` | `readLine`: Tov has no stdin |
+| `kernels/par/` | multicore prefilter, name scoring, negation marking, folder scores, entry pass, content gram counting and filling |
+| `kernels/grams.h` | the content gram hashing shared by `gramCount` and `gramFill` |
+| `kernels/io/` | what Tov can't do: stdin, sockets, file watching, mapped files, reading many files at once, regex, background child processes |
 | `kernels/simd.h`, `par.h`, `par.c` | the only CPU- and OS-specific code |
 | `inject.py` | reads the hooks, writes `hooks.h`, wires in kernels and shadow mode |
 | `build.sh`, `check.sh` | the build and the full check |
 | `tools/diff_oracle.py` | compares a raw engine transcript with the oracle |
-| `bugs/` | a 13-line repro of a Tov bug: `switch` on a string frees it too early |
+| `tools/grepcheck.py` | content index and `grep:`/`regex:`/`sym:` answers against the Rust app on a real disk file |
+| `bugs/` | small repros of Tov compiler bugs, each with its workaround |
 
-## Not ported from Rust
+## Content search
 
-- the `re:` and `path:` regex filters (Tov has no regex)
-- live disk updates
+`grep:`, `regex:` and `sym:` work as in the Rust app, on the same index
+format. The background program builds and merges the index in a child
+process (`tov-search content-build`, `content-merge`), so searches are
+answered meanwhile. `tools/grepcheck.py` checks that the index files and the
+answers match the Rust app byte for byte.
 
-Neither is in the benchmark.
+## Differences from Rust
+
+- Regexes run on the system's POSIX regex, so a bad pattern's error text is
+  not Rust's.
+- `read`, the count of files opened by a content search, is exact in Tov. Rust
+  reads a few files ahead in parallel, so its count runs a few higher.

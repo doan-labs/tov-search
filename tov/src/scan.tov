@@ -1,0 +1,166 @@
+// The disk scan: lists every folder under a root and writes the disk file the
+// engine reads (bench/PROTOCOL.md), so the command line and the benchmark
+// share readDisk and build. Tov walks the tree: it decides which folders to
+// enter and lays out the records. The listQueue and listTake raw hooks list
+// the folders on every core meanwhile.
+
+import { KIND_DIR, FLAG_MOUNT } from "./consts"
+import { enc } from "./bytes"
+
+// hook(raw): queues folders to list in the background, one thread per core.
+// req is, per folder, an id (u32), its path's length (u32), then the path.
+function listQueue(req: u8[]): void {
+  return
+}
+
+// hook(raw): every listing done since the last call, waiting for one if none
+// is; "" once no folder is queued or being listed. Per folder: id u32 | path
+// length u32 | path | entry count u32 | entries, each kind u8 | size u64 |
+// mtime u32 | name_len u16 | name (a disk file record without its parent).
+// Kinds carry FLAG_HIDDEN and FLAG_MOUNT (a mount point not to enter). A
+// folder that can't be opened has count 0xFFFFFFFF and no entries.
+function listTake(): string {
+  return ""
+}
+
+let disk: u8[] = []
+
+function put32(v: int): void {
+  disk.push(u8(v & 255))
+  disk.push(u8((v >> 8) & 255))
+  disk.push(u8((v >> 16) & 255))
+  disk.push(u8((v >> 24) & 255))
+}
+
+function set64(at: int, v: int): void {
+  for (let j = 0; j < 8; j++) {
+    disk[at + j] = u8((v >> (8 * j)) & 255)
+  }
+}
+
+function rd32(b: u8[], p: int): int {
+  return int(b[p]!) | (int(b[p + 1]!) << 8) | (int(b[p + 2]!) << 16) | (int(b[p + 3]!) << 24)
+}
+
+// Folders for the next listQueue call.
+let todo: u8[] = []
+
+function queue(path: u8[], rec: int): void {
+  for (let j = 0; j < 4; j++) {
+    todo.push(u8((rec >> (8 * j)) & 255))
+  }
+  for (let j = 0; j < 4; j++) {
+    todo.push(u8((path.length >> (8 * j)) & 255))
+  }
+  for (const c of path) {
+    todo.push(c)
+  }
+}
+
+// One folder's entries, as listTake gives them (kind u8 | size u64 | mtime
+// u32 | name_len u16 | name each), or undefined if it can't be opened.
+export function listOne(path: u8[]): u8[] | undefined {
+  todo = []
+  queue(path, 0)
+  listQueue(todo)
+  todo = []
+  const ans = new TextEncoder().encode(listTake())
+  const at = 8 + path.length
+  if (rd32(ans, at) === 4294967295) {
+    return undefined
+  }
+  return ans.slice(at + 4)
+}
+
+// Whether path is one of skip, or inside one.
+export function blocked(path: u8[], skip: u8[][]): bool {
+  for (const s of skip) {
+    if (path.length < s.length || (path.length > s.length && int(path[s.length]!) !== 47)) {
+      continue
+    }
+    let same = true
+    for (let j = 0; j < s.length; j++) {
+      if (path[j]! !== s[j]!) {
+        same = false
+        break
+      }
+    }
+    if (same) {
+      return true
+    }
+  }
+  return false
+}
+
+// The disk file for everything under root, except the folders in skip (and
+// what's inside them), with now as its clock. Records come in the order
+// folders finish listing; a folder's record always precedes its entries.
+export function scanDisk(r: u8[], skipB: u8[][], now: int): u8[] {
+  disk = enc("FSDISK01")
+  for (let j = 0; j < 8; j++) {
+    disk.push(u8(0)) // record count, set at the end
+  }
+  put32(now)
+  for (let j = 0; j < 19; j++) {
+    disk.push(u8(0)) // the root: parent 0, kind dir (set below), no name
+  }
+  disk[20 + 4] = u8(KIND_DIR)
+  let nrec = 1
+
+  todo = []
+  if (!blocked(r, skipB)) {
+    queue(r, 0)
+  }
+  for (;;) {
+    if (todo.length > 0) {
+      listQueue(todo)
+      todo = []
+    }
+    const ans = new TextEncoder().encode(listTake())
+    if (ans.length === 0) {
+      break
+    }
+    let p = 0
+    while (p < ans.length) {
+      const rec = rd32(ans, p)
+      const pathLen = rd32(ans, p + 4)
+      const pathAt = p + 8
+      const n = rd32(ans, pathAt + pathLen)
+      const count = n === 4294967295 ? 0 : n
+      p = pathAt + pathLen + 4
+      for (let k = 0; k < count; k++) {
+        const nameLen = int(ans[p + 13]!) | (int(ans[p + 14]!) << 8)
+        const at = disk.length
+        put32(rec)
+        for (let j = 0; j < 15 + nameLen; j++) {
+          disk.push(ans[p + j]!)
+        }
+        const kind = int(ans[p]!)
+        if ((kind & 3) === KIND_DIR && (kind & FLAG_MOUNT) === 0) {
+          // Its path: the folder's, "/" unless that is the root, the name.
+          const child: u8[] = []
+          for (let j = 0; j < pathLen; j++) {
+            child.push(ans[pathAt + j]!)
+          }
+          if (!(pathLen === 1 && int(child[0]!) === 47)) {
+            child.push(u8(47))
+          }
+          for (let j = 0; j < nameLen; j++) {
+            child.push(ans[p + 15 + j]!)
+          }
+          if (blocked(child, skipB)) {
+            disk[at + 4] = u8(kind | FLAG_MOUNT)
+          } else {
+            queue(child, nrec)
+          }
+        }
+        nrec += 1
+        p += 15 + nameLen
+      }
+    }
+  }
+  set64(8, nrec)
+  const out = disk
+  disk = []
+  return out
+}

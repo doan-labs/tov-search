@@ -8,10 +8,10 @@ keystroke does in `tov/engine.tov` and the modules in `tov/src/`.
 | Path | Role |
 |---|---|
 | `tov/engine.tov` | Engine entry: raw stdin hook, answer/output, `main`. |
-| `tov/src/*.tov` | The engine, split by concern: consts, bytes, disk, prior, masks, index, rankedindex, query, score, names, exts, memos, negs, topk, entries, ranked, covers, search. Hook bodies define the behavior their C replacements must keep. |
+| `tov/src/*.tov` | The engine, split by concern: consts, bytes, disk, prior, masks, index, rankedindex, query, score, names, exts, memos, negs, topk, entries, ranked, covers, search, plus `app`, `live` and the content modules (see Content index). Hook bodies define the behavior their C replacements must keep. |
 | `tov/kernels/io/readLine.c` | Required raw stdin hook. Flushes stdout; shadow query diagnostics. |
 | `tov/kernels/simd/` | `prefilter.c`, `findFolded.c`, `rfindFolded.c`, `trailingZeros64.c`: vector mask rejection, folded byte search, zero-safe bit scan. |
-| `tov/kernels/par/` | `prefilter.c`, `scoreNamesLoop.c`, `markNegs.c`, `allMemos.c`, `fullPass.c`: parallel replacements. Name scoring is a C port of Tov's scoring helpers. |
+| `tov/kernels/par/` | `prefilter.c`, `scoreNamesLoop.c`, `markNegs.c`, `allMemos.c`, `fullPass.c`, `gramCount.c`, `gramFill.c`: parallel replacements. Name scoring is a C port of Tov's scoring helpers. |
 | `tov/kernels/simd.h`, `par.h`, `par.c` | Shared SIMD operations and pthread pool. CPU/OS-specific kernel code goes here. |
 | `tov/inject.py` | Parses hook contracts, validates generated C, emits typed interfaces and replacement/shadow shims. |
 | `tov/build.sh`, `tov/check.sh` | Compiler pipeline; complete correctness gate. `tov/build/` is generated output. |
@@ -304,6 +304,31 @@ Rust's `>` boundaries. Equality coverage:
 
 Both equality mutant sites remain untested at equality.
 
+## Content index
+
+`grep:`, `regex:` and `sym:` search file contents. Not in the benchmark; the
+Rust app is the reference (`rust/src/content.rs`).
+
+- Format `BFCSEG02`, the Rust app's: each segment is an immutable file in
+  `<data dir>/content/` (4 KiB header, then 13 aligned sections: trigram
+  keys and posting lists, doc table, paths, bloom filters). `.dead` files
+  tombstone docs that changed or went away; `manifest` lists the segments.
+  Either app opens the other's index.
+- Segments are mapped read-only (`mapFile`). `segs.tov` opens them and diffs
+  folders against the docs held; `plan.tov` turns a pattern into a trigram
+  AND/OR; `csearch.tov` picks candidates per segment, drops those the bloom
+  filters rule out, and reads the best-ranked files fresh from disk until
+  enough match. Results never show stale content.
+- Build and merge run in a child process of the background program:
+  `content-build` writes a todo file's batches as new segments
+  (`segbuild.tov`, `gramCount`/`gramFill`), `content-merge` merges eight
+  segments of a size tier into one. The parent adds or swaps segments in
+  the manifest only after the child exits, so searches go on meanwhile.
+- A changed folder is synced once it has been quiet for 2 s, or 5 min after
+  its first change.
+- `tools/grepcheck.py` checks the segment files and the answers against the
+  Rust app byte for byte.
+
 ## Hooks
 
 The `reads:`/`writes:` comments next to each hook are the exact interface.
@@ -320,6 +345,12 @@ Read them before changing a hook.
 | `allMemos` | Directory topology, name hits, `gen`; writes m* tables | Cached tree plan: fold upper dirs first, then independent subtrees of at most 4096 dirs. |
 | `markNegs` | Name masks/bytes, flattened negated tokens; writes `negBits` (one bit per name) | Parallel over 64-name words; a C port of `fitsT()` and `tokenMatches()`. |
 | `fullPass` | Scope bounds, usable names, entry fields, memos, filters, ranking state; writes `kScore[:return]`, `kIdx[:return]` | Generation-cached usable-name bitset; 64 entry slices with local top-k, merge packed score/index keys. |
+| `gramCount` | Content files `gBuf`/`gStart`/`gLen`/`gText`; writes 4 counts per file in `gCnt` (trigram keys, definition keys, short and long bloom words) | Per file in parallel, with the hashing in `grams.h`. |
+| `gramFill` | The same plus `gCnt`, `gAt`; writes `gTri`, `gSym`, `gBloom`, `gLong` at each file's slots | Per file in parallel; emits exactly the counts `gramCount` gave. |
+| `readDocs`, `docsChanged` (raw) | Request of paths (and sizes); per file its bytes, or a changed byte | Every core; regular files only, links not followed. |
+| `mapFile`, `unmapFile` (raw) | A segment file as a read-only `u8[]` | `mmap` behind an immortal array header. `unmapFile` keeps the header page mapped: Tov still reads it after release. |
+| `grepRe`, `grepReNext` (raw) | Compile the content regex; next match at or after an offset | System POSIX regex. |
+| `spawnBg`, `childDone`, `background` (raw) | Start this program as a child with args; its exit status; lower this process's priority | `fork`/`exec`, `waitpid`, `setpriority` (macOS also QoS). |
 
 ## Thread pool
 

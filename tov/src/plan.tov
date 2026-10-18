@@ -1,0 +1,1028 @@
+// Which docs could hold a match: a trigram query (rust/src/content.rs TQ,
+// literal_plan, regex_plan). A literal needs its trigrams; a regex is parsed
+// (as regex-syntax 0.8 parses it, with its simplifications) and what each
+// part says about its matches (exact strings, prefixes, suffixes) becomes an
+// AND/OR of trigrams.
+
+import { fold, eofKey } from "./cgrams"
+import { enc } from "./bytes"
+
+export const TQ_ALL = 0
+export const TQ_TRI = 1
+// Every key p..=p|0xFF: the trigrams starting with a byte pair, plus the
+// pair itself (the end-of-file key).
+export const TQ_PAIR = 2
+export const TQ_AND = 3
+export const TQ_OR = 4
+
+export let tqKind: int[] = []
+export let tqVal: int[] = []
+export let tqSubs: int[][] = []
+
+export function tqReset(): void {
+  tqKind = []
+  tqVal = []
+  tqSubs = []
+}
+
+function tq(kind: int, val: int, subs: int[]): int {
+  tqKind.push(kind)
+  tqVal.push(val)
+  tqSubs.push(subs)
+  return tqKind.length - 1
+}
+
+export function tqAll(): int {
+  return tq(TQ_ALL, 0, [])
+}
+
+export function tqTri(t: int): int {
+  return tq(TQ_TRI, t, [])
+}
+
+function and(a: int, b: int): int {
+  if (tqKind[a]! === TQ_ALL) {
+    return b
+  }
+  if (tqKind[b]! === TQ_ALL) {
+    return a
+  }
+  if (tqKind[a]! === TQ_AND && tqKind[b]! === TQ_AND) {
+    return tq(TQ_AND, 0, tqSubs[a]!.concat(tqSubs[b]!))
+  }
+  if (tqKind[a]! === TQ_AND) {
+    return tq(TQ_AND, 0, tqSubs[a]!.concat([b]))
+  }
+  if (tqKind[b]! === TQ_AND) {
+    return tq(TQ_AND, 0, tqSubs[b]!.concat([a]))
+  }
+  return tq(TQ_AND, 0, [a, b])
+}
+
+// Sorted distinct folded trigrams of a short string.
+function trigramsSmall(s: u8[]): int[] {
+  const t: int[] = []
+  for (let i = 0; i + 3 <= s.length; i++) {
+    t.push((fold(int(s[i]!)) << 16) | (fold(int(s[i + 1]!)) << 8) | fold(int(s[i + 2]!)))
+  }
+  t.sort((a, b) => a - b)
+  const out: int[] = []
+  for (const x of t) {
+    if (out.length === 0 || out[out.length - 1]! !== x) {
+      out.push(x)
+    }
+  }
+  return out
+}
+
+export function literalPlan(s: u8[]): int {
+  if (s.length < 2) {
+    return tqAll()
+  }
+  if (s.length === 2) {
+    return tq(TQ_PAIR, eofKey(int(s[0]!), int(s[1]!)), [])
+  }
+  return tq(TQ_AND, 0, trigramsSmall(s).map((t) => tqTri(t)))
+}
+
+// ------------------------------------------------------------------ sets of strings
+
+const MAX_EXACT = 16
+
+// A small set of (folded) strings, or none (ok false: no small such set).
+type StrSet = { ok: bool, items: u8[][] }
+
+function none(): StrSet {
+  const items: u8[][] = []
+  return { ok: false, items: items }
+}
+
+function bytesLess(a: u8[], b: u8[]): bool {
+  const m = a.length < b.length ? a.length : b.length
+  for (let j = 0; j < m; j++) {
+    if (a[j]! !== b[j]!) {
+      return a[j]! < b[j]!
+    }
+  }
+  return a.length < b.length
+}
+
+function sameBytes(a: u8[], b: u8[]): bool {
+  if (a.length !== b.length) {
+    return false
+  }
+  for (let j = 0; j < a.length; j++) {
+    if (a[j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+function sortDedup(items: u8[][]): u8[][] {
+  let v = items
+  v.sort((a, b) => (bytesLess(a, b) ? -1 : bytesLess(b, a) ? 1 : 0))
+  const out: u8[][] = []
+  for (const x of v) {
+    if (out.length === 0 || !sameBytes(out[out.length - 1]!, x)) {
+      out.push(x)
+    }
+  }
+  return out
+}
+
+function setOf(items: u8[][]): StrSet {
+  return { ok: true, items: sortDedup(items) }
+}
+
+// Every string of a followed by one of b, if that's few enough.
+function cross(a: StrSet, b: StrSet): StrSet {
+  if (!a.ok || !b.ok || a.items.length * b.items.length > MAX_EXACT) {
+    return none()
+  }
+  const out: u8[][] = []
+  for (const x of a.items) {
+    for (const y of b.items) {
+      out.push(x.concat(y))
+    }
+  }
+  return setOf(out)
+}
+
+// What a set of strings requires of a doc: one of them (All when there is no
+// set, it is empty, or a string in it is too short to have a trigram).
+// Trigrams all of them share are required once, not per string.
+function exactQuery(set: StrSet): int {
+  if (!set.ok || set.items.length === 0) {
+    return tqAll()
+  }
+  let all3 = true
+  for (const s of set.items) {
+    if (s.length < 2) {
+      return tqAll()
+    }
+    all3 = all3 && s.length >= 3
+  }
+  if (!all3) {
+    return tq(TQ_OR, 0, set.items.map((s: u8[]) => literalPlan(s)))
+  }
+  const tris = set.items.map((s: u8[]) => trigramsSmall(s))
+  const common: int[] = []
+  for (const t of tris[0]!) {
+    let inAll = true
+    for (const ts of tris) {
+      if (ts.indexOf(t) < 0) {
+        inAll = false
+        break
+      }
+    }
+    if (inAll) {
+      common.push(t)
+    }
+  }
+  const rest: int[] = []
+  let allNonEmpty = true
+  for (const ts of tris) {
+    const mine: int[] = []
+    for (const t of ts) {
+      if (common.indexOf(t) < 0) {
+        mine.push(tqTri(t))
+      }
+    }
+    allNonEmpty = allNonEmpty && mine.length > 0
+    rest.push(tq(TQ_AND, 0, mine))
+  }
+  let q = tq(TQ_AND, 0, common.map((t) => tqTri(t)))
+  if (allNonEmpty) {
+    q = and(q, tq(TQ_OR, 0, rest))
+  }
+  return q
+}
+
+// What a regex fragment tells about its matches: every match is one of
+// exact, starts with one of prefix and ends with one of suffix; and every
+// doc holding a match satisfies q.
+type Info = { exact: StrSet, prefix: StrSet, suffix: StrSet, q: int }
+
+function infoExact(items: u8[][]): Info {
+  const s = setOf(items)
+  return { exact: s, prefix: s, suffix: s, q: tqAll() }
+}
+
+function infoAny(): Info {
+  return { exact: none(), prefix: none(), suffix: none(), q: tqAll() }
+}
+
+function infoQuery(i: Info): int {
+  if (i.exact.ok) {
+    return and(i.q, exactQuery(i.exact))
+  }
+  return and(and(i.q, exactQuery(i.prefix)), exactQuery(i.suffix))
+}
+
+// a then b. A match holds a's suffix right before b's prefix; that pairing
+// is carried up in the prefix or suffix when one side is exact, else
+// required here.
+function concat(a: Info, b: Info): Info {
+  const exact = cross(a.exact, b.exact)
+  const abPrefix = a.exact.ok ? cross(a.exact, b.prefix) : none()
+  const abSuffix = b.exact.ok ? cross(a.suffix, b.exact) : none()
+  let q = and(a.q, b.q)
+  if (!exact.ok && !abPrefix.ok && !abSuffix.ok) {
+    const j = cross(a.suffix, b.prefix)
+    if (j.ok) {
+      q = and(q, exactQuery(j))
+    } else {
+      const sa = !a.exact.ok ? exactQuery(a.suffix) : tqAll()
+      const pb = !b.exact.ok ? exactQuery(b.prefix) : tqAll()
+      q = and(and(q, sa), pb)
+    }
+  }
+  const prefix = a.exact.ok ? (abPrefix.ok ? abPrefix : a.exact) : a.prefix
+  const suffix = b.exact.ok ? (abSuffix.ok ? abSuffix : b.exact) : b.suffix
+  return { exact: exact, prefix: prefix, suffix: suffix, q: q }
+}
+
+// ------------------------------------------------------------------ the regex, parsed
+
+const H_EMPTY = 0
+const H_LIT = 1
+const H_CLASS = 2
+const H_LOOK = 3
+const H_REP = 4
+const H_CAP = 5
+const H_CONCAT = 6
+const H_ALT = 7
+
+// Nodes: kind, literal bytes, class ranges (start, end code points; a class
+// marked big holds a Unicode table too large to matter), repetition bounds
+// (max -1: none), greedy, look kind or capture index, children.
+let hKind: int[] = []
+let hLit: u8[][] = []
+let hRanges: int[][] = []
+let hBig: bool[] = []
+let hMin: int[] = []
+let hMax: int[] = []
+let hFlag: int[] = []
+let hSubs: int[][] = []
+
+function node(kind: int, lit: u8[], ranges: int[], big: bool, mn: int, mx: int, flag: int, subs: int[]): int {
+  hKind.push(kind)
+  hLit.push(lit)
+  hRanges.push(ranges)
+  hBig.push(big)
+  hMin.push(mn)
+  hMax.push(mx)
+  hFlag.push(flag)
+  hSubs.push(subs)
+  return hKind.length - 1
+}
+
+function utf8(c: int): u8[] {
+  if (c < 128) {
+    return [u8(c)]
+  }
+  if (c < 2048) {
+    return [u8(192 | (c >> 6)), u8(128 | (c & 63))]
+  }
+  if (c < 65536) {
+    return [u8(224 | (c >> 12)), u8(128 | ((c >> 6) & 63)), u8(128 | (c & 63))]
+  }
+  return [u8(240 | (c >> 18)), u8(128 | ((c >> 12) & 63)), u8(128 | ((c >> 6) & 63)), u8(128 | (c & 63))]
+}
+
+function lead(c: int): int {
+  return c < 128 ? c : c < 2048 ? 192 | (c >> 6) : c < 65536 ? 224 | (c >> 12) : 240 | (c >> 18)
+}
+
+function lit(bytes: u8[]): int {
+  return node(H_LIT, bytes, [], false, 0, 0, 0, [])
+}
+
+function empty(): int {
+  return node(H_EMPTY, [], [], false, 0, 0, 0, [])
+}
+
+// Sorted, merged ranges.
+function canon(r: int[]): int[] {
+  const ix: int[] = []
+  for (let i = 0; i < r.length; i += 2) {
+    ix.push(i)
+  }
+  ix.sort((a, b) => (r[a]! !== r[b]! ? r[a]! - r[b]! : r[a + 1]! - r[b + 1]!))
+  const out: int[] = []
+  for (const i of ix) {
+    const s = r[i]!
+    const e = r[i + 1]!
+    if (out.length > 0 && s <= out[out.length - 1]! + 1) {
+      if (e > out[out.length - 1]!) {
+        out[out.length - 1] = e
+      }
+    } else {
+      out.push(s)
+      out.push(e)
+    }
+  }
+  return out
+}
+
+// Hir::class: an empty class never matches; a one-char class is a literal.
+function cls(ranges: int[], big: bool): int {
+  const r = canon(ranges)
+  if (!big && r.length === 2 && r[0]! === r[1]!) {
+    return lit(utf8(r[0]!))
+  }
+  return node(H_CLASS, [], r, big, 0, 0, 0, [])
+}
+
+// Hir::concat: nested concats flattened, adjacent literals joined, empties dropped.
+function mkConcat(subs: int[]): int {
+  const out: int[] = []
+  let prior: u8[] = []
+  let has = false
+  const flat: int[] = []
+  for (const s of subs) {
+    if (hKind[s]! === H_CONCAT) {
+      for (const x of hSubs[s]!) {
+        flat.push(x)
+      }
+    } else {
+      flat.push(s)
+    }
+  }
+  for (const s of flat) {
+    if (hKind[s]! === H_LIT) {
+      prior = has ? prior.concat(hLit[s]!) : hLit[s]!
+      has = true
+    } else if (hKind[s]! !== H_EMPTY) {
+      if (has) {
+        out.push(lit(prior))
+        has = false
+      }
+      out.push(s)
+    }
+  }
+  if (has) {
+    out.push(lit(prior))
+  }
+  if (out.length === 0) {
+    return empty()
+  }
+  if (out.length === 1) {
+    return out[0]!
+  }
+  return node(H_CONCAT, [], [], false, 0, 0, 0, out)
+}
+
+// The one char a literal is, or -1.
+function singleChar(b: u8[]): int {
+  if (b.length === 0) {
+    return -1
+  }
+  const x = int(b[0]!)
+  const n = x < 128 ? 1 : x < 224 ? 2 : x < 240 ? 3 : 4
+  if (b.length !== n) {
+    return -1
+  }
+  if (n === 1) {
+    return x
+  }
+  let c = x & (n === 2 ? 31 : n === 3 ? 15 : 7)
+  for (let j = 1; j < n; j++) {
+    c = (c << 6) | (int(b[j]!) & 63)
+  }
+  return c
+}
+
+function sameNode(a: int, b: int): bool {
+  if (hKind[a]! !== hKind[b]! || hMin[a]! !== hMin[b]! || hMax[a]! !== hMax[b]! || hFlag[a]! !== hFlag[b]! ||
+    hBig[a]! !== hBig[b]! || !sameBytes(hLit[a]!, hLit[b]!) || hRanges[a]!.length !== hRanges[b]!.length ||
+    hSubs[a]!.length !== hSubs[b]!.length) {
+    return false
+  }
+  for (let j = 0; j < hRanges[a]!.length; j++) {
+    if (hRanges[a]![j]! !== hRanges[b]![j]!) {
+      return false
+    }
+  }
+  for (let j = 0; j < hSubs[a]!.length; j++) {
+    if (!sameNode(hSubs[a]![j]!, hSubs[b]![j]!)) {
+      return false
+    }
+  }
+  return true
+}
+
+// Hir::alternation: nested ones flattened; alternatives that are all one
+// char, or all classes, become one class; a common prefix of concats is
+// factored out.
+function mkAlt(subs: int[]): int {
+  const flat: int[] = []
+  for (const s of subs) {
+    if (hKind[s]! === H_ALT) {
+      for (const x of hSubs[s]!) {
+        flat.push(x)
+      }
+    } else {
+      flat.push(s)
+    }
+  }
+  if (flat.length === 1) {
+    return flat[0]!
+  }
+  let chars = true
+  let classes = true
+  for (const s of flat) {
+    chars = chars && hKind[s]! === H_LIT && singleChar(hLit[s]!) >= 0
+    classes = classes && hKind[s]! === H_CLASS
+  }
+  if (chars || classes) {
+    let r: int[] = []
+    let big = false
+    for (const s of flat) {
+      if (chars) {
+        const c = singleChar(hLit[s]!)
+        r.push(c)
+        r.push(c)
+      } else {
+        r = r.concat(hRanges[s]!)
+        big = big || hBig[s]!
+      }
+    }
+    return cls(r, big)
+  }
+  let pre = 0
+  let ok = true
+  for (const s of flat) {
+    ok = ok && hKind[s]! === H_CONCAT
+  }
+  if (ok) {
+    pre = hSubs[flat[0]!]!.length
+    for (const s of flat) {
+      let k = 0
+      const xs = hSubs[s]!
+      const fs = hSubs[flat[0]!]!
+      while (k < pre && k < xs.length && sameNode(xs[k]!, fs[k]!)) {
+        k += 1
+      }
+      pre = k
+    }
+  }
+  if (ok && pre > 0) {
+    const head = hSubs[flat[0]!]!.slice(0, pre)
+    const tails: int[] = []
+    for (const s of flat) {
+      tails.push(mkConcat(hSubs[s]!.slice(pre)))
+    }
+    return mkConcat(head.concat([mkAlt(tails)]))
+  }
+  return node(H_ALT, [], [], false, 0, 0, 0, flat)
+}
+
+function mkRep(sub: int, mn: int, mx: int, greedy: bool): int {
+  if (mn === 0 && mx === 0) {
+    return empty()
+  }
+  if (mn === 1 && mx === 1) {
+    return sub
+  }
+  return node(H_REP, [], [], false, mn, mx, greedy ? 1 : 0, [sub])
+}
+
+// ------------------------------------------------------------------ the parser
+
+let pc: int[] = [] // the pattern's code points
+let at = 0
+let bad = false
+let caps = 0
+
+// White_Space, as \s matches it.
+const SPACE = [9, 13, 32, 32, 133, 133, 160, 160, 5760, 5760, 8192, 8202, 8232, 8233, 8239, 8239, 8287, 8287, 12288, 12288]
+
+function peek(k: int): int {
+  return at + k < pc.length ? pc[at + k]! : -1
+}
+
+// \d \D \w \W \s \S as a class.
+function perl(c: int): int {
+  if (c === 115) {
+    return cls(SPACE, false)
+  }
+  return cls([], true)
+}
+
+function isPerl(c: int): bool {
+  return c === 100 || c === 68 || c === 119 || c === 87 || c === 115 || c === 83
+}
+
+function hexVal(c: int): int {
+  return c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1
+}
+
+// After a backslash: the char an escape stands for, or -1 (not a char).
+function escChar(): int {
+  const c = peek(0)
+  at += 1
+  if (c === 110) {
+    return 10
+  }
+  if (c === 116) {
+    return 9
+  }
+  if (c === 114) {
+    return 13
+  }
+  if (c === 102) {
+    return 12
+  }
+  if (c === 118) {
+    return 11
+  }
+  if (c === 97) {
+    return 7
+  }
+  if (c === 101) {
+    return 27
+  }
+  if (c === 120 || c === 117 || c === 85) {
+    let v = 0
+    if (peek(0) === 123) {
+      at += 1
+      let digits = 0
+      while (peek(0) >= 0 && peek(0) !== 125 && hexVal(peek(0)) >= 0) {
+        v = v * 16 + hexVal(peek(0))
+        at += 1
+        digits += 1
+      }
+      if (peek(0) !== 125 || digits === 0) {
+        bad = true
+        return -1
+      }
+      at += 1
+      return v
+    }
+    const n = c === 120 ? 2 : c === 117 ? 4 : 8
+    for (let j = 0; j < n; j++) {
+      if (hexVal(peek(0)) < 0) {
+        bad = true
+        return -1
+      }
+      v = v * 16 + hexVal(peek(0))
+      at += 1
+    }
+    return v
+  }
+  // Any punctuation may be escaped.
+  if (c >= 0 && c < 128 && !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 60 || c === 62)) {
+    return c
+  }
+  bad = true
+  return -1
+}
+
+const POSIX_NAMES = ["alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+  "upper", "word", "xdigit"]
+const POSIX_RANGES: int[][] = [[48, 57, 65, 90, 97, 122], [65, 90, 97, 122], [0, 127], [9, 9, 32, 32], [0, 31, 127, 127],
+  [48, 57], [33, 126], [97, 122], [32, 126], [33, 47, 58, 64, 91, 96, 123, 126], [9, 13, 32, 32], [65, 90],
+  [48, 57, 65, 90, 95, 95, 97, 122], [48, 57, 65, 70, 97, 102]]
+
+// [...] after the "[": ranges, and whether a big table is in it.
+function bracket(): int {
+  let neg = false
+  if (peek(0) === 94) {
+    neg = true
+    at += 1
+  }
+  let r: int[] = []
+  let big = false
+  let first = true
+  for (;;) {
+    const c = peek(0)
+    if (c < 0) {
+      bad = true
+      return empty()
+    }
+    if (c === 93 && !first) {
+      at += 1
+      break
+    }
+    first = false
+    if ((c === 38 && peek(1) === 38) || (c === 45 && peek(1) === 45) || (c === 126 && peek(1) === 126)) {
+      bad = true // set operations: not planned
+      return empty()
+    }
+    if (c === 91 && peek(1) === 58) {
+      const name: u8[] = []
+      let j = at + 2
+      let negp = false
+      if (j < pc.length && pc[j]! === 94) {
+        negp = true
+        j += 1
+      }
+      while (j < pc.length && pc[j]! !== 58) {
+        name.push(u8(pc[j]! & 255))
+        j += 1
+      }
+      let k = -1
+      for (let x = 0; x < POSIX_NAMES.length; x++) {
+        if (sameBytes(enc(POSIX_NAMES[x]!), name)) {
+          k = x
+        }
+      }
+      if (k >= 0 && j + 1 < pc.length && pc[j + 1]! === 93) {
+        at = j + 2
+        if (negp) {
+          big = true
+        } else {
+          r = r.concat(POSIX_RANGES[k]!)
+        }
+        continue
+      }
+    }
+    if (c === 91) {
+      at += 1
+      const inner = bracket()
+      if (bad) {
+        return empty()
+      }
+      if (hKind[inner]! === H_LIT) {
+        const x = singleChar(hLit[inner]!)
+        r.push(x)
+        r.push(x)
+      } else {
+        r = r.concat(hRanges[inner]!)
+        big = big || hBig[inner]!
+      }
+      continue
+    }
+    let lo = c
+    at += 1
+    if (c === 92) {
+      const e = peek(0)
+      if (isPerl(e)) {
+        at += 1
+        if (e === 115) {
+          r = r.concat(SPACE)
+        } else {
+          big = true
+        }
+        continue
+      }
+      if (e === 112 || e === 80) {
+        at += 1
+        if (peek(0) === 123) {
+          while (peek(0) >= 0 && peek(0) !== 125) {
+            at += 1
+          }
+        }
+        at += 1
+        big = true
+        continue
+      }
+      lo = escChar()
+      if (bad) {
+        return empty()
+      }
+    }
+    let hi = lo
+    if (peek(0) === 45 && peek(1) !== 93 && peek(1) >= 0) {
+      at += 1
+      hi = peek(0)
+      at += 1
+      if (hi === 92) {
+        hi = escChar()
+        if (bad) {
+          return empty()
+        }
+      }
+      if (hi < lo) {
+        bad = true
+        return empty()
+      }
+    }
+    r.push(lo)
+    r.push(hi)
+  }
+  if (neg) {
+    if (big) {
+      return cls([], true)
+    }
+    const c = canon(r)
+    const out: int[] = []
+    let next = 0
+    for (let i = 0; i < c.length; i += 2) {
+      if (c[i]! > next) {
+        out.push(next)
+        out.push(c[i]! - 1)
+      }
+      next = c[i + 1]! + 1
+    }
+    if (next <= 1114111) {
+      out.push(next)
+      out.push(1114111)
+    }
+    return cls(out, false)
+  }
+  return cls(r, big)
+}
+
+function parseAlt(depth: int): int {
+  const alts: int[] = [parseConcat(depth)]
+  while (!bad && peek(0) === 124) {
+    at += 1
+    alts.push(parseConcat(depth))
+  }
+  return alts.length === 1 ? alts[0]! : mkAlt(alts)
+}
+
+function parseConcat(depth: int): int {
+  const items: int[] = []
+  while (!bad && peek(0) >= 0 && peek(0) !== 124 && peek(0) !== 41) {
+    let a = atom(depth)
+    if (a < 0) {
+      continue
+    }
+    for (;;) {
+      const q = peek(0)
+      let mn = -1
+      let mx = -1
+      if (q === 42) {
+        mn = 0
+        at += 1
+      } else if (q === 43) {
+        mn = 1
+        at += 1
+      } else if (q === 63) {
+        mn = 0
+        mx = 1
+        at += 1
+      } else if (q === 123) {
+        at += 1
+        let v = 0
+        let digits = 0
+        while (peek(0) >= 48 && peek(0) <= 57) {
+          v = v * 10 + peek(0) - 48
+          at += 1
+          digits += 1
+        }
+        if (digits === 0) {
+          bad = true
+          return empty()
+        }
+        mn = v
+        mx = v
+        if (peek(0) === 44) {
+          at += 1
+          mx = -1
+          let w = 0
+          let d2 = 0
+          while (peek(0) >= 48 && peek(0) <= 57) {
+            w = w * 10 + peek(0) - 48
+            at += 1
+            d2 += 1
+          }
+          if (d2 > 0) {
+            mx = w
+          }
+        }
+        if (peek(0) !== 125 || (mx >= 0 && mx < mn)) {
+          bad = true
+          return empty()
+        }
+        at += 1
+      } else {
+        break
+      }
+      let greedy = true
+      if (peek(0) === 63) {
+        greedy = false
+        at += 1
+      }
+      if (hKind[a]! === H_LOOK) {
+        bad = true // a repeated assertion: not planned
+      }
+      a = mkRep(a, mn, mx, greedy)
+    }
+    items.push(a)
+  }
+  return mkConcat(items)
+}
+
+// One atom, or -1 for a flag group (no node).
+function atom(depth: int): int {
+  const c = peek(0)
+  if (c === 40) {
+    at += 1
+    let capture = true
+    if (peek(0) === 63) {
+      at += 1
+      if (peek(0) === 80 || peek(0) === 60) {
+        if (peek(0) === 80) {
+          at += 1
+        }
+        while (peek(0) >= 0 && peek(0) !== 62) {
+          at += 1
+        }
+        at += 1
+      } else {
+        // Flags: (?flags) for the rest of the group, (?flags:...) scoped.
+        capture = false
+        while (peek(0) >= 0 && peek(0) !== 41 && peek(0) !== 58) {
+          if (peek(0) === 120) {
+            bad = true // verbose mode: not planned
+          }
+          at += 1
+        }
+        if (peek(0) === 41) {
+          at += 1
+          return -1
+        }
+        at += 1
+      }
+    }
+    const index = capture ? caps + 1 : 0
+    if (capture) {
+      caps += 1
+    }
+    const inner = parseAlt(depth + 1)
+    if (peek(0) !== 41) {
+      bad = true
+      return empty()
+    }
+    at += 1
+    return capture ? node(H_CAP, [], [], false, 0, 0, index, [inner]) : inner
+  }
+  at += 1
+  if (c === 91) {
+    return bracket()
+  }
+  if (c === 46) {
+    return cls([0, 9, 11, 1114111], false)
+  }
+  if (c === 94) {
+    return node(H_LOOK, [], [], false, 0, 0, 1, [])
+  }
+  if (c === 36) {
+    return node(H_LOOK, [], [], false, 0, 0, 2, [])
+  }
+  if (c === 42 || c === 43 || c === 63 || c === 123) {
+    bad = true // a repetition of nothing
+    return empty()
+  }
+  if (c === 92) {
+    const e = peek(0)
+    if (isPerl(e)) {
+      at += 1
+      return e === 115 ? perl(e) : cls([], true)
+    }
+    if (e === 98 || e === 66 || e === 65 || e === 122 || e === 60 || e === 62) {
+      at += 1
+      if (e === 98 && peek(0) === 123) {
+        while (peek(0) >= 0 && peek(0) !== 125) {
+          at += 1
+        }
+        at += 1
+      }
+      return node(H_LOOK, [], [], false, 0, 0, e === 65 ? 1 : e === 122 ? 2 : e, [])
+    }
+    if (e === 112 || e === 80) {
+      at += 1
+      if (peek(0) === 123) {
+        while (peek(0) >= 0 && peek(0) !== 125) {
+          at += 1
+        }
+      }
+      at += 1
+      return cls([], true)
+    }
+    const x = escChar()
+    return bad ? empty() : lit(utf8(x))
+  }
+  return lit(utf8(c))
+}
+
+// ------------------------------------------------------------------ Info
+
+// Up to 8 members are each an exact string; with more, their first bytes,
+// if few, start it.
+function classInfo(h: int): Info {
+  if (hBig[h]!) {
+    return infoAny()
+  }
+  const r = hRanges[h]!
+  const set: u8[][] = []
+  for (let i = 0; i < r.length && set.length < 9; i += 2) {
+    for (let c = r[i]!; c <= r[i + 1]! && set.length < 9; c++) {
+      if (c >= 55296 && c <= 57343) {
+        continue
+      }
+      set.push(utf8(c).map((b) => u8(fold(int(b)))))
+    }
+  }
+  if (set.length <= 8) {
+    return infoExact(set)
+  }
+  const first: int[] = []
+  for (let i = 0; i < r.length; i += 2) {
+    for (let b = lead(r[i]!); b <= lead(r[i + 1]!); b++) {
+      const f = fold(b)
+      if (first.indexOf(f) < 0) {
+        first.push(f)
+      }
+    }
+  }
+  if (first.length > MAX_EXACT) {
+    return infoAny()
+  }
+  return { exact: none(), prefix: setOf(first.map((b) => [u8(b)])), suffix: none(), q: tqAll() }
+}
+
+function union(parts: Info[], which: int): StrSet {
+  const out: u8[][] = []
+  for (const p of parts) {
+    const s = which === 0 ? p.exact : which === 1 ? p.prefix : p.suffix
+    if (!s.ok) {
+      return none()
+    }
+    for (const x of s.items) {
+      out.push(x)
+    }
+  }
+  const set = setOf(out)
+  return set.items.length <= MAX_EXACT ? set : none()
+}
+
+function info(h: int): Info {
+  const k = hKind[h]!
+  if (k === H_EMPTY || k === H_LOOK) {
+    return infoExact([[]])
+  }
+  if (k === H_LIT) {
+    return infoExact([hLit[h]!.map((b) => u8(fold(int(b))))])
+  }
+  if (k === H_CLASS) {
+    return classInfo(h)
+  }
+  if (k === H_CAP) {
+    return info(hSubs[h]![0]!)
+  }
+  if (k === H_REP) {
+    if (hMin[h]! === 0) {
+      return infoAny()
+    }
+    const i = info(hSubs[h]![0]!)
+    // At least one copy, which starts it; one ends it.
+    return { exact: none(), prefix: i.prefix, suffix: i.suffix, q: and(i.q, exactQuery(i.exact)) }
+  }
+  if (k === H_CONCAT) {
+    let acc = infoExact([[]])
+    for (const s of hSubs[h]!) {
+      acc = concat(acc, info(s))
+    }
+    return acc
+  }
+  const parts = hSubs[h]!.map((s) => info(s))
+  const exact = union(parts, 0)
+  const prefix = union(parts, 1)
+  const suffix = union(parts, 2)
+  if (exact.ok) {
+    return { exact: exact, prefix: prefix, suffix: suffix, q: tqAll() }
+  }
+  const ors: int[] = []
+  let anyAll = false
+  for (const p of parts) {
+    const q = infoQuery(p)
+    anyAll = anyAll || tqKind[q]! === TQ_ALL
+    ors.push(q)
+  }
+  return { exact: exact, prefix: prefix, suffix: suffix, q: anyAll ? tqAll() : tq(TQ_OR, 0, ors) }
+}
+
+// The trigram query of a regex; every doc when it can't be parsed.
+export function regexPlan(pattern: string): int {
+  pc = []
+  const b = enc(pattern)
+  let i = 0
+  while (i < b.length) {
+    const x = int(b[i]!)
+    const n = x < 128 ? 1 : x < 224 ? 2 : x < 240 ? 3 : 4
+    pc.push(singleChar(b.slice(i, i + n < b.length ? i + n : b.length)))
+    i += n
+  }
+  at = 0
+  bad = false
+  caps = 0
+  hKind = []
+  hLit = []
+  hRanges = []
+  hBig = []
+  hMin = []
+  hMax = []
+  hFlag = []
+  hSubs = []
+  const h = parseAlt(0)
+  if (bad || at < pc.length) {
+    return tqAll()
+  }
+  return infoQuery(info(h))
+}

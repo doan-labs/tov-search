@@ -1,0 +1,724 @@
+// The content index's segments, ported from rust/src/content.rs (Segment,
+// Content). A segment is an immutable file, mapped read-only: a doc table
+// (paths, sizes, mtimes, ranks, bloom filters) and per trigram the docs
+// holding it. Docs that changed or went away are tombstoned in a .dead file
+// next to it; a manifest lists the segments in order. The file format is the
+// Rust app's, so the two read each other's index.
+
+import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
+import { enc, zerosU64 } from "./bytes"
+import { NOT_TEXT } from "./cscope"
+import { mapFile, unmapFile, writeFile, docsChanged } from "./io"
+
+export const MAGIC = "BFCSEG02"
+export const HDR = 4096
+// A posting list's offset with this bit set: the list is a bitset over the
+// segment's docs (cheaper than varints once more than 1 in 8 docs hold it).
+export const BITSET = 2147483648
+// Largest merge, in posting bytes.
+const MERGE_CAP = 100663296
+
+// Sections, in file order.
+export const S_TRI_KEY = 0
+export const S_TRI_OFF = 1
+export const S_POST = 2
+export const S_PATH_OFF = 3
+export const S_PATHS = 4
+export const S_SIZE = 5
+export const S_MTIME = 6
+export const S_BY_PATH = 7
+export const S_RANK = 8
+export const S_BLOOM_OFF = 9
+export const S_BLOOM = 10
+export const S_LONG_OFF = 11
+export const S_LONG = 12
+
+export function sectionLens(ndocs: int, ntri: int, plen: int, pathsLen: int, blooms: int, longs: int): int[] {
+  const n1 = (ndocs + 1) * 4
+  return [ntri * 4, (ntri + 1) * 4, plen, n1, pathsLen, ndocs * 8, ndocs * 4, ndocs * 4, ndocs, n1, blooms * 8, n1, longs * 8]
+}
+
+// Section offsets for these lengths (each 64-byte aligned after a 4 KiB
+// header), then the file size.
+export function layout(lens: int[]): int[] {
+  const off: int[] = []
+  let at = HDR
+  for (const l of lens) {
+    off.push(at)
+    at = (at + l + 63) & ~63
+  }
+  off.push(at)
+  return off
+}
+
+export function segPath(dir: string, id: int): string {
+  return `${dir}/seg-${`${id}`.padStart(6, "0")}.fsc`
+}
+
+function deadPath(dir: string, id: int): string {
+  return `${dir}/seg-${`${id}`.padStart(6, "0")}.dead`
+}
+
+export function r32(m: u8[], p: int): int {
+  return int(m[p]!) | (int(m[p + 1]!) << 8) | (int(m[p + 2]!) << 16) | (int(m[p + 3]!) << 24)
+}
+
+export function r64(m: u8[], p: int): int {
+  return r32(m, p) | (r32(m, p + 4) << 32)
+}
+
+// ------------------------------------------------------------------ the open segments
+
+export let cDir = ""
+export let segId: int[] = []
+export let segMap: u8[][] = []
+export let segN: int[] = []
+export let segNtri: int[] = []
+export let segPlen: int[] = []
+export let segOff: int[][] = []
+export let segLiveDocs: int[] = []
+// Tombstones, 64 docs a word: segment s's start at deadAt[s].
+export let deadW: u64[] = []
+export let deadAt: int[] = []
+// Built on a segment's first dense search: its docs best-ranked first, and
+// its live text docs as a bitset ([] until then; the bitset is dropped on a
+// tombstone).
+export let segByRank: u32[][] = []
+export let segLiveText: u64[][] = []
+let nextId = 1
+
+export function triKey(s: int, k: int): int {
+  return r32(segMap[s]!, segOff[s]![S_TRI_KEY]! + 4 * k)
+}
+
+export function triOff(s: int, k: int): int {
+  return r32(segMap[s]!, segOff[s]![S_TRI_OFF]! + 4 * k)
+}
+
+export function postAt(s: int): int {
+  return segOff[s]![S_POST]!
+}
+
+export function docSize(s: int, d: int): int {
+  return r64(segMap[s]!, segOff[s]![S_SIZE]! + 8 * d)
+}
+
+export function docMtime(s: int, d: int): int {
+  return r32(segMap[s]!, segOff[s]![S_MTIME]! + 4 * d)
+}
+
+export function docRankOf(s: int, d: int): int {
+  const r = int(segMap[s]![segOff[s]![S_RANK]! + d]!)
+  return r >= 128 ? r - 256 : r
+}
+
+export function byPath(s: int, i: int): int {
+  return r32(segMap[s]!, segOff[s]![S_BY_PATH]! + 4 * i)
+}
+
+function pathStart(s: int, d: int): int {
+  return segOff[s]![S_PATHS]! + r32(segMap[s]!, segOff[s]![S_PATH_OFF]! + 4 * d)
+}
+
+function pathEnd(s: int, d: int): int {
+  return segOff[s]![S_PATHS]! + r32(segMap[s]!, segOff[s]![S_PATH_OFF]! + 4 * d + 4)
+}
+
+export function docPath(s: int, d: int): u8[] {
+  return segMap[s]!.slice(pathStart(s, d), pathEnd(s, d))
+}
+
+// Bloom words of doc d: [start, end) word indices.
+export function bloomRange(s: int, d: int, long: bool): int[] {
+  const o = segOff[s]![long ? S_LONG_OFF : S_BLOOM_OFF]!
+  const m = segMap[s]!
+  return [r32(m, o + 4 * d), r32(m, o + 4 * d + 4)]
+}
+
+export function bloomWord(s: int, w: int, long: bool): u64 {
+  const m = segMap[s]!
+  const at = segOff[s]![long ? S_LONG : S_BLOOM]! + 8 * w
+  let x = u64(0)
+  for (let j = 7; j >= 0; j--) {
+    x = (x << u64(8)) | u64(int(m[at + j]!))
+  }
+  return x
+}
+
+// Doc d's path compared with b: -1, 0 or 1.
+export function pathCmp(s: int, d: int, b: u8[]): int {
+  const m = segMap[s]!
+  const a0 = pathStart(s, d)
+  const n = pathEnd(s, d) - a0
+  const k = n < b.length ? n : b.length
+  for (let j = 0; j < k; j++) {
+    const x = int(m[a0 + j]!)
+    const y = int(b[j]!)
+    if (x !== y) {
+      return x < y ? -1 : 1
+    }
+  }
+  return n < b.length ? -1 : n > b.length ? 1 : 0
+}
+
+export function pathStarts(s: int, d: int, prefix: u8[]): bool {
+  const m = segMap[s]!
+  const a0 = pathStart(s, d)
+  if (pathEnd(s, d) - a0 < prefix.length) {
+    return false
+  }
+  for (let j = 0; j < prefix.length; j++) {
+    if (m[a0 + j]! !== prefix[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+export function isDeadDoc(s: int, d: int): bool {
+  return ((deadW[deadAt[s]! + (d >> 6)]! >> u64(d & 63)) & u64(1)) !== u64(0)
+}
+
+function kill(s: int, d: int): bool {
+  if (isDeadDoc(s, d)) {
+    return false
+  }
+  const w = deadAt[s]! + (d >> 6)
+  deadW[w] = deadW[w]! | (u64(1) << u64(d & 63))
+  const none: u64[] = []
+  segLiveText[s] = none
+  segLiveDocs[s] = segLiveDocs[s]! - 1
+  return true
+}
+
+function popcount(x: u64): int {
+  let c = 0
+  let v = x
+  while (v !== u64(0)) {
+    v = v & (v - u64(1))
+    c += 1
+  }
+  return c
+}
+
+// Maps segment id and appends it; false if it isn't a whole segment of
+// this format (then it isn't used, and an owner deletes it).
+function load(id: int): bool {
+  const m = mapFile(segPath(cDir, id))
+  const magic = enc(MAGIC)
+  let ok = m.length >= HDR
+  for (let j = 0; j < 8 && ok; j++) {
+    ok = m[j]! === magic[j]!
+  }
+  if (!ok) {
+    unmapFile(m)
+    return false
+  }
+  const ndocs = r64(m, 8)
+  const ntri = r64(m, 16)
+  const plen = r64(m, 24)
+  const off = layout(sectionLens(ndocs, ntri, plen, r64(m, 32), r64(m, 40), r64(m, 48)))
+  if (m.length < off[13]!) {
+    unmapFile(m)
+    return false
+  }
+  const words = (ndocs + 63) >> 6
+  const at = deadW.length
+  let dead = 0
+  let b: u8[] = []
+  try {
+    b = new TextEncoder().encode(readFileSync(deadPath(cDir, id)))
+  } catch (e) {
+    // no tombstones yet
+  }
+  for (let w = 0; w < words; w++) {
+    let x = u64(0)
+    if (8 * w + 8 <= b.length) {
+      for (let j = 7; j >= 0; j--) {
+        x = (x << u64(8)) | u64(int(b[8 * w + j]!))
+      }
+    }
+    deadW.push(x)
+    dead += popcount(x)
+  }
+  deadAt.push(at)
+  segId.push(id)
+  segMap.push(m)
+  segN.push(ndocs)
+  segNtri.push(ntri)
+  segPlen.push(plen)
+  segOff.push(off)
+  segLiveDocs.push(ndocs - dead)
+  const noRank: u32[] = []
+  const noText: u64[] = []
+  segByRank.push(noRank)
+  segLiveText.push(noText)
+  if (id >= nextId) {
+    nextId = id + 1
+  }
+  return true
+}
+
+function saveDead(s: int): void {
+  const out: u8[] = []
+  const a = deadAt[s]!
+  for (let w = 0; w < (segN[s]! + 63) >> 6; w++) {
+    const x = deadW[a + w]!
+    for (let j = 0; j < 8; j++) {
+      out.push(u8(int((x >> u64(8 * j)) & u64(255))))
+    }
+  }
+  writeFile(deadPath(cDir, segId[s]!), out)
+}
+
+function saveManifest(): void {
+  let s = ""
+  for (const id of segId) {
+    s = s + `${id}\n`
+  }
+  writeFile(`${cDir}/manifest`, enc(s))
+}
+
+function closeAll(): void {
+  for (const m of segMap) {
+    unmapFile(m)
+  }
+  segId = []
+  segMap = []
+  segN = []
+  segNtri = []
+  segPlen = []
+  segOff = []
+  segLiveDocs = []
+  deadW = []
+  deadAt = []
+  segByRank = []
+  segLiveText = []
+  nextId = 1
+}
+
+// Opens the segments dir's manifest lists. As the owner, also deletes the
+// segment files it doesn't list (an old format, a build that crashed).
+export function contentOpen(dir: string, owner: bool): void {
+  closeAll()
+  cDir = dir
+  if (owner) {
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch (e) {
+      // reported when a segment can't be written
+    }
+  }
+  let man = ""
+  try {
+    man = readFileSync(`${dir}/manifest`)
+  } catch (e) {
+    // a new index
+  }
+  for (const w of man.split("\n")) {
+    const id = parseInt(w.trim())
+    if (id !== undefined && w.trim() !== "") {
+      load(id)
+    }
+  }
+  if (!owner) {
+    return
+  }
+  const keep: string[] = []
+  for (const id of segId) {
+    keep.push(segPath(dir, id).slice(dir.byteLength + 1))
+    keep.push(deadPath(dir, id).slice(dir.byteLength + 1))
+  }
+  try {
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith("seg-") && keep.indexOf(name) < 0) {
+        unlinkSync(`${dir}/${name}`)
+      }
+    }
+  } catch (e) {
+    // nothing to tidy
+  }
+}
+
+export function contentDocs(): int {
+  let n = 0
+  for (const x of segLiveDocs) {
+    n += x
+  }
+  return n
+}
+
+export function contentBytes(): int {
+  let n = 0
+  for (const m of segMap) {
+    n += m.length
+  }
+  return n
+}
+
+export function allocId(): int {
+  nextId += 1
+  return nextId - 1
+}
+
+// Adds segment id (just written) to the end of the manifest.
+export function pushSeg(id: int): void {
+  if (load(id)) {
+    saveManifest()
+  }
+}
+
+// Swaps the merged segments ids for segment id. Nothing was tombstoned
+// while the merge ran: tombstones are only written between merges.
+export function replaceSegs(ids: int[], id: int): void {
+  const keep: int[] = []
+  for (const x of segId) {
+    if (ids.indexOf(x) < 0) {
+      keep.push(x)
+    }
+  }
+  for (const x of ids) {
+    try {
+      unlinkSync(segPath(cDir, x))
+    } catch (e) {
+      // already gone
+    }
+    try {
+      unlinkSync(deadPath(cDir, x))
+    } catch (e) {
+      // never had tombstones
+    }
+  }
+  const dir = cDir
+  closeAll()
+  cDir = dir
+  for (const x of keep) {
+    load(x)
+  }
+  load(id)
+  if (id >= nextId) {
+    nextId = id + 1
+  }
+  saveManifest()
+}
+
+// Index of segment id among the open ones, or -1.
+export function segIndex(id: int): int {
+  return segId.indexOf(id)
+}
+
+// Tiered merging: 8 segments of the same size tier (log 4 of their posting
+// bytes) become one, so updates never pile up thousands of tiny segments.
+// The group to merge (ids), capped so a merge stays small; [] if none.
+export function mergePlan(): int[] {
+  const tierOf: int[] = []
+  for (const p of segPlen) {
+    // (Not a ternary in the call: tov/bugs/ternary-int-to-f64.tov.)
+    let x = 1
+    if (p > 1) {
+      x = p
+    }
+    tierOf.push(Math.trunc(Math.log(x) / Math.log(4)))
+  }
+  const tiers: int[] = []
+  for (const t of tierOf) {
+    if (tiers.indexOf(t) < 0) {
+      tiers.push(t)
+    }
+  }
+  tiers.sort((a, b) => a - b)
+  for (const t of tiers) {
+    const group: int[] = []
+    let bytes = 0
+    let count = 0
+    for (let s = 0; s < segId.length; s++) {
+      if (tierOf[s]! === t) {
+        count += 1
+        if (group.length < 8) {
+          group.push(segId[s]!)
+          bytes += segPlen[s]!
+        }
+      }
+    }
+    if (count >= 8 && bytes <= MERGE_CAP) {
+      return group
+    }
+  }
+  return []
+}
+
+// ------------------------------------------------------------------ docs to index
+
+// Paths with size and mtime.
+export type Docs = { paths: u8[][], sizes: int[], mtimes: int[] }
+
+export function noDocs(): Docs {
+  return { paths: [], sizes: [], mtimes: [] }
+}
+
+export function pathLess(a: u8[], b: u8[]): bool {
+  const m = a.length < b.length ? a.length : b.length
+  for (let j = 0; j < m; j++) {
+    if (a[j]! !== b[j]!) {
+      return a[j]! < b[j]!
+    }
+  }
+  return a.length < b.length
+}
+
+function sameBytes(a: u8[], b: u8[]): bool {
+  if (a.length !== b.length) {
+    return false
+  }
+  for (let j = 0; j < a.length; j++) {
+    if (a[j]! !== b[j]!) {
+      return false
+    }
+  }
+  return true
+}
+
+// Sorted by path, the first of equal paths kept.
+export function sortDocs(x: Docs): Docs {
+  const ix: int[] = []
+  for (let i = 0; i < x.paths.length; i++) {
+    ix.push(i)
+  }
+  ix.sort((a, b) => (pathLess(x.paths[a]!, x.paths[b]!) ? -1 : pathLess(x.paths[b]!, x.paths[a]!) ? 1 : 0))
+  const out = noDocs()
+  for (const i of ix) {
+    if (out.paths.length > 0 && sameBytes(out.paths[out.paths.length - 1]!, x.paths[i]!)) {
+      continue
+    }
+    out.paths.push(x.paths[i]!)
+    out.sizes.push(x.sizes[i]!)
+    out.mtimes.push(x.mtimes[i]!)
+  }
+  return out
+}
+
+function findDoc(x: Docs, p: u8[]): int {
+  let lo = 0
+  let hi = x.paths.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (pathLess(x.paths[mid]!, p)) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return lo < x.paths.length && sameBytes(x.paths[lo]!, p) ? lo : -1
+}
+
+// First position in segment s's path order whose path is not below b.
+function lowerBound(s: int, b: u8[], from: int): int {
+  let lo = from
+  let hi = segN[s]!
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (pathCmp(s, byPath(s, mid), b) < 0) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  return lo
+}
+
+// Live docs whose path starts with prefix.
+function withPrefix(s: int, prefix: u8[]): int[] {
+  const out: int[] = []
+  for (let i = lowerBound(s, prefix, 0); i < segN[s]!; i++) {
+    const d = byPath(s, i)
+    if (!pathStarts(s, d, prefix)) {
+      break
+    }
+    if (!isDeadDoc(s, d)) {
+      out.push(d)
+    }
+  }
+  return out
+}
+
+// Live docs directly inside prefix (which ends in '/'), skipping each
+// subfolder's run of paths with one binary search.
+function directChildren(s: int, prefix: u8[]): int[] {
+  const out: int[] = []
+  let i = lowerBound(s, prefix, 0)
+  while (i < segN[s]!) {
+    const d = byPath(s, i)
+    if (!pathStarts(s, d, prefix)) {
+      break
+    }
+    const p = docPath(s, d)
+    let k = -1
+    for (let j = prefix.length; j < p.length; j++) {
+      if (int(p[j]!) === 47) {
+        k = j
+        break
+      }
+    }
+    if (k < 0) {
+      if (!isDeadDoc(s, d)) {
+        out.push(d)
+      }
+      i += 1
+    } else {
+      // Past "prefix/sub/...": the first path >= "prefix/sub0".
+      const hi = p.slice(0, k + 1)
+      hi[k] = u8(48)
+      i = lowerBound(s, hi, i)
+    }
+  }
+  return out
+}
+
+export type Want = { dir: u8[], recursive: bool, docs: Docs }
+
+// Diffs what the name index wants indexed (per folder, or subtree) against
+// the docs held: tombstones what changed or went away, and returns what
+// needs indexing, sorted by path.
+export function diff(wants: Want[]): Docs {
+  let todo = noDocs()
+  const touched: bool[] = []
+  for (let s = 0; s < segId.length; s++) {
+    touched.push(false)
+  }
+  for (const w of wants) {
+    const held: bool[] = []
+    for (let i = 0; i < w.docs.paths.length; i++) {
+      held.push(false)
+    }
+    const lo = w.dir.slice(0)
+    if (!(lo.length === 1 && int(lo[0]!) === 47)) {
+      lo.push(u8(47))
+    }
+    for (let s = 0; s < segId.length; s++) {
+      const ids = w.recursive ? withPrefix(s, lo) : directChildren(s, lo)
+      for (const d of ids) {
+        const i = findDoc(w.docs, docPath(s, d))
+        if (i >= 0 && w.docs.sizes[i]! === docSize(s, d) && w.docs.mtimes[i]! === docMtime(s, d)) {
+          held[i] = true
+        } else if (kill(s, d)) {
+          touched[s] = true
+        }
+      }
+    }
+    for (let i = 0; i < held.length; i++) {
+      if (!held[i]!) {
+        todo.paths.push(w.docs.paths[i]!)
+        todo.sizes.push(w.docs.sizes[i]!)
+        todo.mtimes.push(w.docs.mtimes[i]!)
+      }
+    }
+  }
+  for (let s = 0; s < segId.length; s++) {
+    if (touched[s]!) {
+      saveDead(s)
+    }
+  }
+  return sortDocs(todo)
+}
+
+// Folders holding an indexed file that changed or went away since `since`:
+// an edit in place leaves its folder's mtime alone, so lost file events are
+// recovered for the content index by an lstat per indexed file.
+export function changedDirs(since: int): u8[][] {
+  let req: u8[] = []
+  const paths: u8[][] = []
+  for (let s = 0; s < segId.length; s++) {
+    for (let d = 0; d < segN[s]!; d++) {
+      if (isDeadDoc(s, d)) {
+        continue
+      }
+      const p = docPath(s, d)
+      paths.push(p)
+      for (let j = 0; j < 4; j++) {
+        req.push(u8((p.length >> (8 * j)) & 255))
+      }
+      pushBytes(&req, p)
+      const size = docSize(s, d)
+      for (let j = 0; j < 8; j++) {
+        req.push(u8((size >> (8 * j)) & 255))
+      }
+    }
+  }
+  const hit = new TextEncoder().encode(docsChanged(req, since))
+  const dirs: u8[][] = []
+  for (let i = 0; i < paths.length; i++) {
+    if (int(hit[i]!) === 1) {
+      const p = paths[i]!
+      let cut = 0
+      for (let j = p.length - 1; j >= 0; j--) {
+        if (int(p[j]!) === 47) {
+          cut = j
+          break
+        }
+      }
+      dirs.push(p.slice(0, cut > 1 ? cut : 1))
+    }
+  }
+  const x = sortDocs({ paths: dirs, sizes: dirs.map((p) => 0), mtimes: dirs.map((p) => 0) })
+  return x.paths
+}
+
+// (A helper: pushed in the loop above, the bytes would overflow the array,
+// tov/bugs/push-reserve-overflow.tov.)
+export function pushBytes(inout out: u8[], b: u8[]): void {
+  for (const c of b) {
+    out.push(c)
+  }
+}
+
+// Doc ids best-ranked first (by rank tier, then newest), ties by id.
+export function byRank(s: int): u32[] {
+  if (segByRank[s]!.length === segN[s]! || segN[s]! === 0) {
+    return segByRank[s]!
+  }
+  const n = segN[s]!
+  const keys: int[] = []
+  for (let d = 0; d < n; d++) {
+    keys.push(rankKey(docRankOf(s, d), docMtime(s, d)))
+  }
+  const ix: int[] = []
+  for (let d = 0; d < n; d++) {
+    ix.push(d)
+  }
+  ix.sort((a, b) => (keys[a]! < keys[b]! ? -1 : keys[a]! > keys[b]! ? 1 : a - b))
+  const out: u32[] = []
+  for (const d of ix) {
+    out.push(u32(d))
+  }
+  segByRank[s] = out
+  return out
+}
+
+// Live docs holding indexable text, as a bitset.
+export function liveText(s: int): u64[] {
+  const n = segN[s]!
+  const words = (n + 63) >> 6
+  if (segLiveText[s]!.length === words) {
+    return segLiveText[s]!
+  }
+  const bits = zerosU64(words)
+  for (let w = 0; w < words; w++) {
+    bits[w] = ~deadW[deadAt[s]! + w]!
+  }
+  for (let d = 0; d < n; d++) {
+    if (docRankOf(s, d) === NOT_TEXT) {
+      bits[d >> 6] = bits[d >> 6]! & ~(u64(1) << u64(d & 63))
+    }
+  }
+  if (n % 64 !== 0) {
+    bits[words - 1] = bits[words - 1]! & ((u64(1) << u64(n % 64)) - u64(1))
+  }
+  segLiveText[s] = bits
+  return bits
+}
+
+// A candidate's place in the ranking, so sorting compares ints: your files
+// before dot-folders and logs, then the most recently modified first.
+export function rankKey(rank: int, mtime: int): int {
+  return ((127 - rank) << 32) | (4294967295 - mtime)
+}

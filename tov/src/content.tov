@@ -1,0 +1,118 @@
+// Keeping the content index in sync (rust/src/engine.rs content_loop): the
+// folders and subtrees that changed are diffed against the docs held, what
+// changed is tombstoned, the files to index are built into new segments,
+// and segments of a size tier are merged eight at a time.
+//
+// The background program does the building and merging in a child process
+// (`tov-search content-build` and `content-merge`, below), so searches keep
+// being answered meanwhile; the checks do it all in-process (syncNow).
+
+import { readFileSync } from "node:fs"
+import { Docs, noDocs, cDir, diff, allocId, pushSeg, mergePlan, segIndex, replaceSegs, contentOpen } from "./segs"
+import { batches, buildSegment, mergeSegs } from "./segbuild"
+import { wants } from "./live"
+import { writeFile, background } from "./io"
+
+// Merges size tiers of eight until none is left. Stops at a merge that
+// writes nothing.
+export function mergeAll(): void {
+  for (;;) {
+    const ids = mergePlan()
+    if (ids.length === 0) {
+      return
+    }
+    const id = allocId()
+    if (!mergeSegs(cDir, id, ids.map((x) => segIndex(x)))) {
+      return
+    }
+    replaceSegs(ids, id)
+  }
+}
+
+// Brings the content index in line with these folders (their files) and
+// subtrees, in-process. Returns how many files were indexed.
+export function syncNow(home: u8[], dirs: u8[][], trees: u8[][]): int {
+  const todo = diff(wants(home, dirs, trees))
+  const b = batches(todo)
+  for (let i = 0; i + 1 < b.length; i++) {
+    const id = allocId()
+    if (buildSegment(cDir, id, todo, b[i]!, b[i + 1]!)) {
+      pushSeg(id)
+    }
+  }
+  mergeAll()
+  return todo.paths.length
+}
+
+// ------------------------------------------------------------------ the child processes
+
+function put(inout out: u8[], v: int, bytes: int): void {
+  for (let j = 0; j < bytes; j++) {
+    out.push(u8((v >> (8 * j)) & 255))
+  }
+}
+
+function pushAll(inout out: u8[], b: u8[]): void {
+  for (const c of b) {
+    out.push(c)
+  }
+}
+
+function rd(b: u8[], p: int, bytes: int): int {
+  let v = 0
+  for (let j = bytes - 1; j >= 0; j--) {
+    v = (v << 8) | int(b[p + j]!)
+  }
+  return v
+}
+
+// Writes files to index (path length u32 | path | size u64 | mtime u32
+// each) for content-build. Returns "" or the error.
+export function writeTodo(path: string, todo: Docs): string {
+  let out: u8[] = []
+  for (let i = 0; i < todo.paths.length; i++) {
+    const p = todo.paths[i]!
+    put(&out, p.length, 4)
+    pushAll(&out, p)
+    put(&out, todo.sizes[i]!, 8)
+    put(&out, todo.mtimes[i]!, 4)
+  }
+  return writeFile(path, out)
+}
+
+function readTodo(path: string): Docs throws Error {
+  const b = new TextEncoder().encode(try readFileSync(path))
+  const todo = noDocs()
+  let p = 0
+  while (p + 4 <= b.length) {
+    const l = rd(b, p, 4)
+    todo.paths.push(b.slice(p + 4, p + 4 + l))
+    todo.sizes.push(rd(b, p + 4 + l, 8))
+    todo.mtimes.push(rd(b, p + 12 + l, 4))
+    p += 16 + l
+  }
+  return todo
+}
+
+// `content-build <dir> <todo file> <first id>`: builds the files in batches,
+// segment ids from first id on. `content-merge <dir> <id> <ids...>`: merges
+// segments ids into segment id; exits 1 if it wrote nothing.
+export function contentChild(args: string[]): int throws Error {
+  background()
+  const dir = args[1]!
+  if (args[0] === "content-build") {
+    const todo = try readTodo(args[2]!)
+    const first = parseInt(args[3]!) ?? 0
+    const b = batches(todo)
+    for (let i = 0; i + 1 < b.length; i++) {
+      buildSegment(dir, first + i, todo, b[i]!, b[i + 1]!)
+    }
+    return 0
+  }
+  contentOpen(dir, false)
+  const ids: int[] = []
+  for (let i = 3; i < args.length; i++) {
+    ids.push(parseInt(args[i]!) ?? 0)
+  }
+  return mergeSegs(dir, parseInt(args[2]!) ?? 0, ids.map((x) => segIndex(x))) ? 0 : 1
+}

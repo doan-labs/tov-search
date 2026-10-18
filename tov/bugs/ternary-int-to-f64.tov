@@ -1,0 +1,10 @@
+// An int ternary passed where an f64 is expected: the build stops with
+// "internal compiler error: no conversion from `int | f64` to `f64`".
+// Workaround: put the value in an int variable first.
+function tier(p: int): int {
+  return Math.trunc(Math.log(p > 1 ? p : 1) / Math.log(4))
+}
+
+function main(): void {
+  process.stdout.write(`${tier(1000)}\n`)
+}
