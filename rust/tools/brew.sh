@@ -1,7 +1,7 @@
 #!/bin/sh
 # Points the Homebrew formula in doan-labs/homebrew-tap at release <tag>, so
 # `brew install doan-labs/tap/tov-search` gets it, on macOS and on Linux. Run
-# it once the release workflow has uploaded all three builds:
+# it once both builds are uploaded (arm64 macOS, x86_64 Linux):
 #   rust/tools/brew.sh v0.1.0
 set -eu
 tag=$1
@@ -12,7 +12,6 @@ sha() {
 }
 mac=$(sha aarch64-apple-darwin)
 linux_x86=$(sha x86_64-unknown-linux-gnu)
-linux_arm=$(sha aarch64-unknown-linux-gnu)
 formula=$(cat <<EOF
 class TovSearch < Formula
   desc "Whole-disk fuzzy file search"
@@ -27,14 +26,9 @@ class TovSearch < Formula
   end
 
   on_linux do
-    on_intel do
-      url "$base/tov-search-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "$linux_x86"
-    end
-    on_arm do
-      url "$base/tov-search-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "$linux_arm"
-    end
+    depends_on arch: :x86_64
+    url "$base/tov-search-x86_64-unknown-linux-gnu.tar.gz"
+    sha256 "$linux_x86"
   end
 
   def install

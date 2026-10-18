@@ -106,17 +106,17 @@ old version.
 
 1. Bump `version` in `Cargo.toml`, merge, then tag `main` and push the tag:
    `git tag v0.2.0 && git push origin v0.2.0`. There is no release workflow
-   (no macOS runner). Build each binary on its own platform from the tag, with
-   `T` the target and `CPU` its flag: `aarch64-apple-darwin` / `apple-m1` on an
-   Apple Silicon Mac, `x86_64-unknown-linux-gnu` / `x86-64-v3` and
-   `aarch64-unknown-linux-gnu` / `generic` on Linux (Ubuntu 22.04's glibc, so
-   it runs on older distros):
-   `RUSTFLAGS="-C target-cpu=$CPU" cargo build --release --locked --manifest-path rust/Cargo.toml`,
-   `tar -czf tov-search-$T.tar.gz -C rust/target/release tov-search`,
+   (no macOS runner). The release ships the Tov app. Build each binary on its
+   own platform from the tag, with `T` the target: `aarch64-apple-darwin` on
+   an Apple Silicon Mac (`tov/build.sh simd par portable`), and
+   `x86_64-unknown-linux-gnu` on Linux, linked statically so it runs on any
+   distro (`CC=gcc CFLAGS=-static tov/build.sh simd par portable`). Then
+   `mkdir -p dist && cp tov/build/engine-simd-par-portable dist/tov-search`,
+   `tar -czf tov-search-$T.tar.gz -C dist tov-search`,
    `shasum -a 256 tov-search-$T.tar.gz > tov-search-$T.tar.gz.sha256`.
    Then `gh release create v0.2.0 --generate-notes tov-search-*.tar.gz*`
    (later ones: `gh release upload v0.2.0 tov-search-$T.tar.gz*`).
-2. Once all three are attached: `rust/tools/brew.sh v0.2.0`. It points the formula
+2. Once both are attached: `rust/tools/brew.sh v0.2.0`. It points the formula
    in [doan-labs/homebrew-tap](https://github.com/doan-labs/homebrew-tap) at the
    new build.
 
