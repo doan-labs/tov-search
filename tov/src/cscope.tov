@@ -1,5 +1,4 @@
-// Which files the content index holds (rust/src/content.rs eligible,
-// name_ok, in_scope, doc_rank): text files of yours under home, without the
+// Which files the content index holds: text files of yours under home, without the
 // generated, vendored and app-data trees.
 
 import { enc, lowerAscii, bytesStart, bytesEnd } from "./bytes"

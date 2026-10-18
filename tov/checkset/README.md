@@ -21,7 +21,7 @@ repo root:
 
 ```sh
 rsync -a --exclude 'target/' --exclude 'data/' --exclude 'out/' --exclude 'DATASET' \
-  rust/bench/ ~/checkset/gen-seed2/
+  bench/ ~/checkset/gen-seed2/
 cd ~/checkset/gen-seed2 && cargo build --release && \
   target/release/bench gen --disk ~/checkset/disks/seed2.bin
 ```

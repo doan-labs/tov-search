@@ -5,18 +5,19 @@ file once, then answers each query in about a millisecond and tolerates typos.
 It can also search file contents.
 
 Started as a fork of [fsearch](https://github.com/noahdunnagan/fsearch), then
-rewritten in [Tov](https://tov.sh/) as an experiment.
+rewritten in [Tov](https://tov.sh/) (TypeScript compiled to C) with
+hand-written C kernels for the hot paths.
 
 ## Install
 
-macOS (Apple Silicon) and Linux (x86_64 with AVX2, arm64):
+macOS (Apple Silicon) and Linux (x86_64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/doan-labs/tov-search/main/install.sh | sh
 ```
 
 Or with Homebrew: `brew install doan-labs/tap/tov-search`. To build from
-source, see [rust/README.md](rust/README.md).
+source, see [tov/README.md](tov/README.md).
 
 ## Usage
 
@@ -33,19 +34,10 @@ Query syntax:
 - Filters: `ext:` `type:` `kind:` `in:` `size:` `mtime:` `path:` `re:`
   `grep:` `regex:` `sym:` `limit:`
 
-The full CLI, the JSON API and the Rust crate are documented in
-[rust/README.md](rust/README.md).
+`tov-search` with no arguments lists the commands (`serve`, `status`,
+`index`, `install`); `--json` prints results as JSON.
 
 ## Performance
-
-On an M1 Pro with 10.4M files and folders, time per search:
-
-| | |
-|---|---|
-| Name search, whole disk | 0.8 ms |
-| Name search with a typo | 0.7 ms |
-| Content search | 0.8-1.5 ms |
-| First index of the disk | ~60 s, once |
 
 Compared with [fsearch](https://github.com/noahdunnagan/fsearch) and
 [fff](https://github.com/dmtrKovalenko/fff): see [compare/](compare/) and
@@ -55,8 +47,8 @@ Compared with [fsearch](https://github.com/noahdunnagan/fsearch) and
 
 | Folder | Contents |
 |---|---|
-| [`rust/`](rust/) | The CLI and daemon you install, plus the benchmark harness |
-| [`tov/`](tov/) | A second engine written in [Tov](https://tov.sh) with C kernels; it must return the same results as the Rust one |
+| [`tov/`](tov/) | The engine, CLI and background program, in [Tov](https://tov.sh) with C kernels |
+| [`bench/`](bench/) | The benchmark harness, test disk generator, traces and saved answers |
 | [`compare/`](compare/) | Benchmarks against fsearch and fff |
 | [`docs/`](docs/) | Architecture, testing and benchmarking |
 
@@ -64,7 +56,7 @@ Compared with [fsearch](https://github.com/noahdunnagan/fsearch) and
 
 ```sh
 curl -fsSL https://tov.sh/install.sh | sh                              # install the Tov compiler
-(cd rust/bench && cargo build --release && target/release/bench gen)   # generate the test disk
+(cd bench && cargo build --release && target/release/bench gen)        # generate the test disk
 tov/check.sh                                                           # build, test and time
 ```
 

@@ -1,5 +1,4 @@
-// Keeping the content index in sync (rust/src/engine.rs content_loop): the
-// folders and subtrees that changed are diffed against the docs held, what
+// Keeping the content index in sync: the folders and subtrees that changed are diffed against the docs held, what
 // changed is tombstoned, the files to index are built into new segments,
 // and segments of a size tier are merged eight at a time.
 //

@@ -5,7 +5,7 @@
   compare.py gen <bin> <out.txt> [--seed N] [--count N]   random queries from the disk's real names
   compare.py run <trace> --disk <bin> [--dir <dir>] --engine name=path ... --dir-engine name=path ...
 
-Every engine speaks rust/bench/PROTOCOL.md: start with one argument, print
+Every engine speaks bench/PROTOCOL.md: start with one argument, print
 "ready", then answer one query per stdin line, ending with a blank line.
 --engine gets the disk file, --dir-engine gets the directory itself.
 

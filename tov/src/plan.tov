@@ -1,5 +1,4 @@
-// Which docs could hold a match: a trigram query (rust/src/content.rs TQ,
-// literal_plan, regex_plan). A literal needs its trigrams; a regex is parsed
+// Which docs could hold a match: a trigram query. A literal needs its trigrams; a regex is parsed
 // (as regex-syntax 0.8 parses it, with its simplifications) and what each
 // part says about its matches (exact strings, prefixes, suffixes) becomes an
 // AND/OR of trigrams.

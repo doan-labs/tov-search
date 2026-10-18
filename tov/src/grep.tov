@@ -1,11 +1,10 @@
-// A content search's pattern (rust/src/content.rs Grep, Literal, lines_at):
-// how it is matched in a file, which lines it shows, and what it asks of the
+// A content search's pattern: how it is matched in a file, which lines it shows, and what it asks of the
 // index (the trigram plan and the bloom probes).
 //
 // Literals are found without a regex: their exact bytes when the pattern has
 // an upper-case letter, else in either case. `sym:` finds the name after a
 // declaring keyword. Regexes run on the system's POSIX regex (extended, with
-// \d \w \s as Rust has them), with lines separate as in Rust's multi-line mode.
+// \d \w \s as in Perl), with lines separate (^ and $ match at line ends).
 
 import { enc } from "./bytes"
 import { fold, gramHash, symbolKey, isWord, SHORT, LONG } from "./cgrams"
@@ -23,7 +22,7 @@ const LIT_REGEX = 4
 const LIT_NONE = 5
 
 // hook(raw): compiles the content search's regex (POSIX extended, \d \w \s
-// as in Rust, lines separate), ignoring case if ci. Returns "" or the error.
+// as in Perl, lines separate), ignoring case if ci. Returns "" or the error.
 function grepRe(pattern: string, ci: bool): string {
   return ""
 }
@@ -106,11 +105,11 @@ export function grepSet(pattern: string, mode: int): string {
     return grepRe(pattern, gCi)
   }
   if (gPattern.length === 0) {
-    // ponytail: an empty sym: finds nothing (Rust matches any definition).
+    // ponytail: an empty sym: finds nothing; matching any definition would need a scan.
     gKind = mode === MODE_SYMBOL ? LIT_NONE : LIT_EMPTY
     return ""
   }
-  // ponytail: a non-ASCII literal folds ASCII letters only (Rust folds all of Unicode).
+  // ponytail: a non-ASCII literal folds ASCII letters only; Unicode case folding if it matters.
   gKind = mode === MODE_SYMBOL ? LIT_DEF : gCi ? LIT_FOLDED : LIT_EXACT
   return ""
 }
@@ -353,7 +352,7 @@ function nextMatch(hay: u8[], from: int, odd: bool): int[] {
 
 const WS3 = [225, 154, 128, 227, 128, 128, 226, 129, 159, 226, 128, 168, 226, 128, 169, 226, 128, 175]
 
-// b[a, e) without trailing Unicode white space (as Rust's trim_end).
+// b[a, e) without trailing Unicode white space.
 function trimEnd(b: u8[], a: int, e: int): int {
   let z = e
   for (;;) {

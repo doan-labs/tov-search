@@ -1,9 +1,9 @@
-// The index as it is right now, ported from rust/src/live.rs: the base
+// The index as it is right now: the base
 // (built from the saved disk file), the base entries that are gone, and the
 // entries added since (the overlay). A change to a folder is applied by
 // listing that folder and diffing it with what the index holds, so replayed,
 // repeated and late events are all harmless. Searches merge the overlay into
-// the base's answers exactly as the Rust app does.
+// the base's answers with the same scores and order.
 
 import { KIND_FILE, KIND_DIR, FLAG_MOUNT, NO } from "./consts"
 import { nameOk, inScope, eligible } from "./cscope"
@@ -525,8 +525,8 @@ function pathLess(a: u8[], b: u8[]): bool {
   return a.length < b.length
 }
 
-// An overlay entry's score for q (the query tables loaded), or NO. Rust's
-// Query::match_path: it has no folder memo, so its folders are matched from
+// An overlay entry's score for q (the query tables loaded), or NO. It has
+// no folder memo, so its folders are matched from
 // its path.
 function overlayScore(q: Query, s: int): int {
   return pathScore(q, oPath[s]!, oKind[s]!, oSize[s]!, oMtime[s]!, oMask[s]!, oPrior[s]!)

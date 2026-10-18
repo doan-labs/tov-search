@@ -1,6 +1,5 @@
 // The tov-search app: the command line, and the background program that
-// keeps the index in memory and answers JSON lines on a unix socket, in the
-// Rust app's protocol (rust/src/server.rs), so its clients work unchanged.
+// keeps the index in memory and answers JSON lines on a unix socket.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs"
 import { setHome, KIND_FILE, KIND_DIR, KIND_LINK } from "./consts"
@@ -55,7 +54,7 @@ function homeDir(): string {
   return process.env.HOME ?? "/"
 }
 
-// Where the index lives: the Rust app's folder.
+// Where the index lives.
 function dataDir(h: string): string {
   if (process.platform === "darwin") {
     return `${h}/Library/Application Support/TovSearch`
@@ -315,7 +314,7 @@ function contentStep(h: string): void {
   contentPending = cTodo
 }
 
-// File watching, as the Rust app does it (rust/src/engine.rs apply_loop).
+// File watching.
 const MUST_SCAN = 1
 const USER_DROPPED = 2
 const KERNEL_DROPPED = 4
@@ -686,7 +685,7 @@ function respond(line: string): string throws Error {
       }
       for (let j = 0; j < hitIdx.length; j++) {
         const i = hitIdx[j]!
-        // Paths that aren't UTF-8 are shown with U+FFFD, as the Rust app does.
+        // Paths that aren't UTF-8 are shown with U+FFFD.
         const hit = `${j > 0 ? "," : ""}{"kind":"${kindName(hitKind(i))}","mtime":${hitMtime(i)},` +
           `"path":${try jstr(try new TextDecoder().decode(hitPath(i)))},"score":${hitScore[j]!},"size":${hitSize(i)}}`
         for (const c of enc(hit)) {

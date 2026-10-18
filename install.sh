@@ -13,13 +13,9 @@ if command -v brew >/dev/null 2>&1 && brew list tov-search >/dev/null 2>&1; then
 fi
 
 case "$(uname -s)-$(uname -m)" in
-    Darwin-arm64) target=aarch64-apple-darwin ;;
-    Linux-x86_64)
-        # The x86_64 build needs AVX2 (Intel 2013+, AMD 2015+).
-        grep -qw avx2 /proc/cpuinfo || { echo "this CPU lacks AVX2; build from source (see rust/README.md)" >&2; exit 1; }
-        target=x86_64-unknown-linux-gnu ;;
-    Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
-    *) echo "no prebuilt tov-search for $(uname -s) $(uname -m); build from source (see rust/README.md)" >&2; exit 1 ;;
+    Darwin-arm64) target=macos-arm64 ;;
+    Linux-x86_64) target=linux-x64 ;;
+    *) echo "no prebuilt tov-search for $(uname -s) $(uname -m); build from source (see tov/README.md)" >&2; exit 1 ;;
 esac
 
 tmp=$(mktemp -d)

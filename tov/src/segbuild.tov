@@ -1,5 +1,4 @@
-// Writing content segments (rust/src/content.rs build_segment, merge,
-// write_segment): from files read fresh, or by merging segments and
+// Writing content segments: from files read fresh, or by merging segments and
 // dropping their tombstoned docs. Posting lists are delta varints, or a
 // bitset over the segment's docs once more than 1 in 8 docs hold the key.
 

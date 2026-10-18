@@ -95,7 +95,7 @@ export function pushToken(q: Query, w: string): Query {
   return out
 }
 
-// Rust's f64 parse of a digits-and-dots string: one dot at most, a digit somewhere.
+// An f64 parse of a digits-and-dots string: one dot at most, a digit somewhere.
 function parseNum(s: string): f64 | undefined {
   let digits = 0
   let dots = 0
@@ -176,7 +176,7 @@ function realPath(p: string): string {
 
 // hook(raw): compiles pattern into regex slot 0 (re:, names) or 1 (path:,
 // whole paths): POSIX extended, ignoring case, with \d \w \s and their
-// capitals as in Rust's regex. Returns "" or the error.
+// capitals as in Perl. Returns "" or the error.
 export function reSet(slot: int, pattern: string): string {
   return ""
 }

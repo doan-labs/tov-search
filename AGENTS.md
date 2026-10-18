@@ -2,7 +2,7 @@
 
 tov-search is whole-disk fuzzy file search. The main engine is written in
 Tov (TypeScript compiled to C) with hand-written C kernels swapped in for
-hot functions; a Rust engine is the reference it must match byte for byte.
+hot functions. Its answers must match the saved oracle byte for byte.
 Start with [README.md](README.md), then read the doc for your task.
 
 ## Where to read
@@ -13,10 +13,9 @@ Start with [README.md](README.md), then read the doc for your task.
 | Build, write or change a kernel, change parsing, scoring or layout | [docs/kernels.md](docs/kernels.md) |
 | Prove a change is correct, CI | [docs/testing.md](docs/testing.md) |
 | Measure speed, prove a change faster, compare with fsearch and fff | [docs/benchmarking.md](docs/benchmarking.md) |
-| Why the Rust reference is built the way it is, past experiments | [docs/rust-architecture.md](docs/rust-architecture.md) |
-| The engine protocol and disk format | [rust/bench/PROTOCOL.md](rust/bench/PROTOCOL.md) |
+| The engine protocol and disk format | [bench/PROTOCOL.md](bench/PROTOCOL.md) |
 | Short Tov how-to | [tov/README.md](tov/README.md) |
-| Cut a release, update the Homebrew install (two steps, don't skip the second) | [rust/README.md#release](rust/README.md#release) |
+| Cut a release, update the Homebrew install (two steps, don't skip the second) | [tov/README.md#release](tov/README.md#release) |
 
 ## Must stay true
 

@@ -1,5 +1,4 @@
-// What the content index records per text file (rust/src/content.rs
-// trigrams, symbols, bloom): its sorted distinct case-folded trigrams, plus
+// What the content index records per text file: its sorted distinct case-folded trigrams, plus
 // the end-of-file pair key; the definitions it makes (`sym:`); and two bloom
 // filters of its folded 5- and 7-byte grams. A file holding ſ or the Kelvin
 // sign is also read with them as s and k (odd folds), since a

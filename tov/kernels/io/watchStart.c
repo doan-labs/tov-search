@@ -46,7 +46,7 @@ static tv_str wt_take(void) {
 }
 
 #ifdef __APPLE__
-/* FSEvents, declared by hand like the Rust app does: CoreServices' headers
+/* FSEvents, declared by hand: CoreServices' headers
  * would bring thousands of names into Tov's C. */
 typedef void (*wt_cb)(const void *s, void *info, size_t n, void *paths, const uint32_t *flags, const uint64_t *ids);
 typedef struct { long version; void *info; const void *retain, *release, *desc; } wt_ctx;
