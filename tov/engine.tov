@@ -1,177 +1,62 @@
-// The tov-search name engine, ported to Tov from the reference engine that wrote
-// bench/oracle (src/{index,live,query}.rs at 04a402e). Speaks bench/PROTOCOL.md:
+// tov-search: whole-disk file search. The engine was ported to Tov from the
+// reference engine that wrote bench/oracle (src/{index,live,query}.rs at
+// 04a402e). Named tov-search, this is the app (src/app.tov); named engine*,
+// it speaks bench/PROTOCOL.md:
 //
-//   engine <disk-file>   build the index, print "ready", answer one query per stdin line
+//   engine <disk-file> [home [linux]]   build the index, print "ready", answer one query per stdin line
 //
-// The engine is split by concern into the modules in src/: this file keeps the
-// raw stdin hook, the answer/output side and main. Plain Tov can't read stdin,
-// so `readLine` is a raw hook: inject.py pastes the C body in
-// kernels/io/readLine.c over it. Every other `// hook:` function, in whatever
-// module, has a pure-Tov body that is the reference, and an optional C kernel
-// in kernels/ to race it. Its `reads:` and `writes:` lines are the globals
-// that kernel gets; see inject.py for the contract and build/hooks.h for the
-// prototypes.
+// home and linux set what `~` means and the Linux folder ranking, for disk
+// files of real disks (the benchmark's home is /Users/bench).
+//
+// The modules in src/ hold the engine by concern. The operating system calls
+// Tov has no API for are `// hook(raw):` functions (src/io.tov, src/scan.tov,
+// realPath): inject.py pastes their C bodies from kernels/io/ over them.
+// Every other `// hook:` function has a pure-Tov body that is the reference,
+// and an optional C kernel in kernels/ to race it. Its `reads:` and `writes:`
+// lines are the globals that kernel gets; see inject.py for the contract and
+// build/hooks.h for the prototypes.
 
-import { readFileSync, existsSync, mkdirSync } from "node:fs"
 import { MAXV, setHome } from "./src/consts"
 import { enc } from "./src/bytes"
-import { readDisk, setNow } from "./src/disk"
+import { readDisk } from "./src/disk"
 import { setLinuxPriors } from "./src/prior"
-import { scanDisk, writeFile, writeOut } from "./src/scan"
-import { build, unames, uoff, entName, entParent, dirEntry } from "./src/index"
+import { build, putPath } from "./src/index"
 import { Query, parse } from "./src/query"
 import { namesAlloc } from "./src/names"
 import { memosAlloc } from "./src/memos"
 import { extIndexBuild } from "./src/exts"
 import { topScore, topIdx } from "./src/topk"
 import { search } from "./src/search"
-
-// ------------------------------------------------------------------ hooks
-
-// hook(raw): one query line without its "\n", or "\n" at EOF. Flushes stdout first.
-function readLine(): string {
-  return "\n"
-}
-
-// ------------------------------------------------------------------ output
+import { readLine, writeOut } from "./src/io"
+import { cli } from "./src/app"
 
 let out: u8[] = []
 
-function putPath(i: int): void {
-  const ch: int[] = []
-  let e = i
-  while (e !== 0 && ch.length < 256) {
-    ch.push(e)
-    e = int(dirEntry[int(entParent[e]!)]!)
-  }
-  if (ch.length === 0) {
-    out.push(u8(47))
-  }
-  for (let j = ch.length - 1; j >= 0; j--) {
-    out.push(u8(47))
-    const id = int(entName[ch[j]!]!)
-    const a = int(uoff[id]!)
-    const b = int(uoff[id + 1]!)
-    for (let x = a; x < b; x++) {
-      out.push(unames[x]!)
-    }
-  }
-}
-
-function answer(line: string): string throws Error {
+// Writes the answer to one query line: score, tab and path per hit, then an
+// empty line.
+function answer(line: string): void {
+  out = []
   let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
   try {
     q = parse(line)
   } catch (e) {
-    return "error\n\n"
+    // Named here, not through enc(): the modules may use TextEncoder only
+    // when the entry module names it (tov/bugs/codec-entry-only).
+    writeOut(new TextEncoder().encode("error\n\n"))
+    return
   }
   search(q)
-  out = []
   for (let j = 0; j < topScore.length; j++) {
     for (const c of enc(`${topScore[j]!}\t`)) {
       out.push(c)
     }
-    putPath(topIdx[j]!)
+    putPath(topIdx[j]!, &out)
     out.push(u8(10))
   }
   out.push(u8(10))
-  return try new TextDecoder().decode(out)
-}
-
-// ------------------------------------------------------------------ command line
-
-const USAGE = `usage:
-  tov-search <query...>    search the index (built on first use)
-  tov-search index [root]  scan the disk (or root) and save the index
-`
-
-function die(msg: string): void {
-  process.stderr.write(`tov-search: ${msg}\n`)
-  process.exit(1)
-}
-
-// Where the index lives: like the Rust app's folder.
-function dataDir(h: string): string {
-  if (process.platform === "darwin") {
-    return `${h}/Library/Application Support/TovSearch`
-  }
-  const x = process.env.XDG_DATA_HOME ?? ""
-  return x.startsWith("/") ? `${x}/tov-search` : `${h}/.local/share/tov-search`
-}
-
-// Folders not to scan. macOS without Full Disk Access: the ones a consent
-// prompt guards, which would stop the scan until someone answered it.
-function skipped(h: string): string[] {
-  if (process.platform !== "darwin") {
-    return ["/proc", "/sys", "/dev", "/run"]
-  }
-  let full = (process.env.TOV_SEARCH_RESTRICT ?? "") === ""
-  if (full) {
-    try {
-      readFileSync("/Library/Application Support/com.apple.TCC/TCC.db")
-    } catch (e) {
-      full = false
-    }
-  }
-  if (full) {
-    return []
-  }
-  return ["Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
-    "Library/CloudStorage", "Pictures/Photos Library.photoslibrary"].map((d) => `${h}/${d}`).concat(["/Volumes"])
-}
-
-function index(root: string, h: string, file: string): void throws Error {
-  const t = Date.now()
-  const disk = scanDisk(root, skipped(h), Math.trunc(t / 1000))
-  try mkdirSync(dataDir(h), { recursive: true })
-  const err = writeFile(file, disk)
-  if (err !== "") {
-    throw new Error(`write ${file}: ${err}`)
-  }
-  process.stderr.write(`indexed ${root} in ${Math.round(Date.now() - t)} ms\n`)
-}
-
-function cli(args: string[]): void throws Error {
-  if (args.length === 0 || args[0] === "-h" || args[0] === "--help") {
-    process.stderr.write(USAGE)
-    return
-  }
-  const h = process.env.HOME ?? "/"
-  const file = `${dataDir(h)}/disk.bin`
-  if (args[0] === "index") {
-    try index(args.length > 1 ? args[1]! : "/", h, file)
-    return
-  }
-  if (!existsSync(file)) {
-    try index("/", h, file)
-  }
-  setHome(h)
-  setLinuxPriors(process.platform === "linux")
-  try readDisk(file)
-  setNow(Math.trunc(Date.now() / 1000))
-  try build()
-  namesAlloc()
-  memosAlloc()
-  extIndexBuild()
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
-  try {
-    q = parse(args.join(" "))
-  } catch (e) {
-    die(e.message)
-    return
-  }
-  search(q)
-  out = []
-  for (let j = 0; j < topIdx.length; j++) {
-    putPath(topIdx[j]!)
-    out.push(u8(10))
-  }
   writeOut(out)
 }
 
-// The benchmark engine (bench/PROTOCOL.md), when the binary is named engine*:
-//
-//   engine <disk-file> [home [linux]]   home and Linux folder ranking for real disks
 function main(): void throws Error {
   const me = process.argv[0]!.split("/")
   const args = process.argv.slice(2)
@@ -197,6 +82,6 @@ function main(): void throws Error {
     if (line === "\n") {
       break
     }
-    process.stdout.write(try answer(line))
+    answer(line)
   }
 }

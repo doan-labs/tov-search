@@ -43,6 +43,28 @@ export function nb(i: int): int {
   return int(unames[i]!)
 }
 
+// Appends entry i's path to out: "/" and each name from the root down.
+export function putPath(i: int, inout out: u8[]): void {
+  const ch: int[] = []
+  let e = i
+  while (e !== 0 && ch.length < 256) {
+    ch.push(e)
+    e = int(dirEntry[int(entParent[e]!)]!)
+  }
+  if (ch.length === 0) {
+    out.push(u8(47))
+  }
+  for (let j = ch.length - 1; j >= 0; j--) {
+    out.push(u8(47))
+    const id = int(entName[ch[j]!]!)
+    const a = int(uoff[id]!)
+    const b = int(uoff[id + 1]!)
+    for (let x = a; x < b; x++) {
+      out.push(unames[x]!)
+    }
+  }
+}
+
 export function build(): void throws Error {
   // Children of each dir record, grouped by parent (counting sort), sorted by name.
   const cStart = zerosU32(nrec + 1)

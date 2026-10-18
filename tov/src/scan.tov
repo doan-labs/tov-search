@@ -23,17 +23,6 @@ function listTake(): string {
   return ""
 }
 
-// hook(raw): writes data to path through a temporary file and a rename, so a
-// reader never sees half a file. Returns "" or the error.
-export function writeFile(path: string, data: u8[]): string {
-  return ""
-}
-
-// hook(raw): writes bytes to stdout as they are, after anything buffered.
-export function writeOut(data: u8[]): void {
-  return
-}
-
 let disk: u8[] = []
 
 function put32(v: int): void {

@@ -2,10 +2,12 @@
 //!
 //!   realcheck scan <root> <disk-file>          scan like the daemon, write a disk file
 //!   realcheck engine <disk-file> <home> [linux] bench/PROTOCOL.md, ranked like the daemon
+//!   realcheck serve <disk-file> <home> [linux]  the daemon's JSON replies, on stdin/stdout
 //!
 //! A folder the scan did not enter (a mount point, or skipped) carries
 //! FLAG_MOUNT in the disk file and gets no block, as in the daemon's index.
 
+use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;
 use tov_search::index::{Index, linux_prior_adjust};
@@ -60,7 +62,9 @@ fn scan(root: &str, out: &str) {
     std::fs::write(out, b).unwrap();
 }
 
-fn engine(path: &str, home: &str, linux: bool) {
+/// The index of a disk file, built like the daemon builds its own. pin: the
+/// disk file's clock, else the real one (as the daemon).
+fn load(path: &str, home: &str, linux: bool, pin: bool) -> Live {
     let b = std::fs::read(path).expect("read disk file");
     assert!(b.len() >= 20 && &b[..8] == b"FSDISK01", "not a disk file");
     let n = u64::from_le_bytes(rd(&b, 8)) as usize;
@@ -87,9 +91,15 @@ fn engine(path: &str, home: &str, linux: bool) {
         p += 19 + len;
     }
     drop(b);
-    NOW_OVERRIDE.store(now, Ordering::Relaxed);
+    if pin {
+        NOW_OVERRIDE.store(now, Ordering::Relaxed);
+    }
     let idx = if linux { Index::build_ranked(ls, 0, now, home.as_bytes(), linux_prior_adjust) } else { Index::build(ls, 0, now, home.as_bytes()) };
-    let live = Live::new(idx);
+    Live::new(idx)
+}
+
+fn engine(path: &str, home: &str, linux: bool) {
+    let live = load(path, home, linux, true);
     let s = Searcher { live: &live };
     let mut out = std::io::BufWriter::with_capacity(1 << 16, std::io::stdout().lock());
     out.write_all(b"ready\n").unwrap();
@@ -113,12 +123,106 @@ fn engine(path: &str, home: &str, linux: bool) {
     }
 }
 
+/// One serialized hit, as rust/src/server.rs writes it.
+#[derive(serde::Serialize)]
+struct HitOut<'a> {
+    kind: &'a str,
+    mtime: u32,
+    path: std::borrow::Cow<'a, str>,
+    score: i32,
+    size: u64,
+}
+
+#[derive(serde::Serialize)]
+struct HitsOut<'a> {
+    hits: Vec<HitOut<'a>>,
+    id: &'a Value,
+    ok: bool,
+    took_us: u64,
+}
+
+/// rust/src/server.rs's answers to name searches, pings and unknown ops,
+/// one JSON request per stdin line, took_us 0.
+fn serve(path: &str, home: &str, linux: bool) {
+    let live = load(path, home, linux, false);
+    let s = Searcher { live: &live };
+    let mut out = std::io::stdout().lock();
+    let mut p = Vec::new();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.expect("stdin");
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                writeln!(out, "{}", json!({"ok": false, "error": format!("bad json: {e}")})).unwrap();
+                continue;
+            }
+        };
+        let id = v.get("id").unwrap_or(&Value::Null).clone();
+        let op = v.get("op").and_then(Value::as_str).unwrap_or("search");
+        let reply = match op {
+            "ping" => json!({"ok": true, "id": id}).to_string(),
+            "search" => match request(&v, home) {
+                Ok(q) => {
+                    let hits = s.search(&q);
+                    let paths: Vec<Vec<u8>> = hits
+                        .iter()
+                        .map(|h| {
+                            live.base.path(h.idx as usize, &mut p);
+                            p.clone()
+                        })
+                        .collect();
+                    let hits = hits
+                        .iter()
+                        .zip(&paths)
+                        .map(|(h, path)| {
+                            let i = h.idx as usize;
+                            let kind = match live.base.kind()[i] & 3 {
+                                0 => "file",
+                                1 => "dir",
+                                2 => "link",
+                                _ => "other",
+                            };
+                            HitOut { kind, mtime: live.base.mtime()[i], path: String::from_utf8_lossy(path), score: h.score, size: live.base.size_of(i) }
+                        })
+                        .collect();
+                    serde_json::to_string(&HitsOut { hits, id: &id, ok: true, took_us: 0 }).unwrap()
+                }
+                Err(e) => json!({"ok": false, "error": e, "id": id}).to_string(),
+            },
+            _ => json!({"ok": false, "error": format!("unknown op {op}"), "id": id}).to_string(),
+        };
+        writeln!(out, "{reply}").unwrap();
+        out.flush().unwrap();
+    }
+}
+
+/// rust/src/server.rs's parse_request.
+fn request(v: &Value, home: &str) -> Result<Query, String> {
+    let mut q = Query::parse(v.get("q").and_then(Value::as_str).unwrap_or(""), home)?;
+    if let Some(obj) = v.as_object() {
+        for (k, val) in obj {
+            if k == "limit" {
+                q.limit = val.as_u64().ok_or("limit must be a number")? as usize;
+            } else {
+                let s = match val {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                q.filter(k, &s, home)?;
+            }
+        }
+    }
+    Ok(q)
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["scan", root, out] => scan(root, out),
         ["engine", disk, home] => engine(disk, home, false),
         ["engine", disk, home, "linux"] => engine(disk, home, true),
-        _ => eprintln!("usage: realcheck scan <root> <disk-file> | engine <disk-file> <home> [linux]"),
+        ["serve", disk, home] => serve(disk, home, false),
+        ["serve", disk, home, "linux"] => serve(disk, home, true),
+        _ => eprintln!("usage: realcheck scan <root> <disk-file> | engine|serve <disk-file> <home> [linux]"),
     }
 }

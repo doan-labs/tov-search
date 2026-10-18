@@ -1,0 +1,70 @@
+// The operating system calls Tov has no API for. Each is a raw hook: its C
+// body in kernels/io/ replaces the Tov stub below, and does the one call.
+
+// hook(raw): one query line without its "\n", or "\n" at EOF. Flushes stdout first.
+export function readLine(): string {
+  return "\n"
+}
+
+// hook(raw): writes bytes to stdout as they are, after anything buffered.
+export function writeOut(data: u8[]): void {
+  return
+}
+
+// hook(raw): writes data to path through a temporary file and a rename, so a
+// reader never sees half a file. Returns "" or the error.
+export function writeFile(path: string, data: u8[]): string {
+  return ""
+}
+
+// hook(raw): listens on the unix socket sock, unless another process holds
+// the lock file lock. Returns "" or the error.
+export function sockListen(sock: string, lock: string): string {
+  return ""
+}
+
+// hook(raw): waits for the next request line on any connection to the
+// socket, accepting new ones meanwhile: the connection (u32) then the line,
+// without its "\n".
+export function sockNext(): string {
+  return ""
+}
+
+// hook(raw): writes data to connection conn (from sockNext).
+export function sockReply(conn: int, data: u8[]): void {
+  return
+}
+
+// hook(raw): sends line to the socket and returns the reply line; "" if
+// nothing listens there.
+export function sockAsk(sock: string, line: string): string {
+  return ""
+}
+
+// hook(raw): starts this program as `serve` in its own session, output to
+// log, then waits up to 3 s for it to listen on sock. Returns "" or the error.
+export function spawnServe(log: string, sock: string): string {
+  return ""
+}
+
+// hook(raw): runs a program (args[0], found on PATH) and returns its exit
+// status, -1 if it could not start. quiet sends its stderr nowhere.
+export function runCmd(args: string[], quiet: bool): int {
+  return -1
+}
+
+// hook(raw): copies this program's file to dst (replacing, not overwriting:
+// a running or signed binary may sit there). Returns "" or the error.
+export function copySelf(dst: string): string {
+  return ""
+}
+
+// hook(raw): this process's user id.
+export function uid(): int {
+  return 0
+}
+
+// hook(raw): sleeps ms milliseconds.
+export function sleepMs(ms: int): void {
+  return
+}
