@@ -17,7 +17,10 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent.parent
 EXTRA = ["ext:rs main", "type:dir src", "kind:dir build", "in:~ readme", "!test main.c", "^Make", "file$", "'exact",
-         "size:>1mb ext:png", "mtime:<1w", "~ config", "ext:json package", "a", "zz", ".git", "node_modules index.js"]
+         "size:>1mb ext:png", "mtime:<1w", "~ config", "ext:json package", "a", "zz", ".git", "node_modules index.js",
+         r"re:^[a-z]+_[0-9]+\.c$", "path:drivers.*usb", r"re:\d{4}", r"re:^\.", "re:^bash path:etc", r"config re:\.json$",
+         r"path:^/home.*\.md$", "re:a.*b ext:txt", r"path:src/.*\.rs$ main", r"re:^[A-Z][a-z]+\.tov$", "re:readme !git",
+         "path:lib limit:200", "re:("]
 
 
 def run(cmd, queries):

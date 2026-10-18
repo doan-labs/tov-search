@@ -10,7 +10,7 @@ import { bytesKey, encDec, zerosU8 } from "./bytes"
 import { n, entName, entKind, entSize, entMtime, entParent, dirEntry, dirStart, dirLen, dirEnd, dirPrior, uoff, nb,
   scratch, putPath } from "./index"
 import { lookup, dirOf, search } from "./search"
-import { Query, clock } from "./query"
+import { Query, clock, reMatch } from "./query"
 import { qNpos, qNneg, fitsT, tokenScore, tokenMatches, extOk, nameFlags, loadQueryTables } from "./score"
 import { nameMask } from "./masks"
 import { rankTweaksAt } from "./prior"
@@ -493,6 +493,9 @@ function overlayScore(q: Query, s: int): int {
   if (qNpos > 0 && (got === 0 || (got | inherited) !== (1 << qNpos) - 1)) {
     return NO
   }
+  if ((q.nameRe !== "" && !reMatch(0, path.slice(cut + 1))) || (q.pathRe !== "" && !reMatch(1, path))) {
+    return NO
+  }
   return score + oPrior[s]! + rankTweaksAt(nameFlags(no, nl), kind, mtime, clock !== 0 ? clock : now)
 }
 
@@ -500,19 +503,23 @@ function overlayScore(q: Query, s: int): int {
 // overlay. Ties: base entries first by index, then overlay ones by path.
 export function liveSearch(q: Query): void {
   const limit = q.limit
-  let bs: int[] = []
-  let bi: int[] = []
+  // Gone entries and paths path: rejects are dropped from the base's answer,
+  // asking it for more until enough are left. Answers for a larger limit
+  // start with those for a smaller one, so each round checks only the rest.
+  const bs: int[] = []
+  const bi: int[] = []
   let lim = limit
+  let checked = 0
   for (;;) {
     search(withLimit(q, lim))
-    bs = []
-    bi = []
-    for (let j = 0; j < topIdx.length && bs.length < limit; j++) {
-      if (deadCount === 0 || !isDead(topIdx[j]!)) {
+    for (let j = checked; j < topIdx.length && bs.length < limit; j++) {
+      const e = topIdx[j]!
+      if ((deadCount === 0 || !isDead(e)) && (q.pathRe === "" || reMatch(1, hitPath(e)))) {
         bs.push(topScore[j]!)
-        bi.push(topIdx[j]!)
+        bi.push(e)
       }
     }
+    checked = topIdx.length
     if (bs.length >= limit || topIdx.length < lim) {
       break
     }

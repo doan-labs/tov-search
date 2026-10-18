@@ -2,13 +2,13 @@
 // the top-level per-keystroke search() that orchestrates the passes.
 
 import { NO, SUFFIX, NF_OK } from "./consts"
-import { lowerAscii, bytesKey, bytesStart, bytesEnd } from "./bytes"
+import { lowerAscii, bytesKey, bytesStart, bytesEnd, enc } from "./bytes"
 import { d, n, entName, entParent, dirEntry, dirStart, dirLen, dirEnd,
-  uoff, u, neOff, ne, nb } from "./index"
-import { Token, Query, takesTypos } from "./query"
+  uoff, u, neOff, ne, nb, unames } from "./index"
+import { Token, Query, takesTypos, reNames } from "./query"
 import { qNpos, qNneg, loadQueryTables } from "./score"
 import { gen, nextGen, narrowCand, scoreNames, prefilter, okBuf, okCount, okEntries,
-  present, hFlags } from "./names"
+  present, hFlags, cand, candSet } from "./names"
 import { memoOf, allMemos } from "./memos"
 import { qNeedDirs, scoreEntry, byNamePass, statOrderPass, fullPass,
   kScore, kIdx, setFilters, kbufPad } from "./entries"
@@ -110,11 +110,37 @@ export function lookup(path: u8[]): int {
   return e
 }
 
-// What the name table depends on: tokens (text, mode, negation) and exts.
+// Which names re: matches (slot 0 holds the query's pattern), for the
+// pattern it was computed for.
+let reOk: u8[] = []
+let reOkFor = ""
+
+// Keeps the names (cand[0, count), or ids 0..count without cand) the re:
+// pattern matches, in cand; returns how many.
+function keepRe(count: int, useCand: bool, pattern: string): int {
+  if (pattern !== reOkFor) {
+    reOk = enc(reNames(0, unames, uoff, u))
+    reOkFor = pattern
+  }
+  let kept = 0
+  for (let c = 0; c < count; c++) {
+    const id = useCand ? int(cand[c]!) : c
+    if (reOk[id]! === u8(1)) {
+      candSet(kept, id)
+      kept += 1
+    }
+  }
+  return kept
+}
+
+// What the name table depends on: tokens (text, mode, negation), exts and re:.
 function nameKey(q: Query): string {
   let k = ""
   for (const x of q.exts) {
     k = k + bytesKey(x) + ","
+  }
+  if (q.nameRe !== "") {
+    k = k + "re:" + bytesKey(enc(q.nameRe)) + ","
   }
   k = k + "|"
   for (const t of q.tokens) {
@@ -187,7 +213,7 @@ export function search(q: Query): void {
   // No name terms (only filters, scope or limit): every entry's score is its
   // static score, so walk statOrder without building a name table. The cached
   // table stays as it was.
-  if (qNpos === 0 && qNneg === 0 && q.exts.length === 0) {
+  if (qNpos === 0 && qNneg === 0 && q.exts.length === 0 && q.nameRe === "") {
     if (topK > 0) {
       statOrderPass(lo, hi, false, false)
     }
@@ -197,7 +223,7 @@ export function search(q: Query): void {
   // Only negated words: every name is usable except those a negation matches.
   // Mark just those in a bitset and walk statOrder; the name table is left
   // as it was.
-  if (qNpos === 0 && q.exts.length === 0) {
+  if (qNpos === 0 && q.exts.length === 0 && q.nameRe === "") {
     loadNegs(nameKey(q), qNneg)
     if (topK > 0) {
       statOrderPass(lo, hi, false, true)
@@ -232,7 +258,12 @@ export function search(q: Query): void {
     } else {
       count = restrictCand(qNpos > 0 ? prefilter(qNpos + qNneg) : u)
     }
-    scoreNames(count, byExt || qNpos > 0)
+    let useCand = byExt || qNpos > 0
+    if (q.nameRe !== "") {
+      count = keepRe(count, useCand, q.nameRe)
+      useCand = true
+    }
+    scoreNames(count, useCand)
     prevKey = key
     prevTokens = q.tokens
     partialTable = false

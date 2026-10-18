@@ -24,7 +24,7 @@ from samecheck import run  # noqa: E402
 
 QUERIES = ["lcfoo", "lcbar", "lcbaz", "lcnew", "lcq", "in:{d} lc", "ext:md lc", "lcfoo !bar", "deep lcfoo", "kind:dir lc",
            "kind:file lcq", "size:>1kb lc", "'lcfoo", "^lcb", "md$", "lcfoo limit:3", "lcfoo limit:200", "main.rs", "readme",
-           "config", "index.js"]
+           "config", "index.js", "re:^lcfoo_3", "path:deeper.*lcfoo", "lc path:new", r"re:\.md$ lc"]
 
 
 def write(p, text):

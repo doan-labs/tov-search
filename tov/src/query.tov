@@ -18,6 +18,9 @@ export type Query = {
   mtimeLo: int,
   mtimeHi: int,
   limit: int,
+  // re: and path: patterns ("" for none), compiled into reSet's slots 0 and 1.
+  nameRe: string,
+  pathRe: string,
 }
 
 const TYPE_NAMES = ["image", "video", "audio", "doc", "code", "archive", "font"]
@@ -161,6 +164,24 @@ function realPath(p: string): string {
   return p
 }
 
+// hook(raw): compiles pattern into regex slot 0 (re:, names) or 1 (path:,
+// whole paths): POSIX extended, ignoring case, with \d \w \s and their
+// capitals as in Rust's regex. Returns "" or the error.
+export function reSet(slot: int, pattern: string): string {
+  return ""
+}
+
+// hook(raw): whether regex slot matches the bytes b.
+export function reMatch(slot: int, b: u8[]): bool {
+  return true
+}
+
+// hook(raw): per name (names[off[k]..off[k+1]], k < u), 1 if regex slot
+// matches it, else 0. On every core.
+export function reNames(slot: int, names: u8[], off: u32[], u: int): string {
+  return ""
+}
+
 // Apply filter k:v; false if k is not a filter name.
 export function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
   const out = q
@@ -229,9 +250,22 @@ export function filter(q: Query, k: string, v: string): { known: bool, q: Query 
       }
       break
     }
-    case 7: // re
-    case 8: // path
-      throw new Error("regex filters are not ported")
+    case 7: { // re
+      const err = reSet(0, v)
+      if (err !== "") {
+        throw new Error(err)
+      }
+      out.nameRe = v
+      break
+    }
+    case 8: { // path
+      const err = reSet(1, v)
+      if (err !== "") {
+        throw new Error(err)
+      }
+      out.pathRe = v
+      break
+    }
     case 9: { // limit
       let s = v.startsWith("+") ? v.slice(1) : v
       if (s === "" || s.byteLength > 18) {
@@ -285,7 +319,8 @@ function splitWords(s: string): string[] {
 }
 
 export function parse(s: string): Query throws Error {
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50,
+    nameRe: "", pathRe: "" }
   for (const word of splitWords(s)) {
     const colon = word.indexOf(":")
     if (colon >= 0) {

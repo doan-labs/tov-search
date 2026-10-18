@@ -248,7 +248,7 @@ export function rankedRun(complete: bool, tentative: bool, t0: int, m: int, base
 
 export function rankedTry(q: Query, lo: int, hi: int): bool {
   if (topK <= 0 || qNpos !== 1 || qNneg !== 0 || tMode.length !== 1 ||
-      int(tMode[0]!) !== FUZZY || q.exts.length !== 0 || q.hasScope || narrows(q)) {
+      int(tMode[0]!) !== FUZZY || q.exts.length !== 0 || q.nameRe !== "" || q.hasScope || narrows(q)) {
     return false
   }
   const ql = int(tOff[1]!) - int(tOff[0]!)

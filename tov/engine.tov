@@ -37,7 +37,8 @@ let out: u8[] = []
 // empty line.
 function answer(line: string): void {
   out = []
-  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50,
+    nameRe: "", pathRe: "" }
   try {
     q = parse(line)
   } catch (e) {
@@ -46,7 +47,7 @@ function answer(line: string): void {
     writeOut(new TextEncoder().encode("error\n\n"))
     return
   }
-  if (deadCount === 0 && overCount === 0) {
+  if (deadCount === 0 && overCount === 0 && q.pathRe === "") {
     search(q)
     for (let j = 0; j < topScore.length; j++) {
       for (const c of enc(`${topScore[j]!}\t`)) {
