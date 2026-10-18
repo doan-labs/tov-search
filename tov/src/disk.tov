@@ -22,6 +22,9 @@ function rd64(p: int): int {
 // Records, by their index in the disk file.
 export let nrec = 0
 export let now = 0
+export function setNow(t: int): void {
+  now = t
+}
 export let rParent: u32[] = []
 export let rKind: u8[] = []
 export let rSize: int[] = []

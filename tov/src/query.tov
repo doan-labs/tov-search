@@ -1,6 +1,6 @@
 // The query: its parsed form and the word/filter parser.
 
-import { HOME, KIND_FILE, KIND_DIR, KIND_LINK, FUZZY, EXACT, PREFIX, SUFFIX, Z, MAXV } from "./consts"
+import { home, KIND_FILE, KIND_DIR, KIND_LINK, FUZZY, EXACT, PREFIX, SUFFIX, Z, MAXV } from "./consts"
 import { enc, lowerAscii, satU64, satSub } from "./bytes"
 import { charBit, startBit } from "./masks"
 import { now } from "./disk"
@@ -148,8 +148,21 @@ function range(v: string, age: bool): int[] throws Error {
 
 const FILTERS = ["ext", "type", "kind", "in", "size", "mtime", "modified", "re", "path", "limit", "grep", "content", "regex", "sym", "symbol"]
 
+// What mtime: filters count ages from: the time of the request in the
+// background program, else the index's clock (which ranking always uses).
+let clock = 0
+export function setClock(t: int): void {
+  clock = t
+}
+
+// hook(raw): the path with links resolved, or p itself if it doesn't exist.
+// The index holds real paths: /etc is /private/etc on a Mac.
+function realPath(p: string): string {
+  return p
+}
+
 // Apply filter k:v; false if k is not a filter name.
-function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
+export function filter(q: Query, k: string, v: string): { known: bool, q: Query } throws Error {
   const out = q
   switch (FILTERS.indexOf(k)) {
     case 0: // ext
@@ -189,7 +202,7 @@ function filter(q: Query, k: string, v: string): { known: bool, q: Query } throw
       }
       break
     case 3: { // in
-      let p = v.startsWith("~") ? HOME + v.slice(1) : v
+      let p = realPath(v.startsWith("~") ? home + v.slice(1) : v)
       while (p.endsWith("/")) {
         p = p.slice(0, p.byteLength - 1)
       }
@@ -208,8 +221,9 @@ function filter(q: Query, k: string, v: string): { known: bool, q: Query } throw
       const r = try range(v, true)
       const lo = r[0]!
       const hi = r[1]!
-      out.mtimeLo = satSub(now, hi < now ? hi : now)
-      out.mtimeHi = satSub(now, lo & 4294967295)
+      const t = clock !== 0 ? clock : now
+      out.mtimeLo = satSub(t, hi < t ? hi : t)
+      out.mtimeHi = satSub(t, lo & 4294967295)
       if (hi === MAXV) {
         out.mtimeLo = 0
       }

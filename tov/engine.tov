@@ -12,9 +12,12 @@
 // that kernel gets; see inject.py for the contract and build/hooks.h for the
 // prototypes.
 
-import { MAXV } from "./src/consts"
+import { readFileSync, existsSync, mkdirSync } from "node:fs"
+import { MAXV, setHome } from "./src/consts"
 import { enc } from "./src/bytes"
-import { readDisk } from "./src/disk"
+import { readDisk, setNow } from "./src/disk"
+import { setLinuxPriors } from "./src/prior"
+import { scanDisk, writeFile, writeOut } from "./src/scan"
 import { build, unames, uoff, entName, entParent, dirEntry } from "./src/index"
 import { Query, parse } from "./src/query"
 import { namesAlloc } from "./src/names"
@@ -75,11 +78,114 @@ function answer(line: string): string throws Error {
   return try new TextDecoder().decode(out)
 }
 
-function main(): void throws Error {
-  const args = process.argv.slice(2)
-  if (args.length < 1) {
-    throw new Error("usage: engine <disk-file>")
+// ------------------------------------------------------------------ command line
+
+const USAGE = `usage:
+  tov-search <query...>    search the index (built on first use)
+  tov-search index [root]  scan the disk (or root) and save the index
+`
+
+function die(msg: string): void {
+  process.stderr.write(`tov-search: ${msg}\n`)
+  process.exit(1)
+}
+
+// Where the index lives: like the Rust app's folder.
+function dataDir(h: string): string {
+  if (process.platform === "darwin") {
+    return `${h}/Library/Application Support/TovSearch`
   }
+  const x = process.env.XDG_DATA_HOME ?? ""
+  return x.startsWith("/") ? `${x}/tov-search` : `${h}/.local/share/tov-search`
+}
+
+// Folders not to scan. macOS without Full Disk Access: the ones a consent
+// prompt guards, which would stop the scan until someone answered it.
+function skipped(h: string): string[] {
+  if (process.platform !== "darwin") {
+    return ["/proc", "/sys", "/dev", "/run"]
+  }
+  let full = (process.env.TOV_SEARCH_RESTRICT ?? "") === ""
+  if (full) {
+    try {
+      readFileSync("/Library/Application Support/com.apple.TCC/TCC.db")
+    } catch (e) {
+      full = false
+    }
+  }
+  if (full) {
+    return []
+  }
+  return ["Desktop", "Documents", "Downloads", "Library/Mobile Documents", "Library/Containers", "Library/Group Containers",
+    "Library/CloudStorage", "Pictures/Photos Library.photoslibrary"].map((d) => `${h}/${d}`).concat(["/Volumes"])
+}
+
+function index(root: string, h: string, file: string): void throws Error {
+  const t = Date.now()
+  const disk = scanDisk(root, skipped(h), Math.trunc(t / 1000))
+  try mkdirSync(dataDir(h), { recursive: true })
+  const err = writeFile(file, disk)
+  if (err !== "") {
+    throw new Error(`write ${file}: ${err}`)
+  }
+  process.stderr.write(`indexed ${root} in ${Math.round(Date.now() - t)} ms\n`)
+}
+
+function cli(args: string[]): void throws Error {
+  if (args.length === 0 || args[0] === "-h" || args[0] === "--help") {
+    process.stderr.write(USAGE)
+    return
+  }
+  const h = process.env.HOME ?? "/"
+  const file = `${dataDir(h)}/disk.bin`
+  if (args[0] === "index") {
+    try index(args.length > 1 ? args[1]! : "/", h, file)
+    return
+  }
+  if (!existsSync(file)) {
+    try index("/", h, file)
+  }
+  setHome(h)
+  setLinuxPriors(process.platform === "linux")
+  try readDisk(file)
+  setNow(Math.trunc(Date.now() / 1000))
+  try build()
+  namesAlloc()
+  memosAlloc()
+  extIndexBuild()
+  let q: Query = { tokens: [], kind: -1, exts: [], hasScope: false, scope: [], sizeLo: 0, sizeHi: MAXV, mtimeLo: 0, mtimeHi: 4294967295, limit: 50 }
+  try {
+    q = parse(args.join(" "))
+  } catch (e) {
+    die(e.message)
+    return
+  }
+  search(q)
+  out = []
+  for (let j = 0; j < topIdx.length; j++) {
+    putPath(topIdx[j]!)
+    out.push(u8(10))
+  }
+  writeOut(out)
+}
+
+// The benchmark engine (bench/PROTOCOL.md), when the binary is named engine*:
+//
+//   engine <disk-file> [home [linux]]   home and Linux folder ranking for real disks
+function main(): void throws Error {
+  const me = process.argv[0]!.split("/")
+  const args = process.argv.slice(2)
+  if (!me[me.length - 1]!.startsWith("engine")) {
+    try cli(args)
+    return
+  }
+  if (args.length < 1) {
+    throw new Error("usage: engine <disk-file> [home [linux]]")
+  }
+  if (args.length > 1) {
+    setHome(args[1]!)
+  }
+  setLinuxPriors(args.length > 2 && args[2] === "linux")
   try readDisk(args[0]!)
   try build()
   namesAlloc()

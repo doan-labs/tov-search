@@ -1,7 +1,7 @@
 // The index: entries, dir blocks, interned names, per-name entry lists and
 // the static score order, all built once by build().
 
-import { HOME, NONE, KIND_DIR } from "./consts"
+import { home, NONE, KIND_DIR, FLAG_MOUNT } from "./consts"
 import { zerosU32, zerosU8, zerosI32, zerosI16, encDec, bytesEq } from "./bytes"
 import { buf, b8, nrec, rParent, rKind, rSize, rMtime, rOff, rLen, kids, sortKids,
   kidsNew, kidsSet, kidsClear, diskRelease } from "./disk"
@@ -97,7 +97,7 @@ export function build(): void throws Error {
       const c = int(kids[j]!)
       entRec[pos] = u32(c)
       par[pos] = u32(e)
-      if ((int(rKind[c]!) & 3) === KIND_DIR) {
+      if ((int(rKind[c]!) & 3) === KIND_DIR && (int(rKind[c]!) & FLAG_MOUNT) === 0) {
         kp.push(pos)
         kr.push(c)
       }
@@ -232,7 +232,7 @@ export function build(): void throws Error {
       dirEnd[p] = dirEnd[k2]!
     }
   }
-  const comps = HOME.split("/").filter((c) => c !== "").map((c) => new TextEncoder().encode(c))
+  const comps = home.split("/").filter((c) => c !== "").map((c) => new TextEncoder().encode(c))
   dirPrior = zerosI32(d)
   const depth: int[] = [0]
   const hm: int[] = [0]

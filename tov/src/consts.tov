@@ -1,6 +1,12 @@
 // Shared constants used across the engine's modules.
 
-export const HOME = "/Users/bench"
+// What `~` means in queries, and the folder ranking favors. The benchmark's
+// disk has its home at /Users/bench; the command line sets the user's.
+export let home = "/Users/bench"
+export function setHome(h: string): void {
+  home = h
+}
+
 export const NONE = 4294967295
 export const NO = -1000000000 // "no match" score: below any real one, so max() works
 export const MAXV = 9223372036854775807 // stands in for u64::MAX in ranges
@@ -9,6 +15,7 @@ export const KIND_FILE = 0
 export const KIND_DIR = 1
 export const KIND_LINK = 2
 export const FLAG_HIDDEN = 4
+export const FLAG_MOUNT = 8 // a folder the scan did not enter (another disk, or skipped): no block
 
 export const FUZZY = 0
 export const EXACT = 1

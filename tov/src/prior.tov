@@ -20,8 +20,34 @@ export const ADJ_VALS = [-20, -20, -20, -20, -20, -20, -20, -20,
 export const APPLICATIONS = enc("Applications")
 export const DOT_APP = enc(".app")
 
+// A Linux disk: its top level ranked like the Mac's (/home like /Users, /usr
+// like /System, /media and /mnt like /Volumes), and Trash, snaps and flatpaks
+// sunk like caches. The benchmark disk is a Mac's.
+export let linuxPriors = false
+export function setLinuxPriors(on: bool): void {
+  linuxPriors = on
+}
+export const LINUX_DEPTH1 = ["home", "root", "media", "mnt", "opt", "var", "srv", "snap", "usr", "boot"].map(enc)
+export const LINUX_DEPTH1_ADJ = [0, 0, -10, -10, -25, -25, -25, -25, -40, -40]
+export const LINUX_SUNK = ["Trash", "snap", "flatpak"].map(enc)
+
 // How much a directory's name moves everything under it in ranking.
 export function priorAdjust(o: int, l: int, depth: int): int {
+  if (linuxPriors) {
+    if (depth === 1) {
+      for (let j = 0; j < LINUX_DEPTH1.length; j++) {
+        if (bytesEq(o, l, LINUX_DEPTH1[j]!)) {
+          return LINUX_DEPTH1_ADJ[j]!
+        }
+      }
+      return -35
+    }
+    for (let j = 0; j < LINUX_SUNK.length; j++) {
+      if (bytesEq(o, l, LINUX_SUNK[j]!)) {
+        return -20
+      }
+    }
+  }
   if (depth === 1) {
     for (let j = 0; j < DEPTH1.length; j++) {
       if (bytesEq(o, l, DEPTH1[j]!)) {
