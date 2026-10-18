@@ -9,13 +9,14 @@ rewritten in [Tov](https://tov.sh/) as an experiment.
 
 ## Install
 
-macOS (Apple Silicon):
+macOS (Apple Silicon) and Linux (x86_64 with AVX2, arm64):
 
 ```sh
-brew install doan-labs/tap/tov-search
+curl -fsSL https://raw.githubusercontent.com/doan-labs/tov-search/main/install.sh | sh
 ```
 
-Linux: build from source, see [rust/README.md](rust/README.md).
+Or with Homebrew: `brew install doan-labs/tap/tov-search`. To build from
+source, see [rust/README.md](rust/README.md).
 
 ## Usage
 
