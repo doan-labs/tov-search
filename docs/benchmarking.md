@@ -58,10 +58,17 @@ python3 compare/compare.py run /tmp/random.txt --disk bench/data/disk.bin --engi
 Run the last line on `bench/traces/holdout.txt` too. Use one idle
 machine, one job at a time. Put every number in the PR, including bad ones.
 
-## fsearch and fff
+## fsearch, fff and fzf
 
 `compare/` times Tov, fsearch and fff on holdout, a random list and the
 Linux source (fsearch only builds on macOS, so run it on a Mac; CI no longer
 does). It is one run and varies
 ±20%, so it isn't proof. fff skips hidden and ignored files, so it searches
 fewer files.
+
+`compare/fzf-engine` puts fzf's own matcher behind the same protocol
+(`compare/fzf-engine/build.sh`, needs Go; add it with
+`--engine fzf=compare/fzf-engine/target/fzf-engine`). fzf has no filters
+(`ext:`, `size:` and the like), so time it on plain word queries only. Like
+fzf's walker, it indexes files, not folders. On a 10M-file disk one timed run
+takes hours.

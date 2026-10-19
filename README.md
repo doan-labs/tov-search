@@ -39,8 +39,9 @@ Query syntax:
 
 ## Performance
 
-Compared with [fsearch](https://github.com/noahdunnagan/fsearch) and
-[fff](https://github.com/dmtrKovalenko/fff): see [compare/](compare/) and
+Compared with [fsearch](https://github.com/noahdunnagan/fsearch),
+[fff](https://github.com/dmtrKovalenko/fff) and
+[fzf](https://github.com/junegunn/fzf): see [compare/](compare/) and
 [docs/benchmarking.md](docs/benchmarking.md).
 
 ## Repository layout
@@ -49,7 +50,7 @@ Compared with [fsearch](https://github.com/noahdunnagan/fsearch) and
 |---|---|
 | [`tov/`](tov/) | The engine, CLI and background program, in [Tov](https://tov.sh) with C kernels |
 | [`bench/`](bench/) | The benchmark harness, test disk generator, traces and saved answers |
-| [`compare/`](compare/) | Benchmarks against fsearch and fff |
+| [`compare/`](compare/) | Benchmarks against fsearch, fff and fzf |
 | [`docs/`](docs/) | Architecture, testing and benchmarking |
 
 ## Development

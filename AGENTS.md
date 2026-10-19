@@ -12,7 +12,7 @@ Start with [README.md](README.md), then read the doc for your task.
 | Find where something lives, understand the index or a keystroke | [docs/architecture.md](docs/architecture.md) |
 | Build, write or change a kernel, change parsing, scoring or layout | [docs/kernels.md](docs/kernels.md) |
 | Prove a change is correct, CI | [docs/testing.md](docs/testing.md) |
-| Measure speed, prove a change faster, compare with fsearch and fff | [docs/benchmarking.md](docs/benchmarking.md) |
+| Measure speed, prove a change faster, compare with fsearch, fff and fzf | [docs/benchmarking.md](docs/benchmarking.md) |
 | The engine protocol and disk format | [bench/PROTOCOL.md](bench/PROTOCOL.md) |
 | Short Tov how-to | [tov/README.md](tov/README.md) |
 | Cut a release, update the Homebrew install (two steps, don't skip the second) | [tov/README.md#release](tov/README.md#release) |

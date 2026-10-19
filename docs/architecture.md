@@ -18,7 +18,7 @@ keystroke does in `tov/engine.tov` and the modules in `tov/src/`.
 | `tov/tools/diff_oracle.py`, `tov/bugs/` | Offline transcript comparison; minimal Tov compiler bug repros. |
 | `tov/tools/diff-check.py`, `stress-check.py`, `ab2.py` | Two builds on synthetic disks and query chains, byte-compared; interleaved A/B timing. |
 | `bench/` | **Frozen spec:** harness, disk generator/fingerprint, traces, saved oracle answers, `PROTOCOL.md`. |
-| `compare/` | Timing against fsearch and fff. |
+| `compare/` | Timing against fsearch, fff and fzf. |
 | `.github/workflows/tov.yml` | Linux compiler/platform matrix; pinned Tov install. |
 
 ## Oracle
