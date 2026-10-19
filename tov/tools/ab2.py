@@ -8,7 +8,7 @@ Compares per-keystroke medians across rounds like the bench metric does.
 Usage: python3 ab2.py <engineA> <engineB> [rounds] [trace-file]
 Keystrokes default to the dev trace expanded like bench does.
 """
-import re
+
 import statistics
 import subprocess
 import sys
@@ -82,7 +82,9 @@ def main():
     msa = sum(m[0] for m in mn)
     msb = sum(m[1] for m in mn)
     mwins = sum(1 for a, b in mn if b < a)
-    print(f"sum-of-mins:    A {msa/1e6:.1f}ms  B {msb/1e6:.1f}ms  delta {(msb-msa)/msa*100:+.2f}%  B-wins {mwins}/{len(ks)}")
+    print(
+        f"sum-of-mins:    A {msa/1e6:.1f}ms  B {msb/1e6:.1f}ms  delta {(msb-msa)/msa*100:+.2f}%  B-wins {mwins}/{len(ks)}"
+    )
     # noise estimate: keystroke-level delta distribution
     ds = sorted(b - a for a, b, _ in med)
     p = len(ds)

@@ -21,6 +21,7 @@ query can't carry the total, how many queries got faster or slower, and the
 mean per query kind. gen writes a fresh trace of every query kind, so a
 change can be checked on queries nobody has tuned against.
 """
+
 import math
 import os
 from array import array
@@ -54,7 +55,15 @@ def mkdisk(src, out):
         parent, path = queue.pop(0)
         for e in sorted(os.scandir(path), key=lambda e: e.name):
             st = e.stat(follow_symlinks=False)
-            kind = 2 if e.is_symlink() else 1 if e.is_dir(follow_symlinks=False) else 0 if e.is_file(follow_symlinks=False) else 3
+            kind = (
+                2
+                if e.is_symlink()
+                else 1
+                if e.is_dir(follow_symlinks=False)
+                else 0
+                if e.is_file(follow_symlinks=False)
+                else 3
+            )
             i = push(parent, os.fsencode(e.name), kind, st.st_size, int(st.st_mtime))
             if kind == 1:
                 queue.append((i, e.path))
@@ -97,7 +106,9 @@ def gen(disk, out, seed, count):
             dirs = dirs[::-1][2:]  # drop Users, bench
             nm = name(i)
             if dirs and all(SAFE.fullmatch(d) for d in dirs + [nm]) and len(nm.split(b".")[0]) >= 3 and typed(nm):
-                return nm.decode(), [dirs[0].decode()] + [d.decode() for d in dirs[1:] if typed(d)]  # top folder first, for in:
+                return nm.decode(), [dirs[0].decode()] + [
+                    d.decode() for d in dirs[1:] if typed(d)
+                ]  # top folder first, for in:
 
     def typed(s):
         """Names people type: not hashes, uuids or temp folders."""
@@ -121,12 +132,17 @@ def gen(disk, out, seed, count):
         "typo": lambda nm, st, ext, d: typo(st),
         "folder word": lambda nm, st, ext, d: f"{frag(rng.choice(d))} {frag(st)}",
         "ext": lambda nm, st, ext, d: f"ext:{ext} {frag(st)}" if ext else f"ext:txt {frag(st)}",
-        "type": lambda nm, st, ext, d: f"type:{rng.choice(['image', 'video', 'audio', 'doc', 'code', 'archive'])} {frag(st)}",
+        "type": lambda nm,
+        st,
+        ext,
+        d: f"type:{rng.choice(['image', 'video', 'audio', 'doc', 'code', 'archive'])} {frag(st)}",
         "kind": lambda nm, st, ext, d: f"kind:dir {frag(rng.choice(d))}",
         "in": lambda nm, st, ext, d: f"in:~/{d[0]} {frag(st)}",
         "size": lambda nm, st, ext, d: f"size:{size()} {frag(st)}",
         "negate": lambda nm, st, ext, d: f"!{rng.choice(pick()[1])} {frag(st)}",
-        "mode": lambda nm, st, ext, d: rng.choice([f"^{frag(st)}", f"{nm[-rng.randint(3, len(nm)):]}$", f"'{frag(st)}"]),
+        "mode": lambda nm, st, ext, d: rng.choice(
+            [f"^{frag(st)}", f"{nm[-rng.randint(3, len(nm)):]}$", f"'{frag(st)}"]
+        ),
     }
     order = [k for _ in range(-(-count // len(kinds))) for k in kinds][:count]
     rng.shuffle(order)
@@ -202,7 +218,12 @@ def rel(path):
 def run(argv):
     path, args = argv[0], argv[1:]
     opt = lambda f: args[args.index(f) + 1] if f in args else None
-    engines = [(*a.split("=", 1), flag) for flag in ("--engine", "--dir-engine") for i, a in enumerate(args) if i and args[i - 1] == flag]
+    engines = [
+        (*a.split("=", 1), flag)
+        for flag in ("--engine", "--dir-engine")
+        for i, a in enumerate(args)
+        if i and args[i - 1] == flag
+    ]
     rows = trace(path)
     keys, final, spans = [], [], []
     for q, want in rows:
@@ -217,11 +238,13 @@ def run(argv):
 
     results = {name: [] for name, _, _ in engines}
     for n in range(PASSES):  # rotate the order, so drift doesn't always hit the same engine
-        for name, binary, flag in engines[n % len(engines):] + engines[: n % len(engines)]:
+        for name, binary, flag in engines[n % len(engines) :] + engines[: n % len(engines)]:
             results[name].append(run_engine([binary, opt("--disk" if flag == "--engine" else "--dir")], keys))
 
-    print(f"{len(keys)} keystrokes from {os.path.basename(path)}. Total = sum of per-key medians over "
-          f"{ROUNDS} rounds; median of {PASSES} passes in rotated order, (min-max). One machine, one run: not an A/B.\n")
+    print(
+        f"{len(keys)} keystrokes from {os.path.basename(path)}. Total = sum of per-key medians over "
+        f"{ROUNDS} rounds; median of {PASSES} passes in rotated order, (min-max). One machine, one run: not an A/B.\n"
+    )
     head = ["engine", "total ms", "p50 key ms", "startup s", "peak RSS MB", "unstable keys"]
     if graded:
         head += ["found first", "found in top 10"]
@@ -232,8 +255,14 @@ def run(argv):
         totals = sorted(sum(r[0]) for r in runs)
         mid = min(runs, key=lambda r: abs(sum(r[0]) - totals[len(totals) // 2]))
         med, answers, startup, rss, _ = mid
-        cells = [name, f"{totals[len(totals) // 2]:.1f} ({totals[0]:.1f}-{totals[-1]:.1f})", f"{statistics.median(med):.3f}",
-                 f"{startup:.2f}", f"{rss:.0f}", str(max(r[4] for r in runs))]
+        cells = [
+            name,
+            f"{totals[len(totals) // 2]:.1f} ({totals[0]:.1f}-{totals[-1]:.1f})",
+            f"{statistics.median(med):.3f}",
+            f"{startup:.2f}",
+            f"{rss:.0f}",
+            str(max(r[4] for r in runs)),
+        ]
         if graded:
             for n in (1, 10):
                 cells.append(f"{sum(w in answers[k][:n] for k, w in final)}/{len(final)}")
@@ -249,8 +278,10 @@ def per_query(results, names, spans):
     kinds = sorted({kind_of(q) for q, _, _ in spans})
     gm = lambda rs: math.exp(statistics.fmean(math.log(r) for r in rs)) if rs else float("nan")
     base = names[0]
-    print(f"\nPer query, against {base}: time ratio, so below 1 is faster. Geometric mean over "
-          f"{len(spans)} queries; faster/slower means past ±{BAND:.0%}.\n")
+    print(
+        f"\nPer query, against {base}: time ratio, so below 1 is faster. Geometric mean over "
+        f"{len(spans)} queries; faster/slower means past ±{BAND:.0%}.\n"
+    )
     head = ["engine", "geo mean", "faster", "slower"] + kinds
     print("| " + " | ".join(head) + " |")
     print("|---" * len(head) + "|")

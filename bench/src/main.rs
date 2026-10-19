@@ -20,8 +20,8 @@ mod stats;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const BENCH_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -62,7 +62,9 @@ fn args() -> Args {
         oracle: true,
     };
     let mut it = std::env::args().skip(1);
-    let num = |v: Option<String>, what: &str| v.and_then(|r| r.parse().ok()).filter(|&r| r > 0).unwrap_or_else(|| die(&format!("{what} needs a number")));
+    let num = |v: Option<String>, what: &str| {
+        v.and_then(|r| r.parse().ok()).filter(|&r| r > 0).unwrap_or_else(|| die(&format!("{what} needs a number")))
+    };
     while let Some(x) = it.next() {
         match x.as_str() {
             "--engine" => a.engine = it.next().unwrap_or_else(|| die("--engine needs a path")).into(),
@@ -85,7 +87,9 @@ fn main() {
         "ab" => cmd_ab(&a),
         "oracle" => cmd_oracle(&a),
         "stats" => stats::print(&disk::parse(&read(&a.disk)).unwrap_or_else(|e| die(&e)).0),
-        _ => die("usage: bench gen | run <trace> | ab <trace> <engineA> <engineB> | oracle <trace> | stats   [--engine bin] [--disk f] [--rounds n] [--pairs n] [--no-oracle]"),
+        _ => die(
+            "usage: bench gen | run <trace> | ab <trace> <engineA> <engineB> | oracle <trace> | stats   [--engine bin] [--disk f] [--rounds n] [--pairs n] [--no-oracle]",
+        ),
     }
 }
 
@@ -110,7 +114,9 @@ fn cmd_gen(out: &Path) {
     let fp = fingerprint(&b);
     println!("wrote {} ({} MB) in {:.1}s, fingerprint {fp}", out.display(), b.len() >> 20, t.elapsed().as_secs_f64());
     match expected() {
-        Some(e) if e != fp => die(&format!("fingerprint differs from bench/DATASET ({e}): the generator is not deterministic here")),
+        Some(e) if e != fp => {
+            die(&format!("fingerprint differs from bench/DATASET ({e}): the generator is not deterministic here"))
+        }
         Some(_) => println!("matches bench/DATASET"),
         None => println!("no bench/DATASET yet"),
     }
@@ -211,7 +217,11 @@ fn run_engine(engine: &Path, disk: &Path, keys: &[String], rounds: usize) -> Run
         for (k, q) in keys.iter().enumerate() {
             resp.clear();
             let t = Instant::now();
-            stdin.write_all(q.as_bytes()).and_then(|_| stdin.write_all(b"\n")).and_then(|_| stdin.flush()).unwrap_or_else(|_| die("engine closed stdin"));
+            stdin
+                .write_all(q.as_bytes())
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush())
+                .unwrap_or_else(|_| die("engine closed stdin"));
             loop {
                 next_line(&mut line);
                 if line == b"\n" {
@@ -313,15 +323,32 @@ fn cmd_run(a: &Args) {
     std::fs::create_dir_all(&out_dir).unwrap();
     let mut tsv = String::from("keystroke\tmedian_us\thits\toracle\n");
     for (k, q) in keys.iter().enumerate() {
-        let ok = if !a.oracle { "-" } else if bad.contains(&k) { "FAIL" } else { "ok" };
+        let ok = if !a.oracle {
+            "-"
+        } else if bad.contains(&k) {
+            "FAIL"
+        } else {
+            "ok"
+        };
         tsv += &format!("{q}\t{:.0}\t{}\t{ok}\n", r.med[k], r.seen[k].lines().count());
     }
     std::fs::write(out_dir.join(format!("{trace}.tsv")), tsv).unwrap();
 
     println!("metric: {:.3}", r.metric());
-    println!("p50_ms: {:.3}  p90_ms: {:.3}  p99_ms: {:.3}  max_ms: {:.3}", pct(&r.med, 50), pct(&r.med, 90), pct(&r.med, 99), pct(&r.med, 100));
+    println!(
+        "p50_ms: {:.3}  p90_ms: {:.3}  p99_ms: {:.3}  max_ms: {:.3}",
+        pct(&r.med, 50),
+        pct(&r.med, 90),
+        pct(&r.med, 99),
+        pct(&r.med, 100)
+    );
     println!("peak_rss_mb: {:.0}  startup_s: {:.2}", r.peak_rss_mb, r.startup_s);
-    println!("keystrokes: {}  rounds: {}  cpus: {}", keys.len(), a.rounds, std::thread::available_parallelism().map_or(0, |n| n.get()));
+    println!(
+        "keystrokes: {}  rounds: {}  cpus: {}",
+        keys.len(),
+        a.rounds,
+        std::thread::available_parallelism().map_or(0, |n| n.get())
+    );
     if !a.oracle {
         println!("oracle: SKIPPED");
     } else if bad.is_empty() && r.unstable == 0 {
@@ -338,7 +365,8 @@ fn cmd_run(a: &Args) {
 /// Alternate whole runs A, B, A, B, ... so machine drift hits both alike.
 fn cmd_ab(a: &Args) {
     check_disk(a);
-    let [trace, ea, eb] = [0, 1, 2].map(|i| a.pos.get(i).cloned().unwrap_or_else(|| die("usage: bench ab <trace> <engineA> <engineB>")));
+    let [trace, ea, eb] =
+        [0, 1, 2].map(|i| a.pos.get(i).cloned().unwrap_or_else(|| die("usage: bench ab <trace> <engineA> <engineB>")));
     let keys = keystrokes(&trace);
     let (mut ma, mut mb, mut wins) = (Vec::new(), Vec::new(), 0);
     for i in 0..a.pairs {
@@ -351,7 +379,16 @@ fn cmd_ab(a: &Args) {
             }
         }
         wins += (rb.metric() < ra.metric()) as usize;
-        println!("pair {}: A {:.3}  B {:.3}  rss A {:.0} B {:.0} MB  startup A {:.2} B {:.2} s", i + 1, ra.metric(), rb.metric(), ra.peak_rss_mb, rb.peak_rss_mb, ra.startup_s, rb.startup_s);
+        println!(
+            "pair {}: A {:.3}  B {:.3}  rss A {:.0} B {:.0} MB  startup A {:.2} B {:.2} s",
+            i + 1,
+            ra.metric(),
+            rb.metric(),
+            ra.peak_rss_mb,
+            rb.peak_rss_mb,
+            ra.startup_s,
+            rb.startup_s
+        );
         ma.push(ra.metric());
         mb.push(rb.metric());
     }
@@ -362,6 +399,10 @@ fn cmd_ab(a: &Args) {
     let (a_med, b_med) = (median(&mut ma), median(&mut mb));
     println!("A median: {a_med:.3}");
     println!("B median: {b_med:.3}");
-    println!("change: {:+.2}%  (negative = B faster)  B faster in {wins}/{} pairs", (b_med / a_med - 1.0) * 100.0, a.pairs);
+    println!(
+        "change: {:+.2}%  (negative = B faster)  B faster in {wins}/{} pairs",
+        (b_med / a_med - 1.0) * 100.0,
+        a.pairs
+    );
     println!("oracle: {}", if a.oracle { "PASS" } else { "SKIPPED" });
 }

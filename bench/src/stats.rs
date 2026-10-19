@@ -5,11 +5,26 @@ use crate::disk::{Ent, FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use std::collections::HashMap;
 
 /// Folder names whose subtrees dominate real disks.
-const MARKS: &[&str] =
-    &["node_modules", ".git", "Library", "Caches", "site-packages", "target", "DerivedData", ".cache", "Containers", "Pods", "build", "dist", "Frameworks"];
+const MARKS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "Library",
+    "Caches",
+    "site-packages",
+    "target",
+    "DerivedData",
+    ".cache",
+    "Containers",
+    "Pods",
+    "build",
+    "dist",
+    "Frameworks",
+];
 
 /// Query fragments whose match rate drives search cost.
-pub const PROBES: &[&str] = &["a", "s", "p", "m", "in", "pa", "ma", "re", "con", "src", "main", "test", "index", "png", "json", "lib", "readme"];
+pub const PROBES: &[&str] = &[
+    "a", "s", "p", "m", "in", "pa", "ma", "re", "con", "src", "main", "test", "index", "png", "json", "lib", "readme",
+];
 
 fn pct(v: &mut [u32], p: &[usize]) -> String {
     v.sort_unstable();
@@ -32,7 +47,13 @@ pub fn print(ents: &[Ent]) {
     let f = |k: usize| format!("{:.1}%", 100.0 * k as f64 / n as f64);
     let count = |pred: &dyn Fn(&Ent) -> bool| ents.iter().filter(|e| pred(e)).count();
     let dirs = count(&|e| e.kind & 3 == KIND_DIR);
-    println!("entries {n}  dirs {dirs} ({})  files {}  links {}  hidden-flag {}", f(dirs), f(count(&|e| e.kind & 3 == KIND_FILE)), f(count(&|e| e.kind & 3 == KIND_LINK)), f(count(&|e| e.kind & FLAG_HIDDEN != 0)));
+    println!(
+        "entries {n}  dirs {dirs} ({})  files {}  links {}  hidden-flag {}",
+        f(dirs),
+        f(count(&|e| e.kind & 3 == KIND_FILE)),
+        f(count(&|e| e.kind & 3 == KIND_LINK)),
+        f(count(&|e| e.kind & FLAG_HIDDEN != 0))
+    );
 
     let mut uniq: HashMap<&[u8], u32> = HashMap::with_capacity(n / 3);
     for e in &ents[1..] {
@@ -42,7 +63,16 @@ pub fn print(ents: &[Ent]) {
     let bucket = |lo: u32, hi: u32| mult.iter().filter(|&&c| c >= lo && c <= hi).count();
     let (b1, b2, b3, b4) = (bucket(1, 1), bucket(2, 9), bucket(10, 99), bucket(100, u32::MAX));
     let bytes: usize = uniq.keys().map(|k| k.len()).sum();
-    println!("distinct names {} ({:.2} per entry, {} MB)  used once {} | 2-9 {} | 10-99 {} | 100+ {}", uniq.len(), uniq.len() as f64 / n as f64, bytes >> 20, b1, b2, b3, b4);
+    println!(
+        "distinct names {} ({:.2} per entry, {} MB)  used once {} | 2-9 {} | 10-99 {} | 100+ {}",
+        uniq.len(),
+        uniq.len() as f64 / n as f64,
+        bytes >> 20,
+        b1,
+        b2,
+        b3,
+        b4
+    );
     println!("most repeated name counts: {}", pct(&mut mult, &[50, 90, 99, 100]));
     mult.sort_unstable_by(|a, b| b.cmp(a));
     println!("top 10 repeat counts: {:?}", &mult[..10.min(mult.len())]);
@@ -60,7 +90,11 @@ pub fn print(ents: &[Ent]) {
     println!("depth: {}", pct(&mut depth.clone(), &[10, 50, 90, 99, 100]));
     let mut dk: Vec<u32> = (0..n).filter(|&i| ents[i].kind & 3 == KIND_DIR || i == 0).map(|i| kids[i]).collect();
     let empty = dk.iter().filter(|&&k| k == 0).count();
-    println!("children per dir: {}  empty dirs {:.1}%", pct(&mut dk, &[50, 90, 99, 100]), 100.0 * empty as f64 / dk.len() as f64);
+    println!(
+        "children per dir: {}  empty dirs {:.1}%",
+        pct(&mut dk, &[50, 90, 99, 100]),
+        100.0 * empty as f64 / dk.len() as f64
+    );
     let mut lens: Vec<u32> = ents[1..].iter().map(|e| e.name.len() as u32).collect();
     println!("name length: {}", pct(&mut lens, &[10, 50, 90, 99, 100]));
 
@@ -84,7 +118,14 @@ pub fn print(ents: &[Ent]) {
     }
     let mut ev: Vec<_> = exts.into_iter().collect();
     ev.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("top extensions: {}", ev.iter().take(30).map(|(e, c)| format!("{} {}", String::from_utf8_lossy(e), f(*c))).collect::<Vec<_>>().join(", "));
+    println!(
+        "top extensions: {}",
+        ev.iter()
+            .take(30)
+            .map(|(e, c)| format!("{} {}", String::from_utf8_lossy(e), f(*c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let mut tops: HashMap<&[u8], usize> = HashMap::new();
     let mut top_of = vec![0u32; n];
@@ -94,10 +135,22 @@ pub fn print(ents: &[Ent]) {
     }
     let mut tv: Vec<_> = tops.into_iter().collect();
     tv.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("under /: {}", tv.iter().take(12).map(|(t, c)| format!("{} {}", String::from_utf8_lossy(t), f(*c))).collect::<Vec<_>>().join(", "));
+    println!(
+        "under /: {}",
+        tv.iter()
+            .take(12)
+            .map(|(t, c)| format!("{} {}", String::from_utf8_lossy(t), f(*c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!(
         "inside folder named: {}",
-        MARKS.iter().enumerate().map(|(k, m)| format!("{m} {}", f(marks.iter().filter(|&&x| x & (1 << k) != 0).count()))).collect::<Vec<_>>().join(", ")
+        MARKS
+            .iter()
+            .enumerate()
+            .map(|(k, m)| format!("{m} {}", f(marks.iter().filter(|&&x| x & (1 << k) != 0).count())))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
 
     let names: Vec<&[u8]> = uniq.keys().copied().collect();

@@ -208,7 +208,9 @@ impl G {
         let parts: Vec<&str> = (0..k).map(|_| self.word()).collect();
         let cap = |s: &str| s[..1].to_uppercase() + &s[1..];
         match style {
-            Style::Camel => parts.iter().enumerate().map(|(i, p)| if i == 0 { p.to_string() } else { cap(p) }).collect(),
+            Style::Camel => {
+                parts.iter().enumerate().map(|(i, p)| if i == 0 { p.to_string() } else { cap(p) }).collect()
+            }
             Style::Pascal => parts.iter().map(|p| cap(p)).collect(),
             Style::Kebab => parts.join("-"),
             Style::Snake => parts.join("_"),
@@ -322,7 +324,9 @@ fn fw_mtime(g: &mut G) -> u32 {
 /// Localized resource folders, each with a few .strings / .nib files.
 fn lprojs(g: &mut G, res: &mut Dir, n: usize, m: u32) {
     let files = g.r.range(1, 6) as usize;
-    let names: Vec<String> = (0..files).map(|k| if k == 0 { "Localizable.strings".to_string() } else { format!("{}.strings", g.ident(Style::Pascal)) }).collect();
+    let names: Vec<String> = (0..files)
+        .map(|k| if k == 0 { "Localizable.strings".to_string() } else { format!("{}.strings", g.ident(Style::Pascal)) })
+        .collect();
     let nibs = g.r.below(3) as usize;
     let nib_names: Vec<String> = (0..nibs).map(|_| format!("{}.nib", g.ident(Style::Pascal))).collect();
     let locs = g.v.locales.clone();
@@ -351,7 +355,11 @@ fn app(g: &mut G, p: &mut Dir, name: &str, electron: bool, size: usize) {
     g.file(&mut res, "Assets.car", 900_000, m);
     lprojs(g, &mut res, if electron { 55 } else { 30 }, m);
     for _ in 0..size {
-        let n = format!("{}.{}", g.ident(Style::Pascal), g.r.pick(&["png", "tiff", "plist", "nib", "storyboardc", "json", "js", "css"]));
+        let n = format!(
+            "{}.{}",
+            g.ident(Style::Pascal),
+            g.r.pick(&["png", "tiff", "plist", "nib", "storyboardc", "json", "js", "css"])
+        );
         let s = g.size_for(&n);
         g.file(&mut res, &n, s, m);
     }
@@ -364,7 +372,14 @@ fn app(g: &mut G, p: &mut Dir, name: &str, electron: bool, size: usize) {
         let mut va = g.must(&mut vers, "A");
         g.file(&mut va, "Electron Framework", 180_000_000, m);
         let mut r = g.must(&mut va, "Resources");
-        for f in ["Info.plist", "icudtl.dat", "resources.pak", "chrome_100_percent.pak", "chrome_200_percent.pak", "v8_context_snapshot.arm64.bin"] {
+        for f in [
+            "Info.plist",
+            "icudtl.dat",
+            "resources.pak",
+            "chrome_100_percent.pak",
+            "chrome_200_percent.pak",
+            "v8_context_snapshot.arm64.bin",
+        ] {
             let s = g.size_for(f);
             g.file(&mut r, f, s, m);
         }
@@ -567,7 +582,9 @@ fn project(g: &mut G, p: &mut Dir, name: &str) {
     let Some(mut d) = g.dir(p, name) else { return };
     let kind = g.r.below(100);
     let m = g.r.mtime();
-    let fresh = |g: &mut G| if g.r.odds(300) { NOW - g.r.below(14 * DAY as u64) as u32 } else { m - g.r.below(200 * DAY as u64) as u32 };
+    let fresh = |g: &mut G| {
+        if g.r.odds(300) { NOW - g.r.below(14 * DAY as u64) as u32 } else { m - g.r.below(200 * DAY as u64) as u32 }
+    };
     for f in ["README.md", ".gitignore"] {
         let t = fresh(g);
         g.file(&mut d, f, 2000, t);
@@ -603,7 +620,16 @@ fn project(g: &mut G, p: &mut Dir, name: &str) {
                 let t = fresh(g);
                 g.file(&mut d, f, 1500, t);
             }
-            for f in ["pnpm-lock.yaml", "vite.config.ts", "webpack.config.js", ".eslintrc.json", ".prettierrc", "next.config.js", "jest.config.js", "tailwind.config.js"] {
+            for f in [
+                "pnpm-lock.yaml",
+                "vite.config.ts",
+                "webpack.config.js",
+                ".eslintrc.json",
+                ".prettierrc",
+                "next.config.js",
+                "jest.config.js",
+                "tailwind.config.js",
+            ] {
                 if g.r.odds(300) {
                     g.file(&mut d, f, 1500, m);
                 }
@@ -628,7 +654,12 @@ fn project(g: &mut G, p: &mut Dir, name: &str) {
                 let mut dist = g.must(&mut d, if g.r.odds(500) { "dist" } else { "build" });
                 let mut assets = g.must(&mut dist, "assets");
                 for _ in 0..g.r.range(5, 120) {
-                    let n = format!("{}-{}.{}", g.ident(Style::Camel), g.r.alnum(8), g.r.pick(&["js", "css", "js.map", "svg", "png", "woff2"]));
+                    let n = format!(
+                        "{}-{}.{}",
+                        g.ident(Style::Camel),
+                        g.r.alnum(8),
+                        g.r.pick(&["js", "css", "js.map", "svg", "png", "woff2"])
+                    );
                     let s = g.size_for(&n);
                     g.file(&mut assets, &n, s, m);
                 }
@@ -701,7 +732,23 @@ fn project(g: &mut G, p: &mut Dir, name: &str) {
 /// A source tree of about `n` files in feature folders.
 fn source_tree(g: &mut G, root: &mut Dir, exts: &[&str], style: Style, n: usize) {
     let mut dirs: Vec<Dir> = Vec::new();
-    for d in ["components", "utils", "lib", "hooks", "api", "models", "services", "pages", "routes", "store", "types", "styles", "config", "handlers", "db"] {
+    for d in [
+        "components",
+        "utils",
+        "lib",
+        "hooks",
+        "api",
+        "models",
+        "services",
+        "pages",
+        "routes",
+        "store",
+        "types",
+        "styles",
+        "config",
+        "handlers",
+        "db",
+    ] {
         if g.r.odds(350) {
             if let Some(x) = g.dir(root, d) {
                 dirs.push(x);
@@ -716,7 +763,13 @@ fn source_tree(g: &mut G, root: &mut Dir, exts: &[&str], style: Style, n: usize)
         let stem = match g.r.below(20) {
             0 => "index".to_string(),
             1 => "main".to_string(),
-            2 => if style as u8 == Style::Pascal as u8 { "App".to_string() } else { "mod".to_string() },
+            2 => {
+                if style as u8 == Style::Pascal as u8 {
+                    "App".to_string()
+                } else {
+                    "mod".to_string()
+                }
+            }
             _ => g.ident(style),
         };
         let ext = g.r.pick(exts).to_string();
@@ -749,7 +802,16 @@ fn git_dir(g: &mut G, p: &mut Dir, m: u32) {
         g.file(&mut git, f, 300, m);
     }
     let mut hooks = g.must(&mut git, "hooks");
-    for h in ["pre-commit", "pre-push", "commit-msg", "post-update", "pre-rebase", "prepare-commit-msg", "update", "fsmonitor-watchman"] {
+    for h in [
+        "pre-commit",
+        "pre-push",
+        "commit-msg",
+        "post-update",
+        "pre-rebase",
+        "prepare-commit-msg",
+        "update",
+        "fsmonitor-watchman",
+    ] {
         g.file(&mut hooks, &format!("{h}.sample"), 1500, m);
     }
     let mut info = g.must(&mut git, "info");
@@ -839,7 +901,8 @@ fn venv(g: &mut G, p: &mut Dir) {
         let mut subs: Vec<Dir> = Vec::new();
         for _ in 0..files {
             let stem = g.ident(Style::Snake);
-            let into = if !subs.is_empty() && g.r.odds(500) { Some(g.r.below(subs.len() as u64) as usize) } else { None };
+            let into =
+                if !subs.is_empty() && g.r.odds(500) { Some(g.r.below(subs.len() as u64) as usize) } else { None };
             let ok = match into {
                 Some(k) => g.file(&mut subs[k], &format!("{stem}.py"), 4000, NOW - 90 * DAY),
                 None => g.file(&mut pk, &format!("{stem}.py"), 4000, NOW - 90 * DAY),
@@ -866,7 +929,17 @@ fn system(g: &mut G, sys: &mut Dir, until: u32) {
     let mut fws = g.must(&mut lib, "Frameworks");
     let mut pfws = g.must(&mut lib, "PrivateFrameworks");
     let mut cs = g.must(&mut lib, "CoreServices");
-    for a in ["Finder", "Dock", "SystemUIServer", "Spotlight", "Siri", "Setup Assistant", "Software Update", "ControlCenter", "NotificationCenter"] {
+    for a in [
+        "Finder",
+        "Dock",
+        "SystemUIServer",
+        "Spotlight",
+        "Siri",
+        "Setup Assistant",
+        "Software Update",
+        "ControlCenter",
+        "NotificationCenter",
+    ] {
         app(g, &mut cs, a, false, 20);
     }
     let mut k = 0;
@@ -880,7 +953,20 @@ fn system(g: &mut G, sys: &mut Dir, until: u32) {
         }
     }
     let mut app = g.must(sys, "Applications");
-    for a in ["Safari", "Mail", "Messages", "Notes", "Calendar", "Photos", "Music", "TV", "Maps", "Preview", "TextEdit", "Utilities"] {
+    for a in [
+        "Safari",
+        "Mail",
+        "Messages",
+        "Notes",
+        "Calendar",
+        "Photos",
+        "Music",
+        "TV",
+        "Maps",
+        "Preview",
+        "TextEdit",
+        "Utilities",
+    ] {
         if let Some(mut x) = g.dir(&mut app, &format!("{a}.app")) {
             g.file(&mut x, "Contents", 0, NOW - 100 * DAY);
         }
@@ -948,7 +1034,9 @@ fn library_root(g: &mut G, lib: &mut Dir, until: u32) {
         let n = format!("{}.h", g.ident(Style::Snake));
         g.file(&mut dirs[k], &n, 5000, NOW - 300 * DAY);
     }
-    for d in ["Application Support", "Caches", "Fonts", "LaunchAgents", "LaunchDaemons", "Logs", "PrivilegedHelperTools"] {
+    for d in
+        ["Application Support", "Caches", "Fonts", "LaunchAgents", "LaunchDaemons", "Logs", "PrivilegedHelperTools"]
+    {
         let mut x = g.must(lib, d);
         for _ in 0..g.r.range(3, 30) {
             let n = format!("com.{}.{}", g.word(), g.ident(Style::Camel));
@@ -1015,7 +1103,20 @@ fn usr_tree(g: &mut G, usr: &mut Dir) {
 
 fn private_tree(g: &mut G, private: &mut Dir, until: u32) {
     let mut etc = g.must(private, "etc");
-    for f in ["hosts", "zshrc", "zprofile", "bashrc", "paths", "shells", "ssh_config", "sudoers", "resolv.conf", "passwd", "group", "profile"] {
+    for f in [
+        "hosts",
+        "zshrc",
+        "zprofile",
+        "bashrc",
+        "paths",
+        "shells",
+        "ssh_config",
+        "sudoers",
+        "resolv.conf",
+        "passwd",
+        "group",
+        "profile",
+    ] {
         g.file(&mut etc, f, 1000, NOW - 300 * DAY);
     }
     let mut var = g.must(private, "var");
@@ -1079,7 +1180,11 @@ fn private_tree(g: &mut G, private: &mut Dir, until: u32) {
                 }
             }
             6..8 => {
-                let n = format!("{}{}", g.r.pick(&["TemporaryItems-", "playwright-", "vscode-", "node-compile-cache-", "go-build"]), g.r.alnum(10));
+                let n = format!(
+                    "{}{}",
+                    g.r.pick(&["TemporaryItems-", "playwright-", "vscode-", "node-compile-cache-", "go-build"]),
+                    g.r.alnum(10)
+                );
                 if let Some(mut d) = g.dir(&mut t, &n) {
                     let mut sub: Vec<Dir> = Vec::new();
                     for _ in 0..g.r.skew(1, 3000) {
@@ -1097,7 +1202,8 @@ fn private_tree(g: &mut G, private: &mut Dir, until: u32) {
                 }
             }
             _ => {
-                let n = format!("{}.{}", g.ident(Style::Camel), g.r.pick(&["tmp", "log", "json", "txt", "lock", "sock"]));
+                let n =
+                    format!("{}.{}", g.ident(Style::Camel), g.r.pick(&["tmp", "log", "json", "txt", "lock", "sock"]));
                 let m = g.r.mtime();
                 g.file(&mut t, &n, 4000, m);
             }
@@ -1109,7 +1215,20 @@ fn home_tree(g: &mut G, home: &mut Dir) {
     let total_until = TOTAL;
     let home_start = g.n();
     let share = |pct: u32| home_start + (total_until - home_start) / 1000 * pct;
-    for f in [".zshrc", ".zprofile", ".zsh_history", ".gitconfig", ".npmrc", ".bash_profile", ".viminfo", ".CFUserTextEncoding", ".DS_Store", ".lesshst", ".python_history", ".node_repl_history"] {
+    for f in [
+        ".zshrc",
+        ".zprofile",
+        ".zsh_history",
+        ".gitconfig",
+        ".npmrc",
+        ".bash_profile",
+        ".viminfo",
+        ".CFUserTextEncoding",
+        ".DS_Store",
+        ".lesshst",
+        ".python_history",
+        ".node_repl_history",
+    ] {
         let t = if f.contains("history") { NOW - 600 } else { g.r.mtime() };
         g.file(home, f, 3000, t);
     }
@@ -1148,7 +1267,11 @@ fn home_tree(g: &mut G, home: &mut Dir) {
 fn project_name(g: &mut G) -> String {
     match g.r.below(4) {
         0 => g.ident(Style::Kebab),
-        1 => format!("{}-{}", g.word(), g.r.pick(&["web", "api", "app", "server", "client", "cli", "sdk", "docs", "infra", "mobile"])),
+        1 => format!(
+            "{}-{}",
+            g.word(),
+            g.r.pick(&["web", "api", "app", "server", "client", "cli", "sdk", "docs", "infra", "mobile"])
+        ),
         2 => g.ident(Style::Pascal),
         _ => g.word().to_string(),
     }
@@ -1162,10 +1285,24 @@ fn user_files(g: &mut G, home: &mut Dir) {
             0 => (format!("Invoice-{}-{:02}", g.r.range(2019, 2026), g.r.range(1, 12)), "pdf"),
             1 => (format!("invoice_{:04}", g.r.below(3000)), "pdf"),
             2 => (format!("Budget {}", g.r.range(2018, 2026)), "xlsx"),
-            3 => (format!("{} report {}", g.r.pick(&["Quarterly", "Annual", "Monthly", "Sales", "Weekly"]), g.r.range(2018, 2026)), g.r.pick(&["pdf", "docx", "key"])),
+            3 => (
+                format!(
+                    "{} report {}",
+                    g.r.pick(&["Quarterly", "Annual", "Monthly", "Sales", "Weekly"]),
+                    g.r.range(2018, 2026)
+                ),
+                g.r.pick(&["pdf", "docx", "key"]),
+            ),
             4 => (format!("Meeting notes {}", g.r.range(1, 300)), g.r.pick(&["md", "docx", "txt"])),
-            5 => (g.r.pick(&["Resume", "CV", "resume", "Cover Letter", "Notes", "notes", "Todo", "Ideas"]).to_string() + &format!(" {}", g.r.below(20)), g.r.pick(&["pdf", "docx", "md", "pages"])),
-            _ => (g.ident(Style::Pascal), g.r.pick(&["pdf", "docx", "xlsx", "pptx", "txt", "md", "numbers", "pages", "csv"])),
+            5 => (
+                g.r.pick(&["Resume", "CV", "resume", "Cover Letter", "Notes", "notes", "Todo", "Ideas"]).to_string()
+                    + &format!(" {}", g.r.below(20)),
+                g.r.pick(&["pdf", "docx", "md", "pages"]),
+            ),
+            _ => (
+                g.ident(Style::Pascal),
+                g.r.pick(&["pdf", "docx", "xlsx", "pptx", "txt", "md", "numbers", "pages", "csv"]),
+            ),
         };
         let n = format!("{stem}.{ext}");
         let s = g.size_for(&n);
@@ -1179,7 +1316,11 @@ fn user_files(g: &mut G, home: &mut Dir) {
             1 => format!("{}.zip", g.ident(Style::Kebab)),
             2 => format!("{} ({}).pdf", g.ident(Style::Pascal), g.r.range(1, 9)),
             3 => format!("IMG_{}.HEIC", g.r.range(1000, 9999)),
-            _ => format!("{}.{}", g.ident(Style::Kebab), g.r.pick(&["pdf", "csv", "png", "jpg", "zip", "json", "pkg", "mp4"])),
+            _ => format!(
+                "{}.{}",
+                g.ident(Style::Kebab),
+                g.r.pick(&["pdf", "csv", "png", "jpg", "zip", "json", "pkg", "mp4"])
+            ),
         };
         let s = g.size_for(&n);
         let t = g.r.mtime();
@@ -1189,9 +1330,25 @@ fn user_files(g: &mut G, home: &mut Dir) {
     for _ in 0..400 {
         let t = g.r.mtime();
         let n = if g.r.odds(850) {
-            format!("Screenshot {}-{:02}-{:02} at {}.{:02}.{:02}.png", g.r.range(2021, 2026), g.r.range(1, 12), g.r.range(1, 28), g.r.range(1, 12), g.r.below(60), g.r.below(60))
+            format!(
+                "Screenshot {}-{:02}-{:02} at {}.{:02}.{:02}.png",
+                g.r.range(2021, 2026),
+                g.r.range(1, 12),
+                g.r.range(1, 28),
+                g.r.range(1, 12),
+                g.r.below(60),
+                g.r.below(60)
+            )
         } else {
-            format!("Screen Recording {}-{:02}-{:02} at {}.{:02}.{:02}.mov", g.r.range(2021, 2026), g.r.range(1, 12), g.r.range(1, 28), g.r.range(1, 12), g.r.below(60), g.r.below(60))
+            format!(
+                "Screen Recording {}-{:02}-{:02} at {}.{:02}.{:02}.mov",
+                g.r.range(2021, 2026),
+                g.r.range(1, 12),
+                g.r.range(1, 28),
+                g.r.range(1, 12),
+                g.r.below(60),
+                g.r.below(60)
+            )
         };
         let s = g.size_for(&n);
         g.file(&mut desk, &n, s, t);
@@ -1210,8 +1367,22 @@ fn user_files(g: &mut G, home: &mut Dir) {
     drop(fan);
     for _ in 0..800 {
         let n = match g.r.below(3) {
-            0 => format!("IMG_{}{:02}{:02}_{:06}.jpg", g.r.range(2016, 2026), g.r.range(1, 12), g.r.range(1, 28), g.r.below(240000)),
-            1 => format!("photo_{}-{:02}-{:02}_{:02}-{:02}-{:02}.jpg", g.r.range(2016, 2026), g.r.range(1, 12), g.r.range(1, 28), g.r.below(24), g.r.below(60), g.r.below(60)),
+            0 => format!(
+                "IMG_{}{:02}{:02}_{:06}.jpg",
+                g.r.range(2016, 2026),
+                g.r.range(1, 12),
+                g.r.range(1, 28),
+                g.r.below(240000)
+            ),
+            1 => format!(
+                "photo_{}-{:02}-{:02}_{:02}-{:02}-{:02}.jpg",
+                g.r.range(2016, 2026),
+                g.r.range(1, 12),
+                g.r.range(1, 28),
+                g.r.below(24),
+                g.r.below(60),
+                g.r.below(60)
+            ),
             _ => format!("IMG_{}.JPG", g.r.range(1000, 9999)),
         };
         let s = g.size_for(&n);
@@ -1345,7 +1516,11 @@ fn home_library(g: &mut G, lib: &mut Dir, until: u32) {
         for sub in ["Caches", "Preferences", "Application Support", "Saved Application State", "Cookies", "WebKit"] {
             if let Some(mut s) = g.dir(&mut dl, sub) {
                 for _ in 0..g.r.skew(0, 200) {
-                    let f = format!("{}.{}", g.ident(Style::Camel), g.r.pick(&["plist", "db", "sqlite", "json", "binarycookies"]));
+                    let f = format!(
+                        "{}.{}",
+                        g.ident(Style::Camel),
+                        g.r.pick(&["plist", "db", "sqlite", "json", "binarycookies"])
+                    );
                     g.file(&mut s, &f, 4000, g.r.mtime());
                 }
             }
@@ -1364,7 +1539,11 @@ fn home_library(g: &mut G, lib: &mut Dir, until: u32) {
             let mut b = g.must(&mut p, "Build");
             let mut i = g.must(&mut b, "Intermediates.noindex");
             for _ in 0..g.r.skew(20, 4000) {
-                let f = format!("{}.{}", g.ident(Style::Pascal), g.r.pick(&["o", "d", "dia", "swiftdeps", "swiftmodule", "swiftdoc"]));
+                let f = format!(
+                    "{}.{}",
+                    g.ident(Style::Pascal),
+                    g.r.pick(&["o", "d", "dia", "swiftdeps", "swiftmodule", "swiftdoc"])
+                );
                 g.file(&mut i, &f, 30_000, g.r.mtime());
             }
         } else {
@@ -1461,7 +1640,15 @@ fn dot_dirs(g: &mut G, home: &mut Dir, until: u32) {
         let v = g.version();
         let Some(mut d) = g.dir(&mut idx, &format!("{c}-{v}")) else { continue };
         let m = NOW - g.r.below(400 * DAY as u64) as u32;
-        for f in ["Cargo.toml", "Cargo.toml.orig", "README.md", "LICENSE-MIT", "LICENSE-APACHE", ".cargo_vcs_info.json", "Cargo.lock"] {
+        for f in [
+            "Cargo.toml",
+            "Cargo.toml.orig",
+            "README.md",
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            ".cargo_vcs_info.json",
+            "Cargo.lock",
+        ] {
             if f == "Cargo.toml" || g.r.odds(600) {
                 g.file(&mut d, f, 3000, m);
             }
@@ -1514,7 +1701,11 @@ fn dot_dirs(g: &mut G, home: &mut Dir, until: u32) {
             continue;
         }
         let k = g.r.below(dirs.len() as u64) as usize;
-        let n = format!("{}.{}.html", g.r.pick(&["fn", "struct", "trait", "enum", "macro", "type", "constant"]), g.ident(Style::Snake));
+        let n = format!(
+            "{}.{}.html",
+            g.r.pick(&["fn", "struct", "trait", "enum", "macro", "type", "constant"]),
+            g.ident(Style::Snake)
+        );
         g.file(&mut dirs[k], &n, 20_000, NOW - 60 * DAY);
     }
     drop(dirs);
@@ -1541,7 +1732,20 @@ fn dot_dirs(g: &mut G, home: &mut Dir, until: u32) {
     }
     let mut cache = g.must(home, ".cache");
     while g.more(until) {
-        let n = g.r.pick(&["huggingface", "pip", "uv", "prisma", "node-gyp", "typescript", "puppeteer", "selenium", "yarn", "deno"]).to_string();
+        let n =
+            g.r.pick(&[
+                "huggingface",
+                "pip",
+                "uv",
+                "prisma",
+                "node-gyp",
+                "typescript",
+                "puppeteer",
+                "selenium",
+                "yarn",
+                "deno",
+            ])
+            .to_string();
         let mut d = match g.dir(&mut cache, &n) {
             Some(d) => d,
             None => {

@@ -14,10 +14,7 @@ class ModulesTest(unittest.TestCase):
             a = root / "sub" / "a.tov"
             b = root / "sub" / "b.tov"
             a.parent.mkdir()
-            entry.write_text(
-                "import { a } from './sub/a'\n"
-                "import { again } from './sub/../sub/a'\n"
-            )
+            entry.write_text("import { a } from './sub/a'\n" "import { again } from './sub/../sub/a'\n")
             a.write_text("import { b } from '../sub/../sub/b'\n")
             b.write_text("import { a } from '../sub/./a'\n")
 
@@ -122,12 +119,7 @@ class ParseTovTest(unittest.TestCase):
                 "}\n",
             ),
         ]
-        c = (
-            "static tv_arr g2_values;\n"
-            "static tv_int f2_update(tv_int p0) {\n"
-            "  return p0;\n"
-            "}\n"
-        )
+        c = "static tv_arr g2_values;\n" "static tv_int f2_update(tv_int p0) {\n" "  return p0;\n" "}\n"
 
         hooks, globals_ = inject.parse_tov(mods, c)
         signature = inject.check_c_signature(hooks[0], c)

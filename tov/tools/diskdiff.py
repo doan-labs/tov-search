@@ -6,6 +6,7 @@
 Prints the entry counts, then up to 20 entries only in each (path, kind,
 size, mtime). Exits 1 if they differ. The record order may differ.
 """
+
 import struct
 import sys
 

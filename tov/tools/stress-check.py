@@ -5,6 +5,7 @@ of every shape, candidate vs reference, byte-compared.
 
 Usage: stress-check.py CAND REF [seed] [entries]
 """
+
 import random
 import struct
 import subprocess
@@ -12,8 +13,43 @@ import sys
 import pathlib
 
 NOW = 1_780_000_000
-SYL = ["re", "ad", "me", "src", "in", "dex", "con", "fig", "pho", "to", "web", "pack", "doc", "ker", "test", "main",
-       "Read", "ME", "x", "a", "b", "e", "s", "t", "2024", "20", "1", "0", "_", "-", ".", " ", "lib", "App", "tsx"]
+SYL = [
+    "re",
+    "ad",
+    "me",
+    "src",
+    "in",
+    "dex",
+    "con",
+    "fig",
+    "pho",
+    "to",
+    "web",
+    "pack",
+    "doc",
+    "ker",
+    "test",
+    "main",
+    "Read",
+    "ME",
+    "x",
+    "a",
+    "b",
+    "e",
+    "s",
+    "t",
+    "2024",
+    "20",
+    "1",
+    "0",
+    "_",
+    "-",
+    ".",
+    " ",
+    "lib",
+    "App",
+    "tsx",
+]
 EXTS = ["", ".md", ".rs", ".ts", ".json", ".txt", ".png", ".log", ".app", ".DS_Store"]
 
 
@@ -53,10 +89,50 @@ def build(seed, n):
 
 def chains(seed):
     r = random.Random(seed + 1)
-    words = ["readme", "rdme", "raedme", "readm", "src", "index", "config", "confgi", "photo 2024", "webpack c",
-             "docker co", "test main", "main", "a", "x", "e", ".", "re", "2024", "20", "app", "lib", "tsx", "ME",
-             "0", "dex", "fig", "packer", "Read", "readme.md", "ad me", "'read", "'te", "^src", "^App", "md$",
-             ".json$", "'2024", "^.", "'x", "s", "r"]
+    words = [
+        "readme",
+        "rdme",
+        "raedme",
+        "readm",
+        "src",
+        "index",
+        "config",
+        "confgi",
+        "photo 2024",
+        "webpack c",
+        "docker co",
+        "test main",
+        "main",
+        "a",
+        "x",
+        "e",
+        ".",
+        "re",
+        "2024",
+        "20",
+        "app",
+        "lib",
+        "tsx",
+        "ME",
+        "0",
+        "dex",
+        "fig",
+        "packer",
+        "Read",
+        "readme.md",
+        "ad me",
+        "'read",
+        "'te",
+        "^src",
+        "^App",
+        "md$",
+        ".json$",
+        "'2024",
+        "^.",
+        "'x",
+        "s",
+        "r",
+    ]
     out = []
     for w in words:
         out.append(w)

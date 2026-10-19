@@ -14,6 +14,7 @@ Chains cover: positive multi-token, negation, exact/prefix/suffix modes,
 ext/type/kind/in/size/mtime/re/path/limit filters, limit changes mid-chain,
 regex changes mid-chain, typos, non-ASCII, empty and invalid queries.
 """
+
 import pathlib
 import random
 import struct
@@ -51,7 +52,7 @@ def write(name, blob):
 def run(engine, disk_path, keys):
     out = subprocess.check_output([engine, disk_path], input=("\n".join(keys) + "\n").encode(), timeout=600)
     _req(out.startswith(b"ready\n"), f"{engine} did not print ready")
-    body = out[len(b"ready\n"):]
+    body = out[len(b"ready\n") :]
     # Strict framing: per key, consume row lines until a REQUIRED blank
     # terminator; an empty answer is exactly one newline. Missing
     # terminator, dropped query, or trailing bytes all fail loud.
@@ -64,12 +65,10 @@ def run(engine, disk_path, keys):
             i += 1
         # A terminator must be a real blank line: the split artifact's
         # final "" (from a trailing newline) does not count.
-        _req(i < len(lines) - 1,
-             f"{engine}: answer for key {len(answers)} lacks blank-line terminator")
+        _req(i < len(lines) - 1, f"{engine}: answer for key {len(answers)} lacks blank-line terminator")
         i += 1  # consume terminator
         answers.append(b"\n".join(rows))
-    _req(i == len(lines) - 1 and lines[i] == b"",
-         f"{engine}: {len(lines) - i} stray line(s) after {len(keys)} answers")
+    _req(i == len(lines) - 1 and lines[i] == b"", f"{engine}: {len(lines) - i} stray line(s) after {len(keys)} answers")
     return answers
 
 
@@ -106,25 +105,61 @@ def build_disks():
 
     # STRESS EXTRA (non-canonical): root-only disk with the 0xFFFFFFFF
     # parent sentinel a real disk writer could emit. Kept labeled.
-    ds["noncanon_emptyroot"] = write(
-        "noncanon_emptyroot", disk([(0xFFFFFFFF, DIR, 0, NOW, b"")]))
+    ds["noncanon_emptyroot"] = write("noncanon_emptyroot", disk([(0xFFFFFFFF, DIR, 0, NOW, b"")]))
 
     # Adversarial names under root and a couple of dirs.
     names = [
-        b".", b"..", b"...", b"..abc", b".abc", b".abc.", b"foo..abc",
+        b".",
+        b"..",
+        b"...",
+        b"..abc",
+        b".abc",
+        b".abc.",
+        b"foo..abc",
         b"a" + b"x" * 150 + b"bcd",  # very long name -> negative scores
         b"x" * 300,
-        b"main.rs", b"mian.rs", b"MAIN.RS", b"Main.Rs",
-        b"caf\xc3\xa9", b"caf\xc3\xa9.rs", b"caf\xc3\xa9 ".rstrip(),
-        ".txt".encode(), "файл.rs".encode(), "🚀rocket.rs".encode(),
-        b"a b c d e f", b" spaced name ", b" ", b"   ",
-        b"0abc", b"9z", b"a0", b"123456789",
-        b"UPPER", b"MiXeD", b"with_underscore", b"with-dash", b"with.dot.dots",
-        b"trailing.", b".hidden", b"~tilde", b"semi;colon", b"quote'quote",
-        b"node_modules", b"index.js", b"index.ts", b"index",
-        b"src", b"test", b"manifest.json", b"manifesto",
-        b"a" * 80, b"a" * 81,  # len-penalty boundary 80
-        b"x" * 10 + b".rs", b"ab cd", b"ab  cd", b"ab.cd",
+        b"main.rs",
+        b"mian.rs",
+        b"MAIN.RS",
+        b"Main.Rs",
+        b"caf\xc3\xa9",
+        b"caf\xc3\xa9.rs",
+        b"caf\xc3\xa9 ".rstrip(),
+        ".txt".encode(),
+        "файл.rs".encode(),
+        "🚀rocket.rs".encode(),
+        b"a b c d e f",
+        b" spaced name ",
+        b" ",
+        b"   ",
+        b"0abc",
+        b"9z",
+        b"a0",
+        b"123456789",
+        b"UPPER",
+        b"MiXeD",
+        b"with_underscore",
+        b"with-dash",
+        b"with.dot.dots",
+        b"trailing.",
+        b".hidden",
+        b"~tilde",
+        b"semi;colon",
+        b"quote'quote",
+        b"node_modules",
+        b"index.js",
+        b"index.ts",
+        b"index",
+        b"src",
+        b"test",
+        b"manifest.json",
+        b"manifesto",
+        b"a" * 80,
+        b"a" * 81,  # len-penalty boundary 80
+        b"x" * 10 + b".rs",
+        b"ab cd",
+        b"ab  cd",
+        b"ab.cd",
     ]
     recs = [(0, DIR, 0, NOW, b"")]
     recs += [(0, DIR, 0, NOW, b"d"), (0, DIR, 0, NOW, b".dotdir"), (0, DIR, 0, NOW, b"Library")]
@@ -140,7 +175,12 @@ def build_disks():
     recs.append((0, FILE | HIDDEN, 5, NOW, b"hid"))
     # deeper path: /Users/bench/Developer/x
     di = len(recs)
-    recs += [(0, DIR, 0, NOW, b"Users"), (di, DIR, 0, NOW, b"bench"), (di + 1, DIR, 0, NOW, b"Developer"), (di + 2, DIR, 0, NOW, b"x")]
+    recs += [
+        (0, DIR, 0, NOW, b"Users"),
+        (di, DIR, 0, NOW, b"bench"),
+        (di + 1, DIR, 0, NOW, b"Developer"),
+        (di + 2, DIR, 0, NOW, b"x"),
+    ]
     recs += [(di + 3, FILE, 100, NOW, b"main.rs"), (di + 3, FILE, 200, NOW, b"index.ts")]
     validate_canonical(recs, "adversarial")
     ds["adversarial"] = write("adversarial", disk(recs))
@@ -148,10 +188,30 @@ def build_disks():
     # Pseudo-random disk: ~60k entries, mixed names/kinds/flags/depths.
     rng = random.Random(12345)
     recs = [(0, DIR, 0, NOW, b"")]
-    words = [b"main", b"index", b"src", b"test", b"config", b"node", b"lib",
-             b"photo", b"screenshot", b"docker", b"compose", b"webpack",
-             b"readme", b"license", b"Makefile", b"utils", b"invoice",
-             b"settings", b"module", b"handler", b"server", b"client"]
+    words = [
+        b"main",
+        b"index",
+        b"src",
+        b"test",
+        b"config",
+        b"node",
+        b"lib",
+        b"photo",
+        b"screenshot",
+        b"docker",
+        b"compose",
+        b"webpack",
+        b"readme",
+        b"license",
+        b"Makefile",
+        b"utils",
+        b"invoice",
+        b"settings",
+        b"module",
+        b"handler",
+        b"server",
+        b"client",
+    ]
     exts = [b"rs", b"ts", b"js", b"json", b"md", b"txt", b"png", b"log", b"py"]
     dirs = [0]
     used = {0: set()}  # parent idx -> child names, for unique paths
@@ -220,7 +280,7 @@ def build_disks():
         recs.append((0, DIR, 0, NOW, f"d{j}".encode()))
     for j in range(10000):
         for l in range(7):
-            recs.append((1 + j, FILE, 10, NOW, b"z" + b"abcdefg"[l:l + 1]))
+            recs.append((1 + j, FILE, 10, NOW, b"z" + b"abcdefg"[l : l + 1]))
     validate_canonical(recs, "seedbound")
     ds["seedbound"] = write("seedbound", disk(recs))
 
@@ -231,22 +291,24 @@ def build_disks():
     # in the hi half ('z' at 64, 'Z' query folding onto it is covered by
     # 'ZZZ'-style chains below).
     bnames = [
-        b"x" * 64 + b"needle" + b"x" * 58,    # 128B, 'needle' only at 64..70
-        b"k" * 64 + b"Z" + b"k" * 63,         # 128B, single 'Z' at byte 64
-        b"p" * 63 + b"ab" + b"p" * 63,        # 128B, 'ab' spans 63..65
-        b"x" * 63 + b"needle" + b"x" * 58,    # 127B, match starts at 63
-        b"x" * 65 + b"needle" + b"x" * 58,    # 129B, above the window gate
-        b"k" * 58 + b"needle",                # 64B, lo-half edge
-        b"k" * 64 + b"n",                     # 65B, first hi-half byte
-        b"s" * 124 + b"tail",                 # 128B, suffix at 124..128
-        b"needle" + b"x" * 121,               # 128B, prefix match at 0
+        b"x" * 64 + b"needle" + b"x" * 58,  # 128B, 'needle' only at 64..70
+        b"k" * 64 + b"Z" + b"k" * 63,  # 128B, single 'Z' at byte 64
+        b"p" * 63 + b"ab" + b"p" * 63,  # 128B, 'ab' spans 63..65
+        b"x" * 63 + b"needle" + b"x" * 58,  # 127B, match starts at 63
+        b"x" * 65 + b"needle" + b"x" * 58,  # 129B, above the window gate
+        b"k" * 58 + b"needle",  # 64B, lo-half edge
+        b"k" * 64 + b"n",  # 65B, first hi-half byte
+        b"s" * 124 + b"tail",  # 128B, suffix at 124..128
+        b"needle" + b"x" * 121,  # 128B, prefix match at 0
         b"w" * 64 + b"abcdefghijklmnop" + b"w" * 48,  # 128B, len-16 token >64
-        b"w" * 64 + b"abcdefghijklmnopq" + b"w" * 47, # 128B, len-17 token >64
-        b"q" * 128,                           # 128B, matches nothing
-        b"camelhump" * 16,                    # 128B repeated word
+        b"w" * 64 + b"abcdefghijklmnopq" + b"w" * 47,  # 128B, len-17 token >64
+        b"q" * 128,  # 128B, matches nothing
+        b"camelhump" * 16,  # 128B repeated word
     ]
-    _req(len(bnames[0]) == 128 and len(bnames[3]) == 127 and len(bnames[4]) == 129,
-         "bounds128 fixture name lengths wrong")
+    _req(
+        len(bnames[0]) == 128 and len(bnames[3]) == 127 and len(bnames[4]) == 129,
+        "bounds128 fixture name lengths wrong",
+    )
     recs = [(0, DIR, 0, NOW, b"")]
     recs += [(0, FILE, 100 + i, NOW - 200 - i, nm) for i, nm in enumerate(bnames)]
     validate_canonical(recs, "bounds128")
@@ -259,15 +321,41 @@ def build_disks():
     #   negsparse 4/1600 (sparse), negedge 100/1600 (== u/16, sparse side),
     #   negover 101/1600 (dense side), negdense 400/1600 (dense).
     # Counts are asserted from the generated name list, not assumed.
-    for dname, te_count, total in [("negsparse", 4, 1600), ("negedge", 100, 1600),
-                                   ("negover", 101, 1600), ("negdense", 400, 1600)]:
+    for dname, te_count, total in [
+        ("negsparse", 4, 1600),
+        ("negedge", 100, 1600),
+        ("negover", 101, 1600),
+        ("negdense", 400, 1600),
+    ]:
         names = []
         for i in range(te_count):
             # 'test' contains "tes"; 'item' contains "te" only.
             names.append((b"test" if i % 2 == 0 else b"item") + b"%05d" % i)
-        fills = [b"alpha", b"bravo", b"cab", b"dir", b"flux", b"grid", b"hub",
-                 b"ion", b"jar", b"kit", b"lag", b"mon", b"nap", b"ox", b"pan",
-                 b"qua", b"ray", b"sky", b"urn", b"via", b"wax", b"yak", b"zig"]
+        fills = [
+            b"alpha",
+            b"bravo",
+            b"cab",
+            b"dir",
+            b"flux",
+            b"grid",
+            b"hub",
+            b"ion",
+            b"jar",
+            b"kit",
+            b"lag",
+            b"mon",
+            b"nap",
+            b"ox",
+            b"pan",
+            b"qua",
+            b"ray",
+            b"sky",
+            b"urn",
+            b"via",
+            b"wax",
+            b"yak",
+            b"zig",
+        ]
         i = 0
         while len(names) < total:
             names.append(fills[i % len(fills)] + b"%05d" % (i // len(fills)))
@@ -284,23 +372,62 @@ def build_disks():
 
     # neguni: unicode/multibyte + 127/128/129-byte names + mode families.
     unames = [
-        "caf\u00e9".encode(), "caf\u00e9cake".encode(), "\u00fcnix".encode(),
-        "\u00fcnsere".encode(), "a\u00fcns".encode(), "n\u00fcns".encode(),
-        "\u00e5ngstr\u00f6m".encode(), "x\u00e5b".encode(), "\u00e5bc".encode(),
-        "h\u00e5b".encode(), "\u00fcnn".encode(), "\u00e5".encode(),
-        b"x" * 62 + "\u00fc".encode() + b"x" * 63,   # 127B, 2-byte char at 62-63
-        b"x" * 62 + "\u00fc".encode() + b"x" * 64,   # 128B
-        b"x" * 62 + "\u00fc".encode() + b"x" * 65,   # 129B
-        b"k" * 62 + "\u00e5".encode() + b"k" * 64,   # 128B, \u00e5 at 62-63
-        b"code", b"inode", b"xnode", b"abmode", b"dcode", b"mynode",
-        b"plainde", b"wonode", b"nodemcu", b"nodular", b"nod",
-        b"abc", b"xabc", b"yxabc", b"abcy", b"xabcy", b"zabcz",
-        b"test", b"testi", b"besti", b"xesti", b"testa", b"bestin",
-        b"xestin", b"testin", b"zesti", b"tosti", b"tests", b"text",
-        b"foo", b"bar", b"plain", b"random", b"!x", b"~!test",
+        "caf\u00e9".encode(),
+        "caf\u00e9cake".encode(),
+        "\u00fcnix".encode(),
+        "\u00fcnsere".encode(),
+        "a\u00fcns".encode(),
+        "n\u00fcns".encode(),
+        "\u00e5ngstr\u00f6m".encode(),
+        "x\u00e5b".encode(),
+        "\u00e5bc".encode(),
+        "h\u00e5b".encode(),
+        "\u00fcnn".encode(),
+        "\u00e5".encode(),
+        b"x" * 62 + "\u00fc".encode() + b"x" * 63,  # 127B, 2-byte char at 62-63
+        b"x" * 62 + "\u00fc".encode() + b"x" * 64,  # 128B
+        b"x" * 62 + "\u00fc".encode() + b"x" * 65,  # 129B
+        b"k" * 62 + "\u00e5".encode() + b"k" * 64,  # 128B, \u00e5 at 62-63
+        b"code",
+        b"inode",
+        b"xnode",
+        b"abmode",
+        b"dcode",
+        b"mynode",
+        b"plainde",
+        b"wonode",
+        b"nodemcu",
+        b"nodular",
+        b"nod",
+        b"abc",
+        b"xabc",
+        b"yxabc",
+        b"abcy",
+        b"xabcy",
+        b"zabcz",
+        b"test",
+        b"testi",
+        b"besti",
+        b"xesti",
+        b"testa",
+        b"bestin",
+        b"xestin",
+        b"testin",
+        b"zesti",
+        b"tosti",
+        b"tests",
+        b"text",
+        b"foo",
+        b"bar",
+        b"plain",
+        b"random",
+        b"!x",
+        b"~!test",
     ]
-    _req(len(unames[12]) == 127 and len(unames[13]) == 128 and len(unames[14]) == 129,
-         "neguni boundary names wrong length")
+    _req(
+        len(unames[12]) == 127 and len(unames[13]) == 128 and len(unames[14]) == 129,
+        "neguni boundary names wrong length",
+    )
     _req(len(set(unames)) == len(unames), "neguni: duplicate names")
     recs = [(0, DIR, 0, NOW, b"")]
     recs += [(0, FILE, 10 + i, NOW - i * 3600, nm) for i, nm in enumerate(unames)]
@@ -356,34 +483,129 @@ CHAINS = [
     ["a limit:5", "a limit:50", "a limit:5", "a limit:500", "a limit:2"],
     # pos-empty filter transitions: ext/re/neg/kind flip mid-chain so the
     # selective/walk paths and name-cache invalidation all get exercised
-    ["ext:rs", "re:m", "!test", "ext:", "re:", "!n", "kind:dir", "ext:md",
-     "re:x", "!l", "kind:file", "ext:rs i", "re:main !t", "!x re:a"],
+    [
+        "ext:rs",
+        "re:m",
+        "!test",
+        "ext:",
+        "re:",
+        "!n",
+        "kind:dir",
+        "ext:md",
+        "re:x",
+        "!l",
+        "kind:file",
+        "ext:rs i",
+        "re:main !t",
+        "!x re:a",
+    ],
     # pos-empty cache transitions: identical name-side predicates under
     # different stat filters/limits must hit the posneg cache; changed
     # name-side keys must miss it. Covers limit 0/1/50, kind/scope/
     # path_re/ext/neg/name_re/mode on both sides of a repeat.
-    ["!n", "kind:file !n", "kind:dir !n", "size:>1mb !n", "mtime:<7d !n",
-     "limit:1 !n", "limit:50 !n", "limit:0 !n", "scope:/ !n", "!n",
-     "re:x", "re:x limit:1", "kind:file re:x", "path:a re:x",
-     "size:>10mb re:x", "re:x", "!test", "kind:file !test", "limit:0 !test",
-     "limit:1 !test", "!test m", "!test", "ext:rs", "ext:rs limit:0",
-     "ext:rs limit:1", "kind:dir ext:rs", "ext:rs", "kind:file",
-     "kind:dir", "kind:file", "size:>0", "mtime:>0", "kind:file"],
+    [
+        "!n",
+        "kind:file !n",
+        "kind:dir !n",
+        "size:>1mb !n",
+        "mtime:<7d !n",
+        "limit:1 !n",
+        "limit:50 !n",
+        "limit:0 !n",
+        "scope:/ !n",
+        "!n",
+        "re:x",
+        "re:x limit:1",
+        "kind:file re:x",
+        "path:a re:x",
+        "size:>10mb re:x",
+        "re:x",
+        "!test",
+        "kind:file !test",
+        "limit:0 !test",
+        "limit:1 !test",
+        "!test m",
+        "!test",
+        "ext:rs",
+        "ext:rs limit:0",
+        "ext:rs limit:1",
+        "kind:dir ext:rs",
+        "ext:rs",
+        "kind:file",
+        "kind:dir",
+        "kind:file",
+        "size:>0",
+        "mtime:>0",
+        "kind:file",
+    ],
     # neg-mode transitions: fuzzy/exact/prefix/suffix neg tokens flip
     # mode mid-chain, same text — posneg cache keys must distinguish
-    ["!test", "!^test", "!test$", "!test", "!^test", "kind:file !test",
-     "!test$", "!test", "size:>1mb !test$", "a !test", "!test a", "!a !test"],
+    [
+        "!test",
+        "!^test",
+        "!test$",
+        "!test",
+        "!^test",
+        "kind:file !test",
+        "!test$",
+        "!test",
+        "size:>1mb !test$",
+        "a !test",
+        "!test a",
+        "!a !test",
+    ],
     # byname seed-boundary: >limit matches, boundary key == seed floor
-    ["z", "z limit:1", "z limit:2", "z limit:49", "z limit:50", "z limit:51",
-     "z limit:60", "z limit:100", "z limit:120", "z limit:0", "z limit:20000",
-     "limit:50 z", "limit:1 z", "za", "zb", "zg", "z limit:5 z"],
+    [
+        "z",
+        "z limit:1",
+        "z limit:2",
+        "z limit:49",
+        "z limit:50",
+        "z limit:51",
+        "z limit:60",
+        "z limit:100",
+        "z limit:120",
+        "z limit:0",
+        "z limit:20000",
+        "limit:50 z",
+        "limit:1 z",
+        "za",
+        "zb",
+        "zg",
+        "z limit:5 z",
+    ],
     # 64/128-byte boundary chain: exercises fuzzy/exact/prefix/suffix and
     # negation on exactly-128B names with required chars only >byte 64,
     # q lengths 0/1/2/16/17, plus a cache transition re-query.
-    ["needle", "'needle", "^needle", "tail$", "needle$",
-     "abcdefghijklmnop", "abcdefghijklmnopq", "z", "Z", "ab", "x", "n", "q",
-     "needle z", "!needle", "!tail", "'z", "^n", "tail$ z", "camelhump",
-     "hump", "cam", "needle", "needle z", "size:>0", "ext:txt", ""],
+    [
+        "needle",
+        "'needle",
+        "^needle",
+        "tail$",
+        "needle$",
+        "abcdefghijklmnop",
+        "abcdefghijklmnopq",
+        "z",
+        "Z",
+        "ab",
+        "x",
+        "n",
+        "q",
+        "needle z",
+        "!needle",
+        "!tail",
+        "'z",
+        "^n",
+        "tail$ z",
+        "camelhump",
+        "hump",
+        "cam",
+        "needle",
+        "needle z",
+        "size:>0",
+        "ext:txt",
+        "",
+    ],
 ]
 
 # RAW chains: COMPLETE queries sent verbatim (no prefix expansion). Prefix
@@ -395,25 +617,25 @@ CHAINS = [
 # documented inline (negbit test plan gaps a-f + meta controls).
 RAW_CHAINS = [
     # gap a: suffix-mode neg extension — adjacent full queries.
-    ["!e$", "!te$", "!ste$", "!teste$"],          # narrow, narrow, narrow
-    ["!teste$", "!ste$", "!te$", "!e$"],          # shrink -> all rebuilds
+    ["!e$", "!te$", "!ste$", "!teste$"],  # narrow, narrow, narrow
+    ["!teste$", "!ste$", "!te$", "!e$"],  # shrink -> all rebuilds
     ["!e$ !te$", "!te$ !ste$", "!ste$ !teste$"],  # pairwise suffix narrows
-    ["!de$ !ode$", "!ode$ !de$"],                 # reject then reject
+    ["!de$ !ode$", "!ode$ !de$"],  # reject then reject
     # gap b: Exact non-prefix containment + reverse/self rejects.
     ["!abc", "!xabc", "!yxabc", "!xabc", "!abc"],
-    ["!ab", "!cab", "!abc"],                      # narrow then reject
+    ["!ab", "!cab", "!abc"],  # narrow then reject
     ["!abc !d", "!xabc !de", "!abc !d"],
-    ["!abc", "!acb", "!abc"],                     # same-len non-match rejects
+    ["!abc", "!acb", "!abc"],  # same-len non-match rejects
     # gap c: Prefix-mode neg chains + mode flips.
-    ["!^n", "!^no", "!^nod", "!^node"],           # all narrow
-    ["!^node", "!^nod", "!^no", "!^n"],           # shrink -> rebuilds
-    ["!^no", "!no", "!no$", "!no", "!^no"],       # mode flips -> rebuilds
-    ["!'no", "!no", "!'no"],                      # ' == Exact semantics
+    ["!^n", "!^no", "!^nod", "!^node"],  # all narrow
+    ["!^node", "!^nod", "!^no", "!^n"],  # shrink -> rebuilds
+    ["!^no", "!no", "!no$", "!no", "!^no"],  # mode flips -> rebuilds
+    ["!'no", "!no", "!'no"],  # ' == Exact semantics
     # gap e: token-count guards, equal-pair, positive-token guard.
-    ["!a", "!a !b", "!a", "!a !b"],               # count 1->2->1->2 rebuilds
-    ["!a !b", "!ab !b", "!a !bb"],                # extend first / second
-    ["!a !b", "!x y !z", "!a !b"],                # pos query leaves cache
-    ["!a !b", "", "!a !b"],                       # empty query leaves cache
+    ["!a", "!a !b", "!a", "!a !b"],  # count 1->2->1->2 rebuilds
+    ["!a !b", "!ab !b", "!a !bb"],  # extend first / second
+    ["!a !b", "!x y !z", "!a !b"],  # pos query leaves cache
+    ["!a !b", "", "!a !b"],  # empty query leaves cache
     # stale-entry discipline (meta): rebuild replaces, next must not
     # narrow from the wrong stored key.
     ["!test", "!xyz", "!testi", "!xyz", "!test"],

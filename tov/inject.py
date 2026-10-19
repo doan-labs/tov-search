@@ -36,6 +36,7 @@ A `// hook(raw):` function's kernel is the C body itself, pasted over Tov's
 
 Prints the paths of the contract kernels to compile, one per line.
 """
+
 import pathlib
 import re
 import sys
@@ -131,7 +132,9 @@ def parse_tov(mods, c: str):
             else:
                 t = TOV_SCALAR.get(cm[0])
                 ok = t is not None and (not elem or elem == t)
-                globals_[name]["type"] = (t, False) if ok else f"{path} says {elem or '(inferred)'}, Tov's C says {cm[0]}"
+                globals_[name]["type"] = (
+                    (t, False) if ok else f"{path} says {elem or '(inferred)'}, Tov's C says {cm[0]}"
+                )
 
     hooks = []
     fn_modules = {}
@@ -162,7 +165,7 @@ def parse_tov(mods, c: str):
             for d in doc:
                 for f in fields:
                     if d.startswith(f + ":"):
-                        fields[f] += d[len(f) + 1:].split()
+                        fields[f] += d[len(f) + 1 :].split()
             writes = []
             for w in fields["writes"]:
                 wm = re.fullmatch(r"(\w+)(?:\[:(\w+)\])?", w)
@@ -186,11 +189,19 @@ def parse_tov(mods, c: str):
                     die(f"{name}: writes {w}[:{n}]: {n} must be `return` or a written scalar")
                 if n and not globals_[w]["type"][1]:
                     die(f"{name}: writes {w}[:{n}]: {w} is not an array")
-            about = doc[next(i for i, d in enumerate(doc) if d.startswith(kind)):]
+            about = doc[next(i for i, d in enumerate(doc) if d.startswith(kind)) :]
             about = [d for d in about if not d.startswith(("reads:", "writes:"))]
-            hooks.append({"name": name, "raw": kind == "hook(raw):", "params": ps, "ret": ret,
-                          "reads": reads, "writes": writes,
-                          "doc": " ".join(about)[len(kind):].strip().replace("*/", "* /")})
+            hooks.append(
+                {
+                    "name": name,
+                    "raw": kind == "hook(raw):",
+                    "params": ps,
+                    "ret": ret,
+                    "reads": reads,
+                    "writes": writes,
+                    "doc": " ".join(about)[len(kind) :].strip().replace("*/", "* /"),
+                }
+            )
     return hooks, globals_
 
 
@@ -208,8 +219,10 @@ def check_c_signature(h, c: str):
     want_ret = "void" if h["ret"] == "void" else TYPES.get(h["ret"], (None, None))[1]
     want = ", ".join(f"{TYPES.get(t, (None, t))[1]} p{i}" for i, (_, t) in enumerate(h["params"])) or "void"
     if m.group(1) != want_ret or m.group(3) != want:
-        die(f"{h['c']} in Tov's C is `{m.group(1)} ({m.group(3)})`, the .tov implies "
-            f"`{want_ret} ({want})` (did Tov change its output?)")
+        die(
+            f"{h['c']} in Tov's C is `{m.group(1)} ({m.group(3)})`, the .tov implies "
+            f"`{want_ret} ({want})` (did Tov change its output?)"
+        )
     return m
 
 
@@ -220,22 +233,30 @@ def fields(h, g):
         t, arr = g[r]["type"]
         ct = ctype(t, r)
         gn = g[r]["c"]
-        f += ([(f"const {ct} *{r}", f".{r} = (const {ct} *)tv_arr_data({gn})"), (f"int64_t {r}_len", f".{r}_len = {gn}.len")]
-              if arr else [(f"{ct} {r}", f".{r} = {gn}")])
+        f += (
+            [
+                (f"const {ct} *{r}", f".{r} = (const {ct} *)tv_arr_data({gn})"),
+                (f"int64_t {r}_len", f".{r}_len = {gn}.len"),
+            ]
+            if arr
+            else [(f"{ct} {r}", f".{r} = {gn}")]
+        )
     for w, _ in h["writes"]:
         t, arr = g[w]["type"]
         ct = ctype(t, w)
         gn = g[w]["c"]
-        f += ([(f"{ct} *{w}", f".{w} = ({ct} *)tv_arr_data({gn})"), (f"int64_t {w}_len", f".{w}_len = {gn}.len")]
-              if arr else [(f"{ct} *{w}", f".{w} = &{gn}")])
+        f += (
+            [(f"{ct} *{w}", f".{w} = ({ct} *)tv_arr_data({gn})"), (f"int64_t {w}_len", f".{w}_len = {gn}.len")]
+            if arr
+            else [(f"{ct} *{w}", f".{w} = &{gn}")]
+        )
     return f
 
 
 def prototype(h, g) -> str:
     ret = "void" if h["ret"] == "void" else ctype(h["ret"], h["name"])
     body = "".join(f"    {d};\n" for d, _ in fields(h, g))
-    return (f"typedef struct {{\n{body}}} k_{h['name']}_args;\n"
-            f"{ret} k_{h['name']}(const k_{h['name']}_args *a);")
+    return f"typedef struct {{\n{body}}} k_{h['name']}_args;\n" f"{ret} k_{h['name']}(const k_{h['name']}_args *a);"
 
 
 def call(h, g, wide: bool) -> str:
@@ -246,7 +267,9 @@ def call(h, g, wide: bool) -> str:
 
 def shim(h, g, sig: str, shadow: bool, wide: bool) -> str:
     name, ret = h["name"], h["ret"]
-    uniq = "".join(f"    tvg_make_unique(&{g[w]['c']}, &{TYPES[g[w]['type'][0]][2]});\n" for w, _ in h["writes"] if g[w]["type"][1])
+    uniq = "".join(
+        f"    tvg_make_unique(&{g[w]['c']}, &{TYPES[g[w]['type'][0]][2]});\n" for w, _ in h["writes"] if g[w]["type"][1]
+    )
     if not shadow:
         return f"{sig} {{\n{uniq}    {'' if ret == 'void' else 'return '}{call(h, g, wide)};\n}}\n"
     pargs = ", ".join(f"p{i}" for i in range(len(h["params"])))
@@ -269,22 +292,28 @@ def shim(h, g, sig: str, shadow: bool, wide: bool) -> str:
         t, arr = g[w]["type"]
         gn = g[w]["c"]
         if arr:
-            s.append(f"    if ({gn}.len != o_{w}.len) tvk_fail(\"{name}\", ncall, "
-                     f"\"the reference resized {w} (%lld to %lld)\", (long long)o_{w}.len, (long long){gn}.len);")
+            s.append(
+                f'    if ({gn}.len != o_{w}.len) tvk_fail("{name}", ncall, '
+                f'"the reference resized {w} (%lld to %lld)", (long long)o_{w}.len, (long long){gn}.len);'
+            )
             s.append(f"    void *a_{w} = tvk_dup(tv_arr_data({gn}), (size_t){gn}.len * sizeof({TYPES[t][0]}));")
             s.append(f"    tv_arr_release({gn}, &{TYPES[t][2]}); {gn} = o_{w};")
         else:
             s.append(f"    {TYPES[t][1]} a_{w} = {gn}; {gn} = b_{w};")
     s.append(f"    {rt + ' r = ' if rt else ''}{call(h, g, wide)};")
     if rt:
-        s.append(f"    if (r != r_ref) tvk_fail(\"{name}\", ncall, \"returned %lld, the reference %lld\", "
-                 f"(long long)r, (long long)r_ref);")
+        s.append(
+            f'    if (r != r_ref) tvk_fail("{name}", ncall, "returned %lld, the reference %lld", '
+            f"(long long)r, (long long)r_ref);"
+        )
     for w, n in h["writes"]:
         t, arr = g[w]["type"]
         gn = g[w]["c"]
         if not arr:
-            s.append(f"    if ({gn} != a_{w}) tvk_fail(\"{name}\", ncall, \"{w} = %lld, the reference %lld\", "
-                     f"(long long){gn}, (long long)a_{w});")
+            s.append(
+                f'    if ({gn} != a_{w}) tvk_fail("{name}", ncall, "{w} = %lld, the reference %lld", '
+                f"(long long){gn}, (long long)a_{w});"
+            )
     for w, n in h["writes"]:
         t, arr = g[w]["type"]
         gn = g[w]["c"]
@@ -292,9 +321,13 @@ def shim(h, g, sig: str, shadow: bool, wide: bool) -> str:
             continue
         ct = TYPES[t][0]
         lim = f"{gn}.len" if not n else ("r_ref" if n == "return" else f"a_{n}")
-        s.append(f"    {{ const {ct} *k_ = tv_arr_data({gn}), *r_ = a_{w}; int64_t n_ = {lim} < {gn}.len ? {lim} : {gn}.len;")
-        s.append(f"      for (int64_t i = 0; i < n_; i++) if (k_[i] != r_[i]) tvk_fail(\"{name}\", ncall, "
-                 f"\"{w}[%lld] = %lld, the reference %lld\", (long long)i, (long long)k_[i], (long long)r_[i]); }}")
+        s.append(
+            f"    {{ const {ct} *k_ = tv_arr_data({gn}), *r_ = a_{w}; int64_t n_ = {lim} < {gn}.len ? {lim} : {gn}.len;"
+        )
+        s.append(
+            f'      for (int64_t i = 0; i < n_; i++) if (k_[i] != r_[i]) tvk_fail("{name}", ncall, '
+            f'"{w}[%lld] = %lld, the reference %lld", (long long)i, (long long)k_[i], (long long)r_[i]); }}'
+        )
         s.append(f"    free(a_{w});")
     if rt:
         s.append("    return r;")
@@ -334,8 +367,13 @@ def main() -> None:
     hooks, g = parse_tov(mods, src)
     by_name = {h["name"]: h for h in hooks}
 
-    header = ["/* Generated by inject.py from engine.tov: one prototype per hook. Don't edit. */",
-              "#pragma once", "#include <stdbool.h>", "#include <stdint.h>", ""]
+    header = [
+        "/* Generated by inject.py from engine.tov: one prototype per hook. Don't edit. */",
+        "#pragma once",
+        "#include <stdbool.h>",
+        "#include <stdint.h>",
+        "",
+    ]
     for h in hooks:
         check_c_signature(h, src)
         if not h["raw"]:
@@ -365,7 +403,7 @@ def main() -> None:
                 die(f"{k} must define k_{name}(const k_{name}_args *a) (see {header_path})")
             ref = ""
             if shadow:
-                ref = src[m.start():end].replace(f" {h['c']}(", f" {h['c']}__ref(", 1)
+                ref = src[m.start() : end].replace(f" {h['c']}(", f" {h['c']}__ref(", 1)
             src = src[: m.start()] + ref + shim(h, g, sig, shadow, wide) + src[end:]
             compile_.append(k)
             if wide:
@@ -376,9 +414,12 @@ def main() -> None:
     # After the runtime header, so shims and raw bodies can use its types.
     at = src.index("\n", src.index("typedef struct tv_arr {")) + 1
     at = src.index("} tv_arr;\n", at) + len("} tv_arr;\n")
-    glue = ["/* Set by the raw readLine kernel, so shadow reports can name the query. */",
-            "static int64_t tvk_query;", "static const char *tvk_line;",
-            pathlib.Path(header_path).read_text().split("#include <stdint.h>\n", 1)[1]]
+    glue = [
+        "/* Set by the raw readLine kernel, so shadow reports can name the query. */",
+        "static int64_t tvk_query;",
+        "static const char *tvk_line;",
+        pathlib.Path(header_path).read_text().split("#include <stdint.h>\n", 1)[1],
+    ]
     if shadow:
         glue.append(SHADOW_PRELUDE)
     if wide:

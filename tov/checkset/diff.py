@@ -14,19 +14,76 @@ from pathlib import Path
 
 
 VOCAB = (
-    "app", "archive", "async", "buffer", "cache", "clang", "client", "config",
-    "controller", "decode", "dialog", "engine", "format", "gallery", "handler",
-    "index", "kernel", "login", "module", "navbar", "network", "package",
-    "parser", "promise", "provider", "query", "request", "retry", "router",
-    "scroll", "search", "signal", "store", "subject", "timer", "token", "user",
-    "worker", "café", "naïve", "résumé", "東京",
+    "app",
+    "archive",
+    "async",
+    "buffer",
+    "cache",
+    "clang",
+    "client",
+    "config",
+    "controller",
+    "decode",
+    "dialog",
+    "engine",
+    "format",
+    "gallery",
+    "handler",
+    "index",
+    "kernel",
+    "login",
+    "module",
+    "navbar",
+    "network",
+    "package",
+    "parser",
+    "promise",
+    "provider",
+    "query",
+    "request",
+    "retry",
+    "router",
+    "scroll",
+    "search",
+    "signal",
+    "store",
+    "subject",
+    "timer",
+    "token",
+    "user",
+    "worker",
+    "café",
+    "naïve",
+    "résumé",
+    "東京",
 )
 EXTENSIONS = (
-    "c", "cc", "cpp", "css", "gif", "h", "html", "ico", "js", "json", "md",
-    "mp4", "pdf", "png", "py", "rs", "sh", "svg", "toml", "ts", "tsx", "txt",
+    "c",
+    "cc",
+    "cpp",
+    "css",
+    "gif",
+    "h",
+    "html",
+    "ico",
+    "js",
+    "json",
+    "md",
+    "mp4",
+    "pdf",
+    "png",
+    "py",
+    "rs",
+    "sh",
+    "svg",
+    "toml",
+    "ts",
+    "tsx",
+    "txt",
     "yaml",
     # A case-folded and a longer-than-7-byte extension, for the ext lists.
-    "JPG", "MarkDown",
+    "JPG",
+    "MarkDown",
 )
 TYPE_EXTENSIONS = {
     "archive": ("zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso", "zst"),
@@ -282,7 +339,9 @@ def random_disk(path, seed):
         ext = name.rsplit(b".", 1)[-1].decode("ascii", errors="ignore").lower()
         kind = 2 if rng.random() < 0.035 else 0
         size = 0 if kind == 2 else rng.choice((0, 1, 32, 512, 4096, 65536, 1_048_576, rng.randrange(1_000_000)))
-        age = rng.choice((0, 1, 60, 3600, 86_400, 3 * 86_400, 30 * 86_400, 365 * 86_400, rng.randrange(6 * 365 * 86_400)))
+        age = rng.choice(
+            (0, 1, 60, 3600, 86_400, 3 * 86_400, 30 * 86_400, 365 * 86_400, rng.randrange(6 * 365 * 86_400))
+        )
         push_record(records, children, parent, name, kind, size, now - age)
         files.append((name.decode("utf-8"), ext, kind, parts, size))
 
@@ -305,25 +364,46 @@ def typo(rng, token):
             op = 3
         else:
             at = rng.choice(swappable)
-            return token[:at] + token[at + 1] + token[at] + token[at + 2:]
+            return token[:at] + token[at + 1] + token[at] + token[at + 2 :]
     at = rng.randrange(len(token) - 1)
     if op == 1:
-        return token[:at] + token[at + 1:]
+        return token[:at] + token[at + 1 :]
     if op == 2:
         return token[:at] + rng.choice("abcdefghijklmnopqrstuvwxyz0123456789") + token[at:]
     replacement = rng.choice("abcdefghijklmnopqrstuvwxyz0123456789")
     while replacement == token[at].lower():
         replacement = rng.choice("abcdefghijklmnopqrstuvwxyz0123456789")
-    return token[:at] + replacement + token[at + 1:]
+    return token[:at] + replacement + token[at + 1 :]
 
 
 def random_queries(rng, files, directories, count):
     queries = []
     kinds = [
-        "prefix", "substring", "typo", "multi", "negative", "exact", "suffix",
-        "ext", "type", "kind", "size", "scope", "mixed", "neg-only", "neg-pair",
-        "ext-only", "kind-only", "size-only", "type-only", "filter-neg", "scope-neg",
-        "short-one", "short-two", "short-filter-one", "short-filter-two",
+        "prefix",
+        "substring",
+        "typo",
+        "multi",
+        "negative",
+        "exact",
+        "suffix",
+        "ext",
+        "type",
+        "kind",
+        "size",
+        "scope",
+        "mixed",
+        "neg-only",
+        "neg-pair",
+        "ext-only",
+        "kind-only",
+        "size-only",
+        "type-only",
+        "filter-neg",
+        "scope-neg",
+        "short-one",
+        "short-two",
+        "short-filter-one",
+        "short-filter-two",
         "tie-probe",
     ]
     rng.shuffle(kinds)
@@ -341,7 +421,7 @@ def random_queries(rng, files, directories, count):
             text = f"^{token[:rng.randint(1, len(token))]}"
         elif mode == "substring":
             start = rng.randrange(len(token))
-            text = token[start:start + rng.randint(1, max(1, len(token) - start))]
+            text = token[start : start + rng.randint(1, max(1, len(token) - start))]
         elif mode == "short-one":
             text = short_token[:1]
         elif mode == "short-two":
@@ -365,7 +445,7 @@ def random_queries(rng, files, directories, count):
         elif mode == "exact":
             text = "'" + token
         elif mode == "suffix":
-            text = token[-rng.randint(1, len(token)):] + "$"
+            text = token[-rng.randint(1, len(token)) :] + "$"
         elif mode == "ext":
             text = f"ext:{ext} {token}"
         elif mode == "type":
@@ -401,25 +481,27 @@ def random_queries(rng, files, directories, count):
     corpus_scope = "/".join(directories[0][1])
     ancestor_parts = next(parts for _, parts, _ in directories if parts[-1] == "ancestor")
     ancestor_scope = "/".join(ancestor_parts)
-    queries.extend((
-        "a",
-        "ab",
-        "abc",
-        "xyz",
-        "qz",
-        "z",
-        "abcd",
-        "ab",
-        "app",
-        "alpha",
-        "aa",
-        "sharedprior",
-        "rank",
-        "ran",
-        "ancestor plainchild",
-        f"in:~/{ancestor_scope} ancestor plainchild",
-        f"in:~/{corpus_scope} app",
-    ))
+    queries.extend(
+        (
+            "a",
+            "ab",
+            "abc",
+            "xyz",
+            "qz",
+            "z",
+            "abcd",
+            "ab",
+            "app",
+            "alpha",
+            "aa",
+            "sharedprior",
+            "rank",
+            "ran",
+            "ancestor plainchild",
+            f"in:~/{ancestor_scope} ancestor plainchild",
+            f"in:~/{corpus_scope} app",
+        )
+    )
     return queries
 
 

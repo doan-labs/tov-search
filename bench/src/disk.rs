@@ -41,7 +41,11 @@ impl Writer {
 
     /// Append an entry; returns its index.
     pub fn push(&mut self, parent: u32, name: &[u8], kind: u8, size: u64, mtime: u32) -> u32 {
-        assert!(name.len() <= u16::MAX as usize && !name.iter().any(|b| b"/\t\n\r".contains(b)) && (self.n == 0 || !name.is_empty()));
+        assert!(
+            name.len() <= u16::MAX as usize
+                && !name.iter().any(|b| b"/\t\n\r".contains(b))
+                && (self.n == 0 || !name.is_empty())
+        );
         assert!(self.n < 1 << 24, "over 16M entries: a generator loop ran away");
         self.buf.extend_from_slice(&parent.to_le_bytes());
         self.buf.push(kind);
